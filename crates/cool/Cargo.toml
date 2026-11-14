@@ -1,0 +1,19 @@
+[package]
+name = "omicsweave-cool"
+description = "cooler .cool / .mcool contact maps (HDF5): parallel streaming of raw pixels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+hdf5-metno.workspace = true
+hdf5-metno-sys.workspace = true
+libdeflater.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

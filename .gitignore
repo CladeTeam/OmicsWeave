@@ -1,0 +1,52 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Python build output
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+*.so
+*.pyd
+*.dylib
+
+# Python environments and tool caches
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.ipynb_checkpoints/
+
+# Local data and generated artifacts
+/data/
+/outputs/
+/tmp/
+*.log
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Editor and operating system files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Internal working notes (kept locally, not published)
+/docs/optimization-round*/
+/docs/optimization-guide.md
+/docs/crate-performance-audit.md

@@ -1,0 +1,15 @@
+[package]
+name = "lib2bit-sys"
+description = "Vendored lib2bit and its raw bindings, a test-only reference for 2bit reading"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+build = "build.rs"
+links = "2bit"
+
+[build-dependencies]
+cc.workspace = true
+
+[lints]
+workspace = true

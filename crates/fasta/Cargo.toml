@@ -1,0 +1,29 @@
+[package]
+name = "omicsweave-fasta"
+description = "Random access to FASTA (.fa/.fai), bgzip FASTA (.fa.gz/.gzi) and 2bit sequences on caller-provided buffers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+omicsweave-bgzf = { path = "../bgzf" }
+libdeflater.workspace = true
+memchr.workspace = true
+
+[dev-dependencies]
+htslib-sys = { path = "../../refs/htslib" }
+lib2bit-sys = { path = "../../refs/lib2bit" }
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "paths"
+harness = false
+
+[[bench]]
+name = "empty_members"
+harness = false

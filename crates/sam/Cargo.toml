@@ -1,0 +1,18 @@
+[package]
+name = "omicsweave-sam"
+description = "SAM text encoded as uncompressed BAM bytes, record by record, as htslib encodes it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+memchr.workspace = true
+
+[dev-dependencies]
+htslib-sys = { path = "../../refs/htslib" }
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

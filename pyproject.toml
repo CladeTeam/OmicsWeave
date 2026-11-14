@@ -1,0 +1,41 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "omicsweave"
+version = "0.1.0"
+description = "A unified framework for loading multi-omics data into model training"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.4",
+]
+
+[project.scripts]
+ow = "omicsweave.cli.app:main"
+
+[dependency-groups]
+dev = [
+    "maturin>=1.9,<2",
+    "pytest>=8",
+    "ruff>=0.11",
+]
+
+[tool.maturin]
+manifest-path = "crates/python/Cargo.toml"
+python-source = "src"
+module-name = "omicsweave._native"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

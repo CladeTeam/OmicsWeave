@@ -1,0 +1,27 @@
+[package]
+name = "omicsweave-hic"
+description = "Juicer .hic contact maps: tile-by-tile reading (v6-v9) and writing (v8, v9)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+flate2.workspace = true
+libdeflater.workspace = true
+
+[dev-dependencies]
+straw-sys = { path = "../../refs/straw" }
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "paths"
+harness = false
+
+[[bench]]
+name = "builder"
+harness = false

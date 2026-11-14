@@ -1,0 +1,33 @@
+[package]
+name = "omicsweave-bbi"
+description = "bigWig and bigBed parsing on caller-provided buffers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+libdeflater.workspace = true
+memchr.workspace = true
+
+[dev-dependencies]
+omicsweave-bed = { path = "../bed" }
+libbigwig-sys = { path = "../../refs/libbigwig" }
+libdeflater.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "paths"
+harness = false
+
+[[bench]]
+name = "reader"
+harness = false
+
+[[bench]]
+name = "sidecar"
+harness = false

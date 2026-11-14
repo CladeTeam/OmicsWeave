@@ -1,0 +1,32 @@
+[package]
+name = "omicsweave-vcf"
+description = "VCF and BCF variant files read whole, decoded as htslib decodes them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+flate2.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+bcftools-sys = { path = "../../refs/bcftools" }
+htslib-sys = { path = "../../refs/htslib" }
+proptest.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "paths"
+harness = false
+
+[[bench]]
+name = "full_fields"
+harness = false
+
+[[bench]]
+name = "filter"
+harness = false
+
+[lints]
+workspace = true

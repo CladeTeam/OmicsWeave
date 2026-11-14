@@ -1,0 +1,31 @@
+[package]
+name = "omicsweave-convert"
+description = "Streaming, parallel format conversion under a thread and memory budget"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+omicsweave-bgzf = { path = "../bgzf" }
+omicsweave-fasta = { path = "../fasta" }
+omicsweave-bbi = { path = "../bbi" }
+omicsweave-hic = { path = "../hic" }
+omicsweave-vcf = { path = "../vcf" }
+omicsweave-sam = { path = "../sam" }
+omicsweave-cool = { path = "../cool" }
+flate2.workspace = true
+memchr.workspace = true
+
+[dev-dependencies]
+htslib-sys = { path = "../../refs/htslib" }
+lib2bit-sys = { path = "../../refs/lib2bit" }
+libbigwig-sys = { path = "../../refs/libbigwig" }
+straw-sys = { path = "../../refs/straw" }
+hdf5-metno.workspace = true
+hdf5-metno-sys.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

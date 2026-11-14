@@ -1,0 +1,27 @@
+[package]
+name = "omicsweave-python"
+description = "The omicsweave._native Python extension"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+omicsweave-fasta = { path = "../fasta" }
+omicsweave-bbi = { path = "../bbi" }
+omicsweave-bed = { path = "../bed" }
+omicsweave-hic = { path = "../hic" }
+omicsweave-consensus = { path = "../consensus" }
+omicsweave-convert = { path = "../convert" }
+pyo3 = { workspace = true, features = ["extension-module"] }
+numpy.workspace = true
+
+[lints]
+workspace = true
