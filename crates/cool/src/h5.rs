@@ -324,6 +324,21 @@ pub(crate) fn elem(ds: &hdf5::Dataset, what: &'static str) -> Result<Option<Elem
     if precision != size * 8 || offset != 0 {
         return Ok(None);
     }
+    if kind == ElemKind::Float {
+        let ieee = match (size, big_endian) {
+            (4, false) => *sys::h5t::H5T_IEEE_F32LE,
+            (4, true) => *sys::h5t::H5T_IEEE_F32BE,
+            (8, false) => *sys::h5t::H5T_IEEE_F64LE,
+            (8, true) => *sys::h5t::H5T_IEEE_F64BE,
+            _ => return Ok(None),
+        };
+        // SAFETY: dtype owns a valid datatype id and ieee is a predefined
+        // HDF5 datatype initialized by opening the file. Both remain valid
+        // under sys::LOCK for this read-only query.
+        if unsafe { sys::h5t::H5Tequal(dtype.id(), ieee) } <= 0 {
+            return Ok(None);
+        }
+    }
     Ok(Some(Elem {
         kind,
         size,

@@ -159,6 +159,48 @@ fn checksum_inside_deflate_stream_matches_library() {
 }
 
 #[test]
+fn shuffle_only_partial_chunks_and_checksum_before_shuffle_match_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shuffle-planes.cool");
+    let mut s = spec(1000, 195);
+    s.storage = [Storage::Chunked {
+        chunk: 73,
+        shuffle: true,
+        gzip: None,
+        fletcher: false,
+    }; 3];
+    write_cool(&path, &s);
+    let cool = Cool::open(&path, "/").unwrap();
+    assert_eq!(cool.read_paths(), [ReadPath::Chunked; 3]);
+    let n = s.pixels.len() as u64;
+    for rows in [0..1, 17..19, 72..75, n - 2..n, 0..n] {
+        let fast = read(&cool, rows.clone());
+        let mut oracle = PixelBatch::new();
+        cool.read_pixels_library(rows.clone(), &mut oracle).unwrap();
+        assert_eq!(fast, oracle);
+        assert_eq!(fast, expected(&s, rows));
+    }
+    drop(cool);
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        file.unlink("pixels/count").unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape(s.pixels.len()..)
+            .chunk(73)
+            .fletcher32()
+            .shuffle()
+            .deflate(6)
+            .create("pixels/count")
+            .unwrap();
+        ds.write_raw(&s.pixels.iter().map(|p| p.2 as i32).collect::<Vec<_>>())
+            .unwrap();
+    }
+    let cool = Cool::open(&path, "/").unwrap();
+    check_all(&cool, &s, 91);
+}
+
+#[test]
 fn failed_chunk_decode_allows_scratch_reuse() {
     use std::io::{Seek, SeekFrom, Write};
 
@@ -349,6 +391,83 @@ fn float_counts() {
     let cool = write_and_open(dir.path(), &s);
     assert!(s.pixels.iter().any(|p| p.2.fract() != 0.0));
     check_all(&cool, &s, 256);
+}
+
+#[test]
+fn float_layouts_preserve_ieee_fast_paths_and_convert_custom_bias() {
+    use hdf5_metno as hdf5;
+    use hdf5_metno_sys as sys;
+
+    for (size, big_endian, custom_bias) in [
+        (4, false, false),
+        (4, true, false),
+        (8, false, false),
+        (8, true, false),
+        (4, false, true),
+        (4, true, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("float-layout.cool");
+        let mut s = MapSpec::new(&[("chr1", 10)], 1);
+        s.pixels = vec![(0, 1, 1.5), (2, 3, 2.5)];
+        write_cool(&path, &s);
+        let offset = {
+            let file = hdf5::File::open_rw(&path).unwrap();
+            file.unlink("pixels/count").unwrap();
+            let dtype = {
+                let _lock = sys::LOCK.lock();
+                let ieee = match (size, big_endian) {
+                    (4, false) => *sys::h5t::H5T_IEEE_F32LE,
+                    (4, true) => *sys::h5t::H5T_IEEE_F32BE,
+                    (8, false) => *sys::h5t::H5T_IEEE_F64LE,
+                    (8, true) => *sys::h5t::H5T_IEEE_F64BE,
+                    _ => unreachable!(),
+                };
+                // SAFETY: HDF5 is initialized by the open file, ieee is a
+                // predefined datatype, and sys::LOCK serializes the copy.
+                let id = unsafe { sys::h5t::H5Tcopy(ieee) };
+                assert!(id >= 0);
+                // SAFETY: id is a newly owned, valid datatype id; ownership
+                // is transferred once to its RAII wrapper under sys::LOCK.
+                let dtype: hdf5::Datatype = unsafe { hdf5::from_id(id) }.unwrap();
+                if custom_bias {
+                    // SAFETY: this mutable transient copy is owned by dtype,
+                    // has not been used by a dataset, and sys::LOCK is held.
+                    assert!(unsafe { sys::h5t::H5Tset_ebias(dtype.id(), 126) } >= 0);
+                }
+                dtype
+            };
+            let ds = file
+                .new_dataset_builder()
+                .empty_as(&dtype)
+                .shape(2)
+                .create("pixels/count")
+                .unwrap();
+            ds.write_raw(&[1.5f32, 2.5]).unwrap();
+            file.flush().unwrap();
+            ds.offset().unwrap() as usize
+        };
+        if custom_bias {
+            let bytes = std::fs::read(&path).unwrap();
+            let first: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+            let raw = if big_endian {
+                f32::from_be_bytes(first)
+            } else {
+                f32::from_le_bytes(first)
+            };
+            assert_ne!(raw, 1.5);
+        }
+        let cool = Cool::open(&path, "/").unwrap();
+        assert_eq!(
+            cool.read_paths()[2],
+            if custom_bias {
+                ReadPath::Library
+            } else {
+                ReadPath::Contiguous
+            }
+        );
+        check_all(&cool, &s, 1);
+    }
 }
 
 #[test]

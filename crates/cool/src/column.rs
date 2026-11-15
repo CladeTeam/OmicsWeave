@@ -88,9 +88,35 @@ const CONTIGUOUS_PIECE: u64 = 1 << 22;
 pub(crate) trait Value: Copy + hdf5::H5Type {
     /// Appends the elements in `bytes` (whole elements of `elem`).
     fn extend(elem: Elem, bytes: &[u8], out: &mut Vec<Self>, what: &'static str) -> Result<()>;
+    /// Converts only the selected elements from HDF5 byte-shuffle planes.
+    fn extend_shuffled(
+        elem: Elem,
+        bytes: &[u8],
+        rows: Range<usize>,
+        out: &mut Vec<Self>,
+        what: &'static str,
+    ) -> Result<()>;
     /// Converts a value read by libhdf5 as `Self::Wide`.
     type Wide: Copy + hdf5::H5Type;
     fn from_wide(w: Self::Wide, what: &'static str) -> Result<Self>;
+}
+
+macro_rules! element_type {
+    ($elem:expr, $run:ident) => {
+        match ($elem.kind, $elem.size) {
+            (ElemKind::Signed, 1) => $run!(i8, 1),
+            (ElemKind::Signed, 2) => $run!(i16, 2),
+            (ElemKind::Signed, 4) => $run!(i32, 4),
+            (ElemKind::Signed, 8) => $run!(i64, 8),
+            (ElemKind::Unsigned, 1) => $run!(u8, 1),
+            (ElemKind::Unsigned, 2) => $run!(u16, 2),
+            (ElemKind::Unsigned, 4) => $run!(u32, 4),
+            (ElemKind::Unsigned, 8) => $run!(u64, 8),
+            (ElemKind::Float, 4) => $run!(f32, 4),
+            (ElemKind::Float, 8) => $run!(f64, 8),
+            _ => unreachable!("element types are checked at open"),
+        }
+    };
 }
 
 macro_rules! each_elem {
@@ -109,19 +135,36 @@ macro_rules! each_elem {
                 }
             };
         }
-        match (e.kind, e.size) {
-            (ElemKind::Signed, 1) => run!(i8, 1),
-            (ElemKind::Signed, 2) => run!(i16, 2),
-            (ElemKind::Signed, 4) => run!(i32, 4),
-            (ElemKind::Signed, 8) => run!(i64, 8),
-            (ElemKind::Unsigned, 1) => run!(u8, 1),
-            (ElemKind::Unsigned, 2) => run!(u16, 2),
-            (ElemKind::Unsigned, 4) => run!(u32, 4),
-            (ElemKind::Unsigned, 8) => run!(u64, 8),
-            (ElemKind::Float, 4) => run!(f32, 4),
-            (ElemKind::Float, 8) => run!(f64, 8),
-            _ => unreachable!("element types are checked at open"),
+        element_type!(e, run)
+    }};
+}
+
+macro_rules! each_shuffled_elem {
+    ($elem:expr, $bytes:expr, $rows:expr, |$v:ident| $body:expr) => {{
+        let e = $elem;
+        let bytes = $bytes;
+        let rows = $rows;
+        let n = bytes.len().checked_div(e.size).unwrap_or(0);
+        if rows.start > rows.end || rows.end > n {
+            return Err(Error::invalid(
+                "hdf5 shuffle",
+                "element range outside byte planes",
+            ));
         }
+        macro_rules! run {
+            ($t:ty, $size:literal) => {
+                for i in rows {
+                    let b: [u8; $size] = std::array::from_fn(|j| bytes[j * n + i]);
+                    let $v = if e.big_endian {
+                        <$t>::from_be_bytes(b)
+                    } else {
+                        <$t>::from_le_bytes(b)
+                    };
+                    $body;
+                }
+            };
+        }
+        element_type!(e, run)
     }};
 }
 
@@ -151,6 +194,28 @@ impl Value for u64 {
     fn from_wide(w: i64, what: &'static str) -> Result<u64> {
         u64::try_from(w).map_err(|_| negative(what))
     }
+
+    #[allow(clippy::unnecessary_cast)]
+    fn extend_shuffled(
+        elem: Elem,
+        bytes: &[u8],
+        rows: Range<usize>,
+        out: &mut Vec<u64>,
+        what: &'static str,
+    ) -> Result<()> {
+        if elem.kind == ElemKind::Float {
+            return Err(Error::invalid(what, "bin ids are not integers"));
+        }
+        let mut bad = false;
+        each_shuffled_elem!(elem, bytes, rows, |v| {
+            bad |= (v as i128) < 0;
+            out.push(v as u64)
+        });
+        if bad {
+            return Err(negative(what));
+        }
+        Ok(())
+    }
 }
 
 impl Value for f64 {
@@ -163,6 +228,17 @@ impl Value for f64 {
 
     fn from_wide(w: f64, _: &'static str) -> Result<f64> {
         Ok(w)
+    }
+
+    fn extend_shuffled(
+        elem: Elem,
+        bytes: &[u8],
+        rows: Range<usize>,
+        out: &mut Vec<f64>,
+        _: &'static str,
+    ) -> Result<()> {
+        each_shuffled_elem!(elem, bytes, rows, |v| out.push(v as f64));
+        Ok(())
     }
 }
 
@@ -275,9 +351,21 @@ impl Column {
                     }
                     scratch.raw.resize(loc.size as usize, 0);
                     source.read_exact_at(&mut scratch.raw, loc.addr)?;
+                    // The first write-stage shuffle is the last decode
+                    // stage. Read its byte planes directly into output,
+                    // avoiding a full-chunk reorder and intermediate buffer.
+                    // Earlier checksums forbid this fusion because they
+                    // must see the complete unshuffled byte stream.
+                    let shuffled =
+                        pipeline.first() == Some(&Stage::Shuffle) && loc.filter_mask & 1 == 0;
+                    let (stages, mask) = if shuffled {
+                        (&pipeline[1..], loc.filter_mask >> 1)
+                    } else {
+                        (pipeline.as_slice(), loc.filter_mask)
+                    };
                     let in_spare = filter::decode(
-                        pipeline,
-                        loc.filter_mask,
+                        stages,
+                        mask,
                         *chunk_bytes,
                         elem.size,
                         &mut scratch.raw,
@@ -289,8 +377,12 @@ impl Column {
                     } else {
                         &scratch.raw
                     };
-                    let bytes = &decoded[(lo * size) as usize..(hi * size) as usize];
-                    T::extend(elem, bytes, out, what)?;
+                    if shuffled {
+                        T::extend_shuffled(elem, decoded, lo as usize..hi as usize, out, what)?;
+                    } else {
+                        let bytes = &decoded[(lo * size) as usize..(hi * size) as usize];
+                        T::extend(elem, bytes, out, what)?;
+                    }
                 }
                 Ok(())
             }
@@ -450,4 +542,122 @@ fn check_extent(what: &'static str, offset: u64, len: u64, file_len: u64) -> Res
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shuffle(bytes: &[u8], size: usize) -> Vec<u8> {
+        let n = bytes.len() / size;
+        let mut shuffled = Vec::with_capacity(bytes.len());
+        for j in 0..size {
+            for i in 0..n {
+                shuffled.push(bytes[i * size + j]);
+            }
+        }
+        shuffled.extend_from_slice(&bytes[n * size..]);
+        shuffled
+    }
+
+    #[test]
+    fn shuffled_integer_planes_select_exact_rows_and_both_byte_orders() {
+        let values = [0u64, 1, 7, 41, 120];
+        for kind in [ElemKind::Signed, ElemKind::Unsigned] {
+            for size in [1, 2, 4, 8] {
+                for big_endian in [false, true] {
+                    let elem = Elem {
+                        kind,
+                        size,
+                        big_endian,
+                    };
+                    let mut encoded = Vec::new();
+                    for v in values {
+                        if big_endian {
+                            encoded.extend_from_slice(&v.to_be_bytes()[8 - size..]);
+                        } else {
+                            encoded.extend_from_slice(&v.to_le_bytes()[..size]);
+                        }
+                    }
+                    // Byte-shuffle leaves an incomplete final element intact.
+                    if size > 1 {
+                        encoded.push(0xa5);
+                    }
+                    let bytes = shuffle(&encoded, size);
+                    for rows in [0..0, 0..1, 1..4, 4..5, 0..5] {
+                        let mut ids = Vec::new();
+                        u64::extend_shuffled(elem, &bytes, rows.clone(), &mut ids, "ids").unwrap();
+                        assert_eq!(ids, values[rows.clone()]);
+                        let mut counts = Vec::new();
+                        f64::extend_shuffled(elem, &bytes, rows.clone(), &mut counts, "count")
+                            .unwrap();
+                        assert_eq!(
+                            counts,
+                            values[rows].iter().map(|&v| v as f64).collect::<Vec<_>>()
+                        );
+                    }
+                    assert!(
+                        u64::extend_shuffled(elem, &bytes, 0..6, &mut Vec::new(), "ids").is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shuffled_float_planes_preserve_values_and_reject_float_ids() {
+        for size in [4, 8] {
+            for big_endian in [false, true] {
+                let elem = Elem {
+                    kind: ElemKind::Float,
+                    size,
+                    big_endian,
+                };
+                let values = [0.0f64, -7.25, 1.5, f64::INFINITY, f64::NAN];
+                let mut encoded = Vec::new();
+                for v in values {
+                    if size == 4 {
+                        encoded.extend_from_slice(&if big_endian {
+                            (v as f32).to_be_bytes()
+                        } else {
+                            (v as f32).to_le_bytes()
+                        });
+                    } else {
+                        encoded.extend_from_slice(&if big_endian {
+                            v.to_be_bytes()
+                        } else {
+                            v.to_le_bytes()
+                        });
+                    }
+                }
+                let bytes = shuffle(&encoded, size);
+                let mut out = Vec::new();
+                f64::extend_shuffled(elem, &bytes, 1..5, &mut out, "count").unwrap();
+                for (actual, expected) in out.iter().zip(&values[1..]) {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+                assert!(u64::extend_shuffled(elem, &bytes, 0..1, &mut Vec::new(), "ids").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn shuffled_negative_id_is_rejected_even_when_other_rows_are_valid() {
+        let elem = Elem {
+            kind: ElemKind::Signed,
+            size: 4,
+            big_endian: false,
+        };
+        let bytes = shuffle(
+            &[1i32, -1, 2]
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+                .collect::<Vec<_>>(),
+            4,
+        );
+        assert!(u64::extend_shuffled(elem, &bytes, 0..3, &mut Vec::new(), "ids").is_err());
+        let mut out = Vec::new();
+        u64::extend_shuffled(elem, &bytes, 2..3, &mut out, "ids").unwrap();
+        assert_eq!(out, [2]);
+    }
 }
