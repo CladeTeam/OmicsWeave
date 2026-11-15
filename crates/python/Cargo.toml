@@ -16,10 +16,15 @@ doctest = false
 omicsweave-core = { path = "../core" }
 omicsweave-fasta = { path = "../fasta" }
 omicsweave-bbi = { path = "../bbi" }
-omicsweave-bed = { path = "../bed" }
 omicsweave-hic = { path = "../hic" }
 omicsweave-consensus = { path = "../consensus" }
+omicsweave-bam = { path = "../bam" }
+omicsweave-cram = { path = "../cram" }
+omicsweave-bgzf = { path = "../bgzf" }
+omicsweave-vcf = { path = "../vcf" }
 omicsweave-convert = { path = "../convert" }
+omicsweave-gtf = { path = "../gtf" }
+omicsweave-quant = { path = "../quant" }
 pyo3 = { workspace = true, features = ["extension-module"] }
 numpy.workspace = true
 

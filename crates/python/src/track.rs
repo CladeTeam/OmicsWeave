@@ -4,14 +4,20 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
 
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1};
+use numpy::{
+    IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1, PyReadwriteArray2,
+    PyUntypedArrayMethods,
+};
 use omicsweave_bbi::{BbiReader, Chrom, Kind, WriteOptions};
-use omicsweave_core::{Error, FileSource, Region, Result, TrackEntry, TrackRead};
+use omicsweave_core::{
+    BinSource, BinSpec, Error, FileSource, Region, Result, Stat, TrackEntry, TrackRead,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::cache::{self, CacheKey, CacheNamespace, PyBlockCache};
 use crate::error::{Done, OrRaise};
-use crate::shared::{Shared, path_str, save_sidecar, slice};
+use crate::shared::{LocusKey, Shared, path_str, save_sidecar, slice, with_locus};
 
 /// Opens a BBI file, which must be of `kind`.
 pub fn open_bbi(source: FileSource, kind: Kind) -> Result<BbiReader<FileSource>> {
@@ -52,9 +58,16 @@ pub struct TrackReader {
 #[pymethods]
 impl TrackReader {
     #[new]
-    fn new(py: Python<'_>, path: PathBuf) -> PyResult<TrackReader> {
+    #[pyo3(signature = (path, cache=None))]
+    fn new(
+        py: Python<'_>,
+        path: PathBuf,
+        cache: Option<PyRef<'_, PyBlockCache>>,
+    ) -> PyResult<TrackReader> {
+        let cache = cache::handle(cache)?;
         py.detach(|| -> Result<TrackReader> {
-            let reader = open_bbi(FileSource::open(&path)?, Kind::BigWig)?;
+            let mut reader = open_bbi(FileSource::open(&path)?, Kind::BigWig)?;
+            reader.set_cache(cache)?;
             let summary = reader
                 .total_summary()?
                 .map(|s| (s.bases_covered, s.min, s.max, s.sum, s.sum_squares));
@@ -78,20 +91,115 @@ impl TrackReader {
         self.summary
     }
 
-    /// Writes one value per base of `chrom:[start, end)` into `out`.
+    fn set_cache(&self, py: Python<'_>, cache: Option<PyRef<'_, PyBlockCache>>) -> PyResult<()> {
+        let cache = cache::handle(cache)?;
+        self.inner.run(py, |t| Ok(t.reader.set_cache(cache)?))
+    }
+
+    fn cache_namespace(&self, py: Python<'_>) -> PyResult<CacheNamespace> {
+        self.inner
+            .run(py, |t| Ok(CacheNamespace::new(t.reader.cache_namespace())))
+    }
+
+    fn describe_cache(&self, py: Python<'_>, key: LocusKey) -> PyResult<Vec<CacheKey>> {
+        self.inner.run(py, |t| {
+            let mut keys = Vec::new();
+            with_locus(&key, |locus| t.reader.describe_cache(locus, &mut keys))?;
+            Ok(keys.into_iter().map(CacheKey::new).collect())
+        })
+    }
+
+    fn prefetch_cache(&self, py: Python<'_>, key: LocusKey) -> PyResult<()> {
+        self.inner.run(py, |t| {
+            Ok(with_locus(&key, |locus| t.reader.prefetch_cache(locus))?)
+        })
+    }
+
+    fn clone_context(&self, py: Python<'_>) -> PyResult<Self> {
+        let reader = self.inner.run(py, |t| Ok(t.reader.try_clone()?))?;
+        Ok(Self {
+            inner: Shared::new(Track {
+                reader,
+                entries: Vec::new(),
+            }),
+            chroms: self.chroms.clone(),
+            summary: self.summary,
+        })
+    }
+
+    /// Writes one value per position of `key` into `out`, 5' to 3'.
     fn values(
         &self,
         py: Python<'_>,
-        chrom: &str,
-        start: u32,
-        end: u32,
+        key: LocusKey,
         mut out: PyReadwriteArray1<'_, f32>,
     ) -> PyResult<()> {
         let out = out
             .as_slice_mut()
             .map_err(|_| PyValueError::new_err("out must be a contiguous float32 array"))?;
         self.inner.run(py, |t| -> Done<()> {
-            Ok(t.reader.values(Region::new(chrom, start, end), out)?)
+            Ok(with_locus(&key, |locus| t.reader.values(locus, out))?)
+        })
+    }
+
+    /// Writes the `stats` of the bins of `key` into `out`, shaped
+    /// `(len(stats), bins)`, C-contiguous.
+    #[pyo3(signature = (key, resolution, phase, stats, exact, out))]
+    #[allow(clippy::too_many_arguments)]
+    fn bins(
+        &self,
+        py: Python<'_>,
+        key: LocusKey,
+        resolution: u32,
+        phase: u32,
+        stats: Vec<String>,
+        exact: bool,
+        mut out: PyReadwriteArray2<'_, f32>,
+    ) -> PyResult<()> {
+        let stats = stats
+            .iter()
+            .map(|s| {
+                Stat::parse(s).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "unknown statistic {s:?}; one of mean, min, max, sum, std, coverage"
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        if out.shape()[0] != stats.len() {
+            return Err(PyValueError::new_err(format!(
+                "out has {} rows, need one per statistic ({})",
+                out.shape()[0],
+                stats.len()
+            )));
+        }
+        if !out.is_c_contiguous() {
+            return Err(PyValueError::new_err(
+                "out must be a C-contiguous float32 array",
+            ));
+        }
+        let out = out
+            .as_slice_mut()
+            .map_err(|_| PyValueError::new_err("out must be a C-contiguous float32 array"))?;
+        let spec = BinSpec {
+            resolution,
+            phase,
+            stats: &stats,
+            source: if exact {
+                BinSource::Exact
+            } else {
+                BinSource::Zoom
+            },
+        };
+        self.inner.run(py, |t| -> Done<()> {
+            Ok(with_locus(&key, |locus| t.reader.bins(locus, &spec, out))?)
+        })
+    }
+
+    /// Zoom reductions in file order, coarsening.
+    fn zoom_reductions(&self, py: Python<'_>) -> PyResult<Vec<u32>> {
+        self.inner.run(py, |t| {
+            Ok(t.reader.zooms().iter().map(|z| z.reduction).collect())
         })
     }
 
@@ -187,7 +295,7 @@ impl BigWigWriter {
             let writer =
                 omicsweave_bbi::BigWigWriter::create(out, bbi_chrom_list(chroms), options)?;
             Ok(BigWigWriter {
-                inner: Shared::new(writer),
+                inner: Shared::new_writer(writer),
                 path,
             })
         })

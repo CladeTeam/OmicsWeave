@@ -1,21 +1,22 @@
-//! Consensus sequences (`bcftools consensus`) of a VCF over a reference.
+//! Consensus sequences (`bcftools consensus`) of a BCF, read by region
+//! through its CSI, over a reference.
 
-use std::fs::File;
-use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use numpy::{IntoPyArray, PyArray1};
 use omicsweave_consensus::{
-    Alleles, Consensus, ConsensusOptions, Mark, Mask, MaskWith, Overlap, RecordFilter, VcfStore,
+    Alleles, Consensus, ConsensusOptions, Mark, Mask, MaskWith, Overlap, RecordFilter,
 };
-use omicsweave_core::{Error, Region, Result};
+use omicsweave_core::{Error, FileSource, Region, Result, Strand};
+use omicsweave_vcf::BcfReader;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::error::{Done, Fail, OrRaise};
 use crate::sequence::SequenceReader;
-use crate::shared::Shared;
+use crate::shared::{Shared, path_str};
+use crate::variant::open_index;
 
 /// One query's choice of alleles, as the Python selector classes encode it:
 /// (`all`, [], None), (`samples`, names, None) or
@@ -40,6 +41,7 @@ impl Builder {
         });
         if !cached {
             self.loaded = None;
+            reference.ensure_process()?;
             let mut guard = reference.lock();
             let reader = guard.as_mut().ok_or(Fail::Closed)?;
             self.consensus.load(reader, region)?;
@@ -61,6 +63,14 @@ impl Builder {
         };
         Ok(self.consensus.query(alleles)?)
     }
+}
+
+fn strand(s: &str) -> PyResult<Strand> {
+    match s.as_bytes() {
+        [b] => Strand::from_byte(*b),
+        _ => None,
+    }
+    .ok_or_else(|| PyValueError::new_err(format!("strand {s:?} is not one of + - . ?")))
 }
 
 fn byte(what: &str, c: Option<char>) -> PyResult<Option<u8>> {
@@ -97,18 +107,18 @@ pub struct ConsensusBuilder {
     inner: Shared<Builder>,
     reference: Py<SequenceReader>,
     samples: Vec<String>,
-    records: usize,
-    skipped: usize,
+    index: PathBuf,
 }
 
 #[pymethods]
 impl ConsensusBuilder {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (vcf, reference, iupac_codes, missing, absent, mark_del, mark_ins, mark_snv, mask, mask_with, regions_overlap, chain, include, exclude))]
+    #[pyo3(signature = (bcf, index, reference, iupac_codes, missing, absent, mark_del, mark_ins, mark_snv, mask, mask_with, regions_overlap, chain, include, exclude))]
     fn new(
         py: Python<'_>,
-        vcf: PathBuf,
+        bcf: PathBuf,
+        index: Option<PathBuf>,
         reference: Py<SequenceReader>,
         iupac_codes: bool,
         missing: Option<char>,
@@ -156,7 +166,7 @@ impl ConsensusBuilder {
             regions_overlap,
             chain,
         };
-        let built = py.detach(|| -> Result<(VcfStore, Option<Mask>)> {
+        let built = py.detach(|| -> Result<(Consensus, PathBuf)> {
             let filter = match (&include, &exclude) {
                 (Some(_), Some(_)) => {
                     return Err(Error::invalid(
@@ -168,26 +178,22 @@ impl ConsensusBuilder {
                 (None, Some(e)) => Some(RecordFilter::Exclude(e)),
                 (None, None) => None,
             };
-            let store = VcfStore::read(BufReader::new(File::open(&vcf)?), filter)?;
-            let mask = match &mask {
-                Some(p) => Some(Mask::parse(&std::fs::read(p)?, mask_with)?),
-                None => None,
-            };
-            Ok((store, mask))
+            if let Some(p) = &mask {
+                options.mask = Some(Arc::new(Mask::parse(&std::fs::read(p)?, mask_with)?));
+            }
+            let (csi, at) = open_index(&bcf, index.as_deref())?;
+            let variants = BcfReader::open(FileSource::open(&bcf)?, csi)?;
+            Ok((Consensus::new(variants, filter, options)?, at))
         });
-        let (store, mask) = built.or_raise()?;
-        options.mask = mask.map(Arc::new);
-        let samples = store.samples().to_vec();
-        let (records, skipped) = (store.n_records(), store.skipped_records());
+        let (consensus, index) = built.or_raise()?;
         Ok(ConsensusBuilder {
+            samples: consensus.samples().to_vec(),
             inner: Shared::new(Builder {
-                consensus: Consensus::new(Arc::new(store), options),
+                consensus,
                 loaded: None,
             }),
             reference,
-            samples,
-            records,
-            skipped,
+            index,
         })
     }
 
@@ -195,46 +201,65 @@ impl ConsensusBuilder {
         self.samples.clone()
     }
 
-    /// (records kept, malformed lines skipped).
-    fn records(&self) -> (usize, usize) {
-        (self.records, self.skipped)
+    #[getter]
+    fn index_path(&self) -> String {
+        path_str(&self.index)
     }
 
-    /// The consensus of `chrom:[start, end)` with `selector`: its bases and
-    /// its chain (with `chain`).
+    fn clone_context(&self, py: Python<'_>, reference: Py<SequenceReader>) -> PyResult<Self> {
+        reference.get().inner.ensure_process()?;
+        let consensus = self.inner.run(py, |b| Ok(b.consensus.try_clone()?))?;
+        Ok(Self {
+            inner: Shared::new(Builder {
+                consensus,
+                loaded: None,
+            }),
+            reference,
+            samples: self.samples.clone(),
+            index: self.index.clone(),
+        })
+    }
+
+    /// The consensus of `chrom:[start, end)` with `selector`, 5' to 3' of
+    /// `strand`: its bases and its chain (with `chain`).
+    #[allow(clippy::too_many_arguments)]
     fn sequence<'py>(
         &self,
         py: Python<'py>,
         chrom: &str,
         start: u32,
         end: u32,
+        strand: &str,
         selector: Selector,
     ) -> PyResult<(Bound<'py, PyArray1<u8>>, Option<String>)> {
+        let strand = self::strand(strand)?;
         let reference = &self.reference.get().inner;
         let (bases, chain) = self.inner.run(py, |b| -> Done<_> {
             let n = b.build(reference, Region::new(chrom, start, end), &selector)?;
             let mut bases = vec![0u8; n];
-            b.consensus.write(&mut bases)?;
+            b.consensus.write(strand, &mut bases)?;
             Ok((bases, b.consensus.chain().map(str::to_owned)))
         })?;
         Ok((bases.into_pyarray(py), chain))
     }
 
-    /// The consensus of `chrom:[start, end)` with each selector, packed:
-    /// sequence `i` is `bases[offsets[i]..offsets[i + 1]]`.
-    #[allow(clippy::type_complexity)]
+    /// The consensus of `chrom:[start, end)` with each selector, 5' to 3'
+    /// of `strand`, packed: sequence `i` is `bases[offsets[i]..offsets[i + 1]]`.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn sequences<'py>(
         &self,
         py: Python<'py>,
         chrom: &str,
         start: u32,
         end: u32,
+        strand: &str,
         selectors: Vec<Selector>,
     ) -> PyResult<(
         Bound<'py, PyArray1<i64>>,
         Bound<'py, PyArray1<u8>>,
         Vec<Option<String>>,
     )> {
+        let strand = self::strand(strand)?;
         let reference = &self.reference.get().inner;
         let (offsets, bases, chains) = self.inner.run(py, |b| -> Done<_> {
             let region = Region::new(chrom, start, end);
@@ -246,7 +271,7 @@ impl ConsensusBuilder {
                 let n = b.build(reference, region, selector)?;
                 let at = bases.len();
                 bases.resize(at + n, 0u8);
-                b.consensus.write(&mut bases[at..])?;
+                b.consensus.write(strand, &mut bases[at..])?;
                 offsets.push(bases.len() as i64);
                 chains.push(b.consensus.chain().map(str::to_owned));
             }

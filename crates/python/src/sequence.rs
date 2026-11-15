@@ -4,19 +4,59 @@
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use numpy::PyReadwriteArray1;
-use omicsweave_core::{Error, FileSource, Region, Result, SequenceRead};
+use numpy::{PyArray1, PyArrayMethods, PyReadwriteArray1};
+use omicsweave_core::cache::{BlockCache, BlockKey, SourceToken};
+use omicsweave_core::{Error, FileSource, Locus, Result, SequenceRead};
 use omicsweave_fasta::{Fai, FastaReader, Gzi, TWOBIT_MAGIC, TwoBitReader, fai_path, gzi_path};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::cache::{self, CacheKey, CacheNamespace, PyBlockCache};
 use crate::error::{Done, OrRaise};
-use crate::shared::{Shared, head, path_str};
+use crate::shared::{LocusKey, Shared, head, path_str, with_locus};
 
 pub enum Sequences {
     Fasta(FastaReader<FileSource>),
     TwoBit(TwoBitReader<FileSource>),
+}
+
+impl Sequences {
+    fn set_cache(&mut self, cache: Option<Arc<BlockCache>>) -> Result<()> {
+        match self {
+            Self::Fasta(r) => r.set_cache(cache),
+            Self::TwoBit(r) => r.set_cache(cache),
+        }
+    }
+
+    fn namespace(&self) -> SourceToken {
+        match self {
+            Self::Fasta(r) => r.cache_namespace(),
+            Self::TwoBit(r) => r.cache_namespace(),
+        }
+    }
+
+    fn describe(&self, locus: &Locus<'_>, keys: &mut Vec<BlockKey>) -> Result<()> {
+        match self {
+            Self::Fasta(r) => r.describe_cache(locus, keys),
+            Self::TwoBit(r) => r.describe_cache(locus, keys),
+        }
+    }
+
+    fn prefetch(&mut self, locus: &Locus<'_>) -> Result<()> {
+        match self {
+            Self::Fasta(r) => r.prefetch_cache(locus),
+            Self::TwoBit(r) => r.prefetch_cache(locus),
+        }
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        match self {
+            Self::Fasta(r) => Ok(Self::Fasta(r.try_clone()?)),
+            Self::TwoBit(r) => Ok(Self::TwoBit(r.try_clone()?)),
+        }
+    }
 }
 
 impl SequenceRead for Sequences {
@@ -27,10 +67,10 @@ impl SequenceRead for Sequences {
         }
     }
 
-    fn sequence(&mut self, region: Region<'_>, out: &mut [u8]) -> Result<()> {
+    fn sequence(&mut self, locus: &Locus<'_>, out: &mut [u8]) -> Result<()> {
         match self {
-            Sequences::Fasta(r) => r.sequence(region, out),
-            Sequences::TwoBit(r) => r.sequence(region, out),
+            Sequences::Fasta(r) => r.sequence(locus, out),
+            Sequences::TwoBit(r) => r.sequence(locus, out),
         }
     }
 }
@@ -76,6 +116,22 @@ fn index<T>(given: Option<&Path>, beside: PathBuf, parse: fn(&[u8]) -> Result<T>
     }
 }
 
+/// Opens the sequence file at `path` by its content (FASTA, bgzip FASTA,
+/// 2bit) with the indexes beside it.
+pub(crate) fn open_sequences(path: &Path) -> Result<Sequences> {
+    let source = FileSource::open(path)?;
+    Ok(match SequenceKind::of(&head(&source, 4)?) {
+        SequenceKind::TwoBit => Sequences::TwoBit(TwoBitReader::open(source, false)?),
+        kind => Sequences::Fasta(open_fasta(
+            path,
+            source,
+            kind == SequenceKind::Bgzf,
+            None,
+            None,
+        )?),
+    })
+}
+
 /// Opens `.fa` with its `.fai`, or `.fa.gz` with its `.fai` and `.gzi`.
 fn open_fasta(
     path: &Path,
@@ -102,18 +158,20 @@ pub struct SequenceReader {
 #[pymethods]
 impl SequenceReader {
     #[new]
-    #[pyo3(signature = (path, fai=None, gzi=None, soft_mask=false))]
+    #[pyo3(signature = (path, fai=None, gzi=None, soft_mask=false, cache=None))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
         fai: Option<PathBuf>,
         gzi: Option<PathBuf>,
         soft_mask: bool,
+        cache: Option<PyRef<'_, PyBlockCache>>,
     ) -> PyResult<SequenceReader> {
+        let cache = cache::handle(cache)?;
         py.detach(|| -> Result<SequenceReader> {
             let source = FileSource::open(&path)?;
             let kind = SequenceKind::of(&head(&source, 4)?);
-            let reader = match kind {
+            let mut reader = match kind {
                 SequenceKind::TwoBit => Sequences::TwoBit(TwoBitReader::open(source, soft_mask)?),
                 _ => Sequences::Fasta(open_fasta(
                     &path,
@@ -123,6 +181,9 @@ impl SequenceReader {
                     gzi.as_deref(),
                 )?),
             };
+            if cache.is_some() {
+                reader.set_cache(cache)?;
+            }
             let chroms = match &reader {
                 Sequences::Fasta(r) => r
                     .fai()
@@ -148,21 +209,68 @@ impl SequenceReader {
         self.chroms.clone()
     }
 
-    /// Writes the bases of `chrom:[start, end)` into `out`.
+    fn set_cache(&self, py: Python<'_>, cache: Option<PyRef<'_, PyBlockCache>>) -> PyResult<()> {
+        let cache = cache::handle(cache)?;
+        self.inner.run(py, |r| Ok(r.set_cache(cache)?))
+    }
+
+    fn cache_namespace(&self, py: Python<'_>) -> PyResult<CacheNamespace> {
+        self.inner
+            .run(py, |r| Ok(CacheNamespace::new(r.namespace())))
+    }
+
+    fn describe_cache(&self, py: Python<'_>, key: LocusKey) -> PyResult<Vec<CacheKey>> {
+        self.inner.run(py, |r| {
+            let mut keys = Vec::new();
+            with_locus(&key, |locus| r.describe(locus, &mut keys))?;
+            Ok(keys.into_iter().map(CacheKey::new).collect())
+        })
+    }
+
+    fn prefetch_cache(&self, py: Python<'_>, key: LocusKey) -> PyResult<()> {
+        self.inner
+            .run(py, |r| Ok(with_locus(&key, |locus| r.prefetch(locus))?))
+    }
+
+    fn clone_context(&self, py: Python<'_>) -> PyResult<Self> {
+        let r = self.inner.run(py, |r| Ok(r.try_clone()?))?;
+        Ok(Self {
+            inner: Shared::new(r),
+            chroms: self.chroms.clone(),
+        })
+    }
+
+    /// Writes the bases of `key` into `out`, 5' to 3' of its strand.
     fn sequence(
         &self,
         py: Python<'_>,
-        chrom: &str,
-        start: u32,
-        end: u32,
+        key: LocusKey,
         mut out: PyReadwriteArray1<'_, u8>,
     ) -> PyResult<()> {
         let out = out
             .as_slice_mut()
             .map_err(|_| PyValueError::new_err("out must be a contiguous uint8 array"))?;
         self.inner.run(py, |r| -> Done<()> {
-            Ok(r.sequence(Region::new(chrom, start, end), out)?)
+            Ok(with_locus(&key, |locus| r.sequence(locus, out))?)
         })
+    }
+
+    /// The bases of `key` in new NumPy storage.
+    fn fetch<'py>(&self, py: Python<'py>, key: LocusKey) -> PyResult<Bound<'py, PyArray1<u8>>> {
+        let length: u64 = key.1.iter().map(|&(s, e)| e.saturating_sub(s) as u64).sum();
+        // Initialized, privately allocated storage permits a safe mutable
+        // slice and preserves NumPy ownership/resizing of default outputs.
+        let out = PyArray1::zeros(py, [length as usize], false);
+        {
+            let mut borrow = out.readwrite();
+            let bytes = borrow
+                .as_slice_mut()
+                .expect("new NumPy array is contiguous");
+            self.inner.run(py, |r| {
+                Ok(with_locus(&key, |locus| r.sequence(locus, bytes))?)
+            })?;
+        }
+        Ok(out)
     }
 
     fn close(&self, py: Python<'_>) {
@@ -195,7 +303,7 @@ impl FastaWriter {
                 None => omicsweave_fasta::FastaWriter::new(out, line_width),
             };
             Ok(FastaWriter {
-                inner: Shared::new(writer),
+                inner: Shared::new_writer(writer),
                 path,
             })
         })

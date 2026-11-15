@@ -12,6 +12,7 @@ use omicsweave_hic::{BuildOptions, Chrom, HicHeader, HicReader, HicSidecar, Reco
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::cache::{self, CacheKey, CacheNamespace, PyBlockCache};
 use crate::error::{Done, OrRaise};
 use crate::shared::{Shared, path_str, save_sidecar, slice};
 
@@ -52,9 +53,16 @@ pub struct ContactReader {
 #[pymethods]
 impl ContactReader {
     #[new]
-    fn new(py: Python<'_>, path: PathBuf) -> PyResult<ContactReader> {
+    #[pyo3(signature = (path, cache=None))]
+    fn new(
+        py: Python<'_>,
+        path: PathBuf,
+        cache: Option<PyRef<'_, PyBlockCache>>,
+    ) -> PyResult<ContactReader> {
+        let cache = cache::handle(cache)?;
         py.detach(|| -> Result<ContactReader> {
-            let reader = HicReader::open(FileSource::open(&path)?)?;
+            let mut reader = HicReader::open(FileSource::open(&path)?)?;
+            reader.set_cache(cache);
             let h = reader.header();
             Ok(ContactReader {
                 version: h.version,
@@ -86,6 +94,56 @@ impl ContactReader {
         self.attributes.clone()
     }
 
+    fn set_cache(&self, py: Python<'_>, cache: Option<PyRef<'_, PyBlockCache>>) -> PyResult<()> {
+        let cache = cache::handle(cache)?;
+        self.inner.run(py, |c| {
+            c.reader.set_cache(cache);
+            Ok(())
+        })
+    }
+
+    fn cache_namespace(&self, py: Python<'_>) -> PyResult<CacheNamespace> {
+        self.inner
+            .run(py, |c| Ok(CacheNamespace::new(c.reader.cache_namespace())))
+    }
+
+    fn describe_cache(&self, py: Python<'_>, tile: Tile) -> PyResult<Vec<CacheKey>> {
+        let q = query(&tile)?;
+        self.inner.run(py, |c| {
+            let mut keys = Vec::new();
+            c.reader.describe_cache(q, &mut keys)?;
+            Ok(keys.into_iter().map(CacheKey::new).collect())
+        })
+    }
+
+    fn prefetch_cache(&self, py: Python<'_>, tile: Tile) -> PyResult<()> {
+        let q = query(&tile)?;
+        self.inner.run(py, |c| {
+            let mut requests = Vec::new();
+            c.reader.cache_plan(q, &mut requests)?;
+            for request in requests {
+                c.reader.load_cached_block(&request)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn clone_context(&self, py: Python<'_>) -> PyResult<Self> {
+        let reader = self.inner.run(py, |c| Ok(c.reader.try_clone_context()?))?;
+        Ok(Self {
+            inner: Shared::new(Contacts {
+                reader,
+                entries: Vec::new(),
+            }),
+            version: self.version,
+            genome: self.genome.clone(),
+            attributes: self.attributes.clone(),
+            chroms: self.chroms.clone(),
+            bp_resolutions: self.bp_resolutions.clone(),
+            frag_resolutions: self.frag_resolutions.clone(),
+        })
+    }
+
     fn chroms(&self) -> Vec<(String, u64)> {
         self.chroms.clone()
     }
@@ -111,12 +169,17 @@ impl ContactReader {
         Ok(sites.into_pyarray(py))
     }
 
-    /// Writes the tile row-major into `out`.
+    /// Writes the tile row-major into `out`; rows (columns) run from the
+    /// high coordinate down when `flip_rows` (`flip_cols`), for keys on the
+    /// reverse strand.
+    #[pyo3(signature = (tile, out, flip_rows=false, flip_cols=false))]
     fn matrix(
         &self,
         py: Python<'_>,
         tile: Tile,
         mut out: PyReadwriteArray2<'_, f32>,
+        flip_rows: bool,
+        flip_cols: bool,
     ) -> PyResult<()> {
         let q = query(&tile)?;
         q.check().or_raise()?;
@@ -137,8 +200,11 @@ impl ContactReader {
         let out = out
             .as_slice_mut()
             .map_err(|_| PyValueError::new_err("out must be a C-contiguous float32 array"))?;
-        self.inner
-            .run(py, |c| -> Done<()> { Ok(c.reader.matrix(q, out)?) })
+        self.inner.run(py, |c| -> Done<()> {
+            c.reader.matrix(q, out)?;
+            omicsweave_core::orient::flip_tile(out, rows, cols, flip_rows, flip_cols);
+            Ok(())
+        })
     }
 
     /// The tile's nonzero cells as (row, col, value) columns.
@@ -255,7 +321,7 @@ impl HicWriter {
         py.detach(|| -> Result<HicWriter> {
             let out = BufWriter::new(File::create(&path)?);
             Ok(HicWriter {
-                inner: Shared::new(omicsweave_hic::HicWriter::create(out, h, level)?),
+                inner: Shared::new_writer(omicsweave_hic::HicWriter::create(out, h, level)?),
                 path,
             })
         })

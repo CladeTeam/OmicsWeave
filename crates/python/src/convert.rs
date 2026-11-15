@@ -44,7 +44,7 @@ fn budget(threads: Option<usize>, memory: &str, tmp_dir: Option<PathBuf>) -> Res
 }
 
 /// (source format, (format, path) of every file written, records, bytes
-/// read, bytes spilled, seconds).
+/// read, bytes spilled, seconds, warnings).
 type Converted = (
     &'static str,
     Vec<(&'static str, String)>,
@@ -52,15 +52,18 @@ type Converted = (
     u64,
     u64,
     f64,
+    Vec<String>,
 );
 
 /// Converts `src` into `dst`; returns (source format, (format, path) of
 /// every file written with the destination first, records, bytes read,
-/// bytes spilled, seconds).
+/// bytes spilled, seconds, warnings).
 #[pyfunction]
 #[pyo3(signature = (src, dst, *, src_format=None, dst_format=None, threads=None, memory="4G",
                     tmp_dir=None, level=None, index=None, chrom_sizes=None, resolutions=None,
-                    sidecar=true, add_contigs=false, progress=None))]
+                    value=None, r#mod=None, strand=None,
+                    sidecar=true, add_contigs=false, sort=false, reference=None,
+                    progress=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn convert(
     py: Python<'_>,
@@ -75,8 +78,13 @@ pub fn convert(
     index: Option<String>,
     chrom_sizes: Option<PathBuf>,
     resolutions: Option<Vec<u32>>,
+    value: Option<String>,
+    r#mod: Option<String>,
+    strand: Option<String>,
     sidecar: bool,
     add_contigs: bool,
+    sort: bool,
+    reference: Option<PathBuf>,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<Converted> {
     let memory = memory.to_owned();
@@ -89,8 +97,13 @@ pub fn convert(
                 index: index.as_deref().map(Index::from_name).transpose()?,
                 chrom_sizes,
                 resolutions,
+                value,
+                mod_code: r#mod,
+                strand,
                 sidecar,
                 add_contigs,
+                sort,
+                reference,
             })?;
             let budget = budget(threads, &memory, tmp_dir)?;
             let report = match &progress {
@@ -124,6 +137,7 @@ pub fn convert(
         report.bytes_read,
         report.spilled,
         report.elapsed.as_secs_f64(),
+        report.warnings,
     ))
 }
 
@@ -131,11 +145,15 @@ pub fn convert(
 /// pipeline, buffer bytes).
 type Planned = (&'static str, &'static str, usize, u64, u64, u64, u64);
 
-/// Checks the conversion of `src` into `dst` against its budget without
-/// reading any data; returns (source format, destination format, threads,
-/// memory budget, fixed, pipeline, buffer bytes).
+/// Checks the conversion of `src` into `dst` (sorting, given `sort`; with
+/// the options that shape its plan) against its budget without reading any
+/// data; returns (source format, destination format, threads, memory
+/// budget, fixed, pipeline, buffer bytes).
 #[pyfunction]
-#[pyo3(signature = (src, dst, *, src_format=None, dst_format=None, threads=None, memory="4G"))]
+#[pyo3(signature = (src, dst, *, src_format=None, dst_format=None, threads=None, memory="4G",
+                    chrom_sizes=None, resolutions=None, value=None, r#mod=None, strand=None,
+                    sort=false))]
+#[allow(clippy::too_many_arguments)]
 pub fn plan_convert(
     py: Python<'_>,
     src: PathBuf,
@@ -144,10 +162,26 @@ pub fn plan_convert(
     dst_format: Option<String>,
     threads: Option<usize>,
     memory: &str,
+    chrom_sizes: Option<PathBuf>,
+    resolutions: Option<Vec<u32>>,
+    value: Option<String>,
+    r#mod: Option<String>,
+    strand: Option<String>,
+    sort: bool,
 ) -> PyResult<Planned> {
     let memory = memory.to_owned();
     py.detach(|| -> Result<Planned> {
-        let (conversion, from) = choose(src, dst, src_format.as_deref(), dst_format.as_deref())?;
+        let (mut conversion, from) =
+            choose(src, dst, src_format.as_deref(), dst_format.as_deref())?;
+        conversion.configure(&Options {
+            chrom_sizes,
+            resolutions,
+            value,
+            mod_code: r#mod,
+            strand,
+            sort,
+            ..Options::default()
+        })?;
         let to = conversion.target();
         let p = plan(conversion, budget(threads, &memory, None)?)?;
         Ok((

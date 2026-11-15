@@ -1,12 +1,12 @@
-//! Interval features (bigBed, BED): reading as columns, and writing bigBed.
+//! Interval features (bigBed): reading by region as columns, and writing
+//! bigBed.
 
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
 
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
-use omicsweave_bbi::{BIGBED_MAGIC, BIGWIG_MAGIC, BbiReader, BedSchema, Kind};
-use omicsweave_bed::BedTable;
+use omicsweave_bbi::{BbiReader, BedSchema, Kind};
 use omicsweave_core::{
     FileSource, IntervalEntry, IntervalRead, IntervalSize, IntervalsOut, Region, Result,
     StringColumn,
@@ -14,26 +14,13 @@ use omicsweave_core::{
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::cache::{self, CacheKey, CacheNamespace, PyBlockCache};
 use crate::error::{Done, OrRaise};
-use crate::shared::{Shared, head, path_str, save_sidecar, slice};
+use crate::shared::{Shared, path_str, save_sidecar, slice};
 use crate::track::{bbi_chrom_list, bbi_chroms, open_bbi, write_options};
 
-enum Features {
-    BigBed(Box<BbiReader<FileSource>>),
-    Bed(Box<BedTable>),
-}
-
-impl Features {
-    fn source(&mut self) -> &mut dyn IntervalRead {
-        match self {
-            Features::BigBed(r) => r.as_mut(),
-            Features::Bed(t) => t.as_mut(),
-        }
-    }
-}
-
 struct Intervals {
-    features: Features,
+    reader: Box<BbiReader<FileSource>>,
     entries: Vec<IntervalEntry>,
 }
 
@@ -41,7 +28,7 @@ type Columns = (Vec<u32>, Vec<u32>, Vec<i64>, Vec<u8>);
 
 impl Intervals {
     fn query(&mut self, region: Region<'_>) -> Result<Columns> {
-        let source = self.features.source();
+        let source: &mut dyn IntervalRead = self.reader.as_mut();
         let size: IntervalSize = source.query(region)?;
         self.entries.resize(size.entries, IntervalEntry::default());
         let mut offsets = vec![0i64; size.entries + 1];
@@ -61,44 +48,31 @@ impl Intervals {
 #[pyclass(frozen, module = "omicsweave._native")]
 pub struct IntervalReader {
     inner: Shared<Intervals>,
-    /// (name, length); BED files do not record lengths.
-    chroms: Vec<(String, Option<u32>)>,
+    chroms: Vec<(String, u32)>,
     auto_sql: Option<String>,
-    field_count: Option<(u16, u16)>,
+    field_count: (u16, u16),
 }
 
 #[pymethods]
 impl IntervalReader {
     #[new]
-    fn new(py: Python<'_>, path: PathBuf) -> PyResult<IntervalReader> {
+    #[pyo3(signature = (path, cache=None))]
+    fn new(
+        py: Python<'_>,
+        path: PathBuf,
+        cache: Option<PyRef<'_, PyBlockCache>>,
+    ) -> PyResult<IntervalReader> {
+        let cache = cache::handle(cache)?;
         py.detach(|| -> Result<IntervalReader> {
-            let source = FileSource::open(&path)?;
-            let magic = head(&source, 4)?;
-            let magic =
-                (magic.len() == 4).then(|| u32::from_le_bytes(magic[..4].try_into().unwrap()));
-            if matches!(magic, Some(BIGBED_MAGIC | BIGWIG_MAGIC)) {
-                let reader = open_bbi(source, Kind::BigBed)?;
-                let header = reader.header();
-                return Ok(IntervalReader {
-                    chroms: bbi_chroms(&reader)
-                        .into_iter()
-                        .map(|(n, l)| (n, Some(l)))
-                        .collect(),
-                    auto_sql: reader.auto_sql()?,
-                    field_count: Some((header.field_count, header.defined_field_count)),
-                    inner: Shared::new(Intervals {
-                        features: Features::BigBed(Box::new(reader)),
-                        entries: Vec::new(),
-                    }),
-                });
-            }
-            let table = BedTable::load(&std::fs::read(&path)?)?;
+            let mut reader = open_bbi(FileSource::open(&path)?, Kind::BigBed)?;
+            reader.set_cache(cache)?;
+            let header = reader.header();
             Ok(IntervalReader {
-                chroms: table.chroms().iter().map(|n| (n.clone(), None)).collect(),
-                auto_sql: None,
-                field_count: None,
+                chroms: bbi_chroms(&reader),
+                auto_sql: reader.auto_sql()?,
+                field_count: (header.field_count, header.defined_field_count),
                 inner: Shared::new(Intervals {
-                    features: Features::Bed(Box::new(table)),
+                    reader: Box::new(reader),
                     entries: Vec::new(),
                 }),
             })
@@ -106,8 +80,55 @@ impl IntervalReader {
         .or_raise()
     }
 
-    fn chroms(&self) -> Vec<(String, Option<u32>)> {
+    fn chroms(&self) -> Vec<(String, u32)> {
         self.chroms.clone()
+    }
+
+    fn set_cache(&self, py: Python<'_>, cache: Option<PyRef<'_, PyBlockCache>>) -> PyResult<()> {
+        let cache = cache::handle(cache)?;
+        self.inner.run(py, |t| Ok(t.reader.set_cache(cache)?))
+    }
+
+    fn cache_namespace(&self, py: Python<'_>) -> PyResult<CacheNamespace> {
+        self.inner
+            .run(py, |t| Ok(CacheNamespace::new(t.reader.cache_namespace())))
+    }
+
+    fn describe_cache(
+        &self,
+        py: Python<'_>,
+        chrom: &str,
+        start: u32,
+        end: u32,
+    ) -> PyResult<Vec<CacheKey>> {
+        self.inner.run(py, |t| {
+            let mut keys = Vec::new();
+            t.reader
+                .describe_cache(&Region::new(chrom, start, end).into(), &mut keys)?;
+            Ok(keys.into_iter().map(CacheKey::new).collect())
+        })
+    }
+
+    fn prefetch_cache(&self, py: Python<'_>, chrom: &str, start: u32, end: u32) -> PyResult<()> {
+        self.inner.run(py, |t| {
+            Ok(t.reader
+                .prefetch_cache(&Region::new(chrom, start, end).into())?)
+        })
+    }
+
+    fn clone_context(&self, py: Python<'_>) -> PyResult<Self> {
+        let reader = self
+            .inner
+            .run(py, |t| Ok(Box::new(t.reader.try_clone()?)))?;
+        Ok(Self {
+            inner: Shared::new(Intervals {
+                reader,
+                entries: Vec::new(),
+            }),
+            chroms: self.chroms.clone(),
+            auto_sql: self.auto_sql.clone(),
+            field_count: self.field_count,
+        })
     }
 
     #[getter]
@@ -115,9 +136,9 @@ impl IntervalReader {
         self.auto_sql.clone()
     }
 
-    /// (fields, standard fields) of a bigBed file.
+    /// (fields, standard fields).
     #[getter]
-    fn field_count(&self) -> Option<(u16, u16)> {
+    fn field_count(&self) -> (u16, u16) {
         self.field_count
     }
 
@@ -195,7 +216,7 @@ impl BigBedWriter {
             let writer =
                 omicsweave_bbi::BigBedWriter::create(out, bbi_chrom_list(chroms), schema, options)?;
             Ok(BigBedWriter {
-                inner: Shared::new(writer),
+                inner: Shared::new_writer(writer),
                 path,
             })
         })
