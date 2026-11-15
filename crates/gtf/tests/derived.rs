@@ -1,0 +1,429 @@
+//! Derived views against per-base computations on random annotations.
+
+mod common;
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use common::*;
+use omicsweave_gtf::{
+    Annotation, FeatureKind, Flank, IntervalSet, Level, ReadOptions, Select, Strand, Tags,
+};
+
+const LEN: u32 = 3000;
+
+type JunctionKey = (u32, u32, u32, Strand);
+
+fn random(seed: u64) -> Annotation {
+    let text = random_gtf(&mut Rng(seed), 3, 40, LEN);
+    Annotation::parse(text.as_bytes(), &ReadOptions::default()).unwrap()
+}
+
+/// Exonic bases of transcript `t` (its exon rows) as a bitmap.
+fn exon_bits(a: &Annotation, t: u32) -> Vec<bool> {
+    let f = a.features();
+    let mut bits = vec![false; LEN as usize];
+    for i in a.transcripts().features(t) {
+        let i = i as usize;
+        if f.kind[i] == FeatureKind::Exon {
+            bits[f.start[i] as usize..f.end[i] as usize].fill(true);
+        }
+    }
+    bits
+}
+
+/// Maximal runs of `true`.
+fn runs(bits: &[bool]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bits.len() {
+        if bits[i] {
+            let s = i;
+            while i < bits.len() && bits[i] {
+                i += 1;
+            }
+            out.push((s as u32, i as u32));
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn rows(set: &IntervalSet) -> Vec<(u32, u32, u32, Strand, u32)> {
+    (0..set.len())
+        .map(|i| {
+            (
+                set.seqid[i],
+                set.start[i],
+                set.end[i],
+                set.strand[i],
+                set.owner[i],
+            )
+        })
+        .collect()
+}
+
+fn naive_introns(a: &Annotation, t: u32) -> Vec<(u32, u32)> {
+    let r = runs(&exon_bits(a, t));
+    r.windows(2).map(|w| (w[0].1, w[1].0)).collect()
+}
+
+#[test]
+fn introns_exonic_regions_and_lengths() {
+    for seed in 0..8 {
+        let a = random(seed);
+        let tx = a.transcripts();
+        let mut want = Vec::new();
+        for t in 0..tx.len() as u32 {
+            let i = t as usize;
+            for (s, e) in naive_introns(&a, t) {
+                want.push((tx.seqid[i], s, e, tx.strand[i], t));
+            }
+            let len: u32 = exon_bits(&a, t).iter().filter(|&&b| b).count() as u32;
+            assert_eq!(a.transcript_lengths()[i], len);
+        }
+        assert_eq!(rows(a.introns()), want);
+
+        let g = a.genes();
+        let mut want = Vec::new();
+        for gene in 0..g.len() as u32 {
+            let mut bits = vec![false; LEN as usize];
+            for t in g.transcripts(gene) {
+                for (b, e) in bits.iter_mut().zip(exon_bits(&a, t)) {
+                    *b |= e;
+                }
+            }
+            let i = gene as usize;
+            for (s, e) in runs(&bits) {
+                want.push((g.seqid[i], s, e, g.strand[i], gene));
+            }
+        }
+        assert_eq!(rows(a.exonic_regions()), want);
+    }
+}
+
+#[test]
+fn junctions_collect_genes_and_transcripts() {
+    for seed in 0..8 {
+        let a = random(seed);
+        let tx = a.transcripts();
+        let mut want: BTreeMap<JunctionKey, (BTreeSet<u32>, Vec<u32>)> = BTreeMap::new();
+        for t in 0..tx.len() as u32 {
+            let i = t as usize;
+            for (s, e) in naive_introns(&a, t) {
+                let v = want.entry((tx.seqid[i], s, e, tx.strand[i])).or_default();
+                v.0.insert(tx.gene[i]);
+                v.1.push(t);
+            }
+        }
+        let j = a.junctions();
+        assert_eq!(j.len(), want.len());
+        for (k, ((s, st, en, strand), (genes, txs))) in want.iter().enumerate() {
+            let k = k as u32;
+            let i = k as usize;
+            assert_eq!(
+                (
+                    j.set.seqid[i],
+                    j.set.start[i],
+                    j.set.end[i],
+                    j.set.strand[i]
+                ),
+                (*s, *st, *en, *strand)
+            );
+            assert_eq!(j.genes.get(k), genes.iter().copied().collect::<Vec<_>>());
+            assert_eq!(j.transcripts.get(k), txs.as_slice());
+            assert_eq!(j.find(*s, *st, *en, *strand), Some(k));
+            assert_eq!(
+                j.find_any(*s, *st, *en).map(|x| j.set.start[x as usize]),
+                Some(*st)
+            );
+            let (d, ac) = (j.donor(k), j.acceptor(k));
+            if *strand == Strand::Reverse {
+                assert_eq!((d, ac), (en - 1, *st));
+            } else {
+                assert_eq!((d, ac), (*st, en - 1));
+            }
+        }
+        assert_eq!(j.find(0, 1, 2, Strand::Forward), None);
+    }
+}
+
+/// Bins of a unit of genes: runs of bases with the same non-empty set of
+/// covering transcripts.
+fn naive_bins(a: &Annotation, genes: &[u32]) -> Vec<(u32, u32, Vec<u32>)> {
+    let mut cover: Vec<Vec<u32>> = vec![Vec::new(); LEN as usize];
+    let mut txs: Vec<u32> = genes
+        .iter()
+        .flat_map(|&g| a.genes().transcripts(g))
+        .collect();
+    txs.sort_unstable();
+    for &t in &txs {
+        for (b, e) in cover.iter_mut().zip(exon_bits(a, t)) {
+            if e {
+                b.push(t);
+            }
+        }
+    }
+    let mut out: Vec<(u32, u32, Vec<u32>)> = Vec::new();
+    for (p, set) in cover.into_iter().enumerate() {
+        if set.is_empty() {
+            continue;
+        }
+        let p = p as u32;
+        if let Some(last) = out.last_mut()
+            && last.1 == p
+            && last.2 == set
+        {
+            last.1 += 1;
+            continue;
+        }
+        out.push((p, p + 1, set));
+    }
+    out
+}
+
+#[test]
+fn exon_bins_per_gene_and_aggregate() {
+    for seed in 0..6 {
+        let a = random(seed);
+        let g = a.genes();
+        let bins = a.exon_bins(false);
+        let mut want = Vec::new();
+        for gene in 0..g.len() as u32 {
+            for (n, (s, e, txs)) in naive_bins(&a, &[gene]).into_iter().enumerate() {
+                want.push((gene, n as u32 + 1, s, e, txs));
+            }
+        }
+        let got: Vec<_> = (0..bins.set.len())
+            .map(|i| {
+                (
+                    bins.set.owner[i],
+                    bins.part[i],
+                    bins.set.start[i],
+                    bins.set.end[i],
+                    bins.transcripts.get(i as u32).to_vec(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want);
+
+        // Aggregates: genes sharing exonic bases on the same seqid and
+        // strand, transitively.
+        let n = g.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(p: &mut [usize], x: usize) -> usize {
+            if p[x] != x {
+                let r = find(p, p[x]);
+                p[x] = r;
+            }
+            p[x]
+        }
+        let exonic = a.exonic_regions();
+        for i in 0..exonic.len() {
+            for j in 0..i {
+                if exonic.seqid[i] == exonic.seqid[j]
+                    && exonic.strand[i] == exonic.strand[j]
+                    && exonic.start[i] < exonic.end[j]
+                    && exonic.start[j] < exonic.end[i]
+                {
+                    let (x, y) = (
+                        find(&mut parent, exonic.owner[i] as usize),
+                        find(&mut parent, exonic.owner[j] as usize),
+                    );
+                    parent[x.max(y)] = x.min(y);
+                }
+            }
+        }
+        let mut groups: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        for gene in 0..n {
+            groups
+                .entry(find(&mut parent, gene))
+                .or_default()
+                .push(gene as u32);
+        }
+        let agg = a.exon_bins(true);
+        let mut want = Vec::new();
+        for members in groups.values() {
+            for (k, (s, e, txs)) in naive_bins(&a, members).into_iter().enumerate() {
+                want.push((members[0], k as u32 + 1, s, e, txs, members.clone()));
+            }
+        }
+        let got: Vec<_> = (0..agg.set.len())
+            .map(|i| {
+                (
+                    agg.set.owner[i],
+                    agg.part[i],
+                    agg.set.start[i],
+                    agg.set.end[i],
+                    agg.transcripts.get(i as u32).to_vec(),
+                    agg.genes.get(i as u32).to_vec(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+}
+
+#[test]
+fn windows_follow_strand_and_clip() {
+    let a = random(3);
+    let g = a.genes();
+    let lengths: Vec<Option<u32>> = (0..a.seqid_count())
+        .map(|s| (s != 1).then_some(LEN - 100))
+        .collect();
+    let d = a.derive().clip(&lengths);
+    let flank = Flank::new(250, 40);
+    let promoters = d.promoters(Level::Gene, flank);
+    let bodies = d.gene_bodies(Level::Gene, Flank::new(500, 0));
+    let tes = d.tes_windows(Level::Gene, Flank::new(30, 70));
+    let tss = a.derive().tss(Level::Gene);
+    assert_eq!(promoters.len(), g.len());
+    for i in 0..g.len() {
+        let (s, e) = (g.start[i] as i64, g.end[i] as i64);
+        let len = lengths[g.seqid[i] as usize].map_or(i64::MAX, |l| l as i64);
+        let clip = |a: i64, b: i64| {
+            let b = b.min(len).max(0);
+            (a.max(0).min(b) as u32, b as u32)
+        };
+        let rev = g.strand[i] == Strand::Reverse;
+        // 1-based GenomicRanges::promoters, then back to half-open.
+        let (tss1, want_p) = if rev {
+            (e, clip(e - 40, e + 250))
+        } else {
+            (s + 1, clip(s - 250, s + 40))
+        };
+        assert_eq!((promoters.start[i], promoters.end[i]), want_p, "gene {i}");
+        assert_eq!(promoters.owner[i], i as u32);
+        assert_eq!(a.str(promoters.name[i]), a.str(g.id[i]));
+        assert_eq!((tss.start[i] as i64 + 1, tss.end[i] as i64), (tss1, tss1));
+        let want_b = if rev {
+            clip(s, e + 500)
+        } else {
+            clip(s - 500, e)
+        };
+        assert_eq!((bodies.start[i], bodies.end[i]), want_b);
+        let want_t = if rev {
+            clip(s - 70, s + 30)
+        } else {
+            clip(e - 30, e + 70)
+        };
+        assert_eq!((tes.start[i], tes.end[i]), want_t);
+    }
+    // Windows index like any other set.
+    let mut hits = Vec::new();
+    promoters.overlaps(
+        promoters.seqid[0],
+        promoters.start[0],
+        promoters.end[0].max(promoters.start[0] + 1),
+        &mut hits,
+    );
+    assert!(hits.contains(&0) || promoters.start[0] == promoters.end[0]);
+    let t = a.derive().promoters(Level::Transcript, flank);
+    assert_eq!(t.len(), a.transcripts().len());
+    assert_eq!(t.owner_level(), Some(Level::Transcript));
+}
+
+#[test]
+fn selections_restrict_views() {
+    let a = random(5);
+    let sel = a.select(&Select::new().transcript_biotypes(["tt0"]));
+    let tx = a.transcripts();
+    assert!(!sel.transcripts.is_empty());
+    for &t in &sel.transcripts {
+        assert_eq!(a.str(tx.biotype[t as usize]), "tt0");
+        assert!(sel.genes.binary_search(&tx.gene[t as usize]).is_ok());
+    }
+    let want = (0..tx.len() as u32)
+        .filter(|&t| a.str(tx.biotype[t as usize]) == "tt0")
+        .count();
+    assert_eq!(sel.transcripts.len(), want);
+    let introns = a.derive().selection(&sel).introns();
+    assert!(
+        introns
+            .owner
+            .iter()
+            .all(|t| sel.transcripts.binary_search(t).is_ok())
+    );
+    let all = a
+        .introns()
+        .filter_owners(|t| sel.transcripts.binary_search(&t).is_ok());
+    assert_eq!(rows(&introns), rows(&all));
+
+    let by_gene = a.select(&Select::new().genes(["G0_1", "G2_3"]).seqids(["c0"]));
+    assert_eq!(by_gene.genes, [a.gene("G0_1").unwrap()]);
+    let bt = a.select(&Select::new().gene_biotypes(["bt1"]));
+    assert!(
+        bt.genes
+            .iter()
+            .all(|&g| a.str(a.genes().biotype[g as usize]) == "bt1")
+    );
+
+    let gencode = read(GENCODE_GTF);
+    let mane = gencode.select(&Select::new().tags(Tags::MANE_SELECT));
+    assert_eq!(
+        mane.transcripts,
+        [gencode.transcript("ENST00000641515.2").unwrap()]
+    );
+    let basic = gencode.select(&Select::new().tag_values(["basic"]));
+    assert_eq!(basic.transcripts.len(), 4);
+}
+
+#[test]
+fn sparse_gene_candidates_match_ids_names_and_combined_filters() {
+    let ann = read(GENCODE_GTF);
+    let wanted = ["OR4F5", "ENSG00000290825.1", "OR4F5", "absent"];
+    for seqids in [None, Some(vec!["chr1"]), Some(vec!["chrM"])] {
+        let mut filter = Select::new().genes(wanted);
+        if let Some(seqids) = &seqids {
+            filter = filter.seqids(seqids.iter().copied());
+        }
+        let got = ann.select(&filter);
+        let g = ann.genes();
+        let genes: Vec<u32> = (0..g.len() as u32)
+            .filter(|&r| {
+                let i = r as usize;
+                (wanted.contains(&ann.str(g.id[i])) || wanted.contains(&ann.str(g.name[i])))
+                    && seqids
+                        .as_ref()
+                        .is_none_or(|s| s.contains(&ann.seqid_name(g.seqid[i])))
+            })
+            .collect();
+        let transcripts: Vec<u32> = genes
+            .iter()
+            .flat_map(|&g| ann.genes().transcripts(g))
+            .collect();
+        assert_eq!(got.genes, genes);
+        assert_eq!(got.transcripts, transcripts);
+    }
+    let empty = ann.select(&Select::new().genes(Vec::<String>::new()));
+    assert!(empty.genes.is_empty());
+    assert!(empty.transcripts.is_empty());
+}
+
+#[test]
+fn exon_index_and_cursor_cover_feature_rows() {
+    let a = random(11);
+    let ix = a.interval_index(Level::Exon);
+    assert_eq!(ix.len(), a.exons().len());
+    let f = a.features();
+    for s in 0..a.seqid_count() as u32 {
+        let mut c = a.cursor(Level::Exon, s);
+        let mut got = Vec::new();
+        for p in (0..LEN).step_by(37) {
+            got.clear();
+            c.query(p, p + 50, &mut got);
+            let mut want: Vec<u32> = a
+                .exons()
+                .iter()
+                .copied()
+                .filter(|&e| {
+                    let i = e as usize;
+                    a.feature_seqid(e) == s && f.start[i] < p + 50 && p < f.end[i]
+                })
+                .collect();
+            want.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, want);
+        }
+    }
+}
