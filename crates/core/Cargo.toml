@@ -8,13 +8,9 @@ rust-version.workspace = true
 [dependencies]
 thiserror.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true
 
-[[bench]]
-name = "identity"
-harness = false
-
-[[bench]]
-name = "exec"
-harness = false

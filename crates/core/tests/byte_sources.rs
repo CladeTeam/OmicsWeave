@@ -51,3 +51,18 @@ fn empty_source_accepts_only_empty_read_at_zero() {
     assert!(source.read_exact_at(&mut [], 1).is_err());
     assert!(source.read_exact_at(&mut [0], 0).is_err());
 }
+
+#[test]
+fn cloned_file_and_shared_handles_retain_positional_reads() {
+    let source = FileSource::open(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/read-at.txt"
+    ))
+    .unwrap();
+    let cloned = source.try_clone().unwrap();
+    drop(source);
+    compare_reads(&cloned);
+    let shared = std::sync::Arc::new(cloned);
+    compare_reads(&shared);
+    compare_reads(&shared.clone());
+}

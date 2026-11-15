@@ -7,7 +7,9 @@
 //! caller, then copied out; nothing is decoded twice.
 
 use crate::Result;
+use crate::bins::BinSpec;
 use crate::layout::{IntervalSize, IntervalsOut, TrackEntry};
+use crate::locus::Locus;
 use crate::region::Region;
 
 /// Sequences (`.fa`, `.fa.gz`, `.2bit`).
@@ -15,22 +17,33 @@ pub trait SequenceRead {
     /// Length of `chrom`; [`crate::Error::UnknownChrom`] if absent.
     fn chrom_len(&self, chrom: &str) -> Result<u32>;
 
-    /// Writes the bases of `region` as ASCII into `out`
-    /// (`out.len() == region.len()`). The region must lie within the
-    /// sequence.
-    fn sequence(&mut self, region: Region<'_>, out: &mut [u8]) -> Result<()>;
+    /// Writes the bases of `locus` as ASCII into `out`
+    /// (`out.len() == locus.len()`), 5' to 3' of its strand: a reverse
+    /// locus reads the reverse complement of its concatenated spans. Every
+    /// span must lie within the sequence. Each stored block the spans
+    /// overlap is read and decoded once.
+    fn sequence(&mut self, locus: &Locus<'_>, out: &mut [u8]) -> Result<()>;
 }
 
-/// Signal tracks (bigWig). Unknown chromosomes are errors; regions may run
-/// past a chromosome's end, where there is no data; an empty region yields
-/// no values and no entries.
+/// Signal tracks (bigWig). Unknown chromosomes are errors; keys may run
+/// past a chromosome's end, where there is no data; an empty key yields
+/// no values, bins or entries.
 pub trait TrackRead {
     /// Length of `chrom`; [`crate::Error::UnknownChrom`] if absent.
     fn chrom_len(&self, chrom: &str) -> Result<u32>;
 
-    /// Writes one value per base of `region` into `out`
-    /// (`out.len() == region.len()`); bases without data read NaN.
-    fn values(&mut self, region: Region<'_>, out: &mut [f32]) -> Result<()>;
+    /// Writes one value per position of `locus` into `out`
+    /// (`out.len() == locus.len()`), 5' to 3' of its strand; positions
+    /// without data read NaN. Each data block the spans overlap is decoded
+    /// once.
+    fn values(&mut self, locus: &Locus<'_>, out: &mut [f32]) -> Result<()>;
+
+    /// Writes the statistics of `spec` over the bins of `locus` into `out`:
+    /// one row of [`BinSpec::count`] bins per statistic, in `spec.stats`
+    /// order, bins 5' to 3' (`out.len() == spec.output_len(locus.len())`).
+    /// See [`crate::BinSpec`] for the bin layout and statistics. The data
+    /// are decoded once for all bins and statistics.
+    fn bins(&mut self, locus: &Locus<'_>, spec: &BinSpec<'_>, out: &mut [f32]) -> Result<()>;
 
     /// Decodes the intervals with data in `region` once, clipped to it, in
     /// position order, and holds them in the reader until the next query.
@@ -43,7 +56,7 @@ pub trait TrackRead {
     fn write_entries(&self, out: &mut [TrackEntry]) -> Result<()>;
 }
 
-/// Interval features (bigBed, BED). Entries are the features overlapping
+/// Interval features (bigBed). Entries are the features overlapping
 /// the region, unclipped, ordered by start; an empty region, or a chromosome
 /// without features (including one the source never names), yields none.
 pub trait IntervalRead {

@@ -62,6 +62,16 @@ impl<T: ReadAt + ?Sized> ReadAt for &T {
     }
 }
 
+impl<T: ReadAt + ?Sized> ReadAt for std::sync::Arc<T> {
+    fn len(&self) -> u64 {
+        (**self).len()
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        (**self).read_exact_at(buf, offset)
+    }
+}
+
 /// A file read with `pread`; its length is taken once at open.
 pub struct FileSource {
     file: File,
@@ -73,6 +83,15 @@ impl FileSource {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
         Ok(FileSource { file, len })
+    }
+
+    /// A new positional-read handle to the same open file, retaining its
+    /// recorded length. This does not reopen a path that may have changed.
+    pub fn try_clone(&self) -> Result<FileSource> {
+        Ok(FileSource {
+            file: self.file.try_clone()?,
+            len: self.len,
+        })
     }
 }
 
