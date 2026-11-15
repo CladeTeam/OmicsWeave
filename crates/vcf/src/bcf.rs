@@ -170,6 +170,20 @@ pub(crate) fn parse_record(
     indiv: &[u8],
     rec: &mut Record,
 ) -> Result<()> {
+    parse_record_fields(h, fixed, shared, indiv, rec, true)
+}
+
+/// Indexed genotype matrices consume selected typed sample rows directly,
+/// avoiding a second, all-sample widened GT staging buffer. Public records
+/// still unpack the complete genotype vector.
+pub(crate) fn parse_record_fields(
+    h: &Header,
+    fixed: &Fixed,
+    shared: &[u8],
+    indiv: &[u8],
+    rec: &mut Record,
+    unpack_genotypes: bool,
+) -> Result<()> {
     rec.clear();
     if fixed.rid < 0
         || fixed.rid as usize >= h.contigs.len()
@@ -307,9 +321,11 @@ pub(crate) fn parse_record(
         if !matches!(gt.ty, INT8 | INT16 | INT32) {
             return Err(bad("GT is not an integer vector"));
         }
-        let (out, data) = rec.gt_and_data(gt.n as usize);
-        let bytes = &data.fmt_bytes[gt.start..gt.end];
-        decode_gt(gt.ty, gt.n as usize, bytes, n_sample, out);
+        if unpack_genotypes {
+            let (out, data) = rec.gt_and_data(gt.n as usize);
+            let bytes = &data.fmt_bytes[gt.start..gt.end];
+            decode_gt(gt.ty, gt.n as usize, bytes, n_sample, out);
+        }
     }
     if n_fmt > 0 && c.at != indiv.len() {
         return Err(bad("trailing bytes in FORMAT block"));

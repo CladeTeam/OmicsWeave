@@ -246,6 +246,111 @@ fn has_missing_string(s: &KStr, mut beg: usize) -> bool {
     false
 }
 
+/// Comma items before a C terminator, excluding a trailing empty item while
+/// retaining leading and interior empty items as filter.c does.
+fn string_items(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes.split(|&b| b == b',').scan(0usize, move |at, item| {
+        if *at >= bytes.len() {
+            return None;
+        }
+        *at += item.len() + 1;
+        Some(item)
+    })
+}
+
+/// Large, fully initialized vectors admit a set intersection for equality,
+/// or a constant-size distinct-value summary for existential inequality.
+/// Sparse states fall back to ordered tracked reads, preserving errors.
+#[allow(clippy::too_many_arguments)]
+fn large_string_vectors(
+    a: &KStr,
+    abeg: usize,
+    alen: usize,
+    b: &KStr,
+    bbeg: usize,
+    blen: usize,
+    logic: i32,
+    ml: &[i32; 3],
+) -> Option<bool> {
+    if alen < 128 || blen < 128 || !matches!(logic, TOK_EQ | TOK_NE) {
+        return None;
+    }
+    fn dense(s: &KStr, beg: usize, len: usize) -> Option<&[u8]> {
+        let end = beg.checked_add(len)?;
+        // The ordered loop also reads the boundary byte after a final item.
+        let initialized = s.buf.get(beg..end.checked_add(1)?)?;
+        let bytes = &initialized[..len];
+        let end = bytes.iter().position(|&c| c == 0).unwrap_or(len);
+        Some(&bytes[..end])
+    }
+    let (a, b) = (dense(a, abeg, alen)?, dense(b, bbeg, blen)?);
+    // A long scalar/literal must not pay for indexing a one-item vector.
+    if !a.get(..64)?.contains(&b',') || !b.get(..64)?.contains(&b',') {
+        return None;
+    }
+    struct Summary<'a> {
+        items: usize,
+        missing: bool,
+        present: usize,
+        first: Option<&'a [u8]>,
+        varied: bool,
+    }
+    fn summarize(bytes: &[u8]) -> Summary<'_> {
+        let mut out = Summary {
+            items: 0,
+            missing: false,
+            present: 0,
+            first: None,
+            varied: false,
+        };
+        for item in string_items(bytes) {
+            out.items += 1;
+            if item == b"." {
+                out.missing = true;
+            } else {
+                out.present += 1;
+                if let Some(first) = out.first {
+                    out.varied |= first != item;
+                } else {
+                    out.first = Some(item);
+                }
+            }
+        }
+        out
+    }
+    let (sa, sb) = (summarize(a), summarize(b));
+    if sa.items < 16 || sb.items < 16 {
+        return None;
+    }
+    if (sa.missing && sb.missing && ml[2] != 0)
+        || (sa.missing && sb.present != 0 && ml[1] != 0)
+        || (sb.missing && sa.present != 0 && ml[1] != 0)
+    {
+        return Some(true);
+    }
+    if sa.present == 0 || sb.present == 0 {
+        return Some(false);
+    }
+    if logic == TOK_NE {
+        return Some(sa.varied || sb.varied || sa.first != sb.first);
+    }
+    if !sa.varied {
+        return Some(string_items(b).any(|item| item != b"." && Some(item) == sa.first));
+    }
+    if !sb.varied {
+        return Some(string_items(a).any(|item| item != b"." && Some(item) == sb.first));
+    }
+    let (small, large, count) = if sa.present <= sb.present {
+        (a, b, sa.present)
+    } else {
+        (b, a, sb.present)
+    };
+    let mut keys = HashSet::new();
+    keys.try_reserve(count).ok()?;
+    keys.extend(string_items(small).filter(|&item| item != b"."));
+    Some(string_items(large).any(|item| item != b"." && keys.contains(item)))
+}
+
 /// `_match_vector_strings`: whether any field of `a` matches any of `b`.
 // Preserve the two independent string spans and the C comparison flags.
 #[allow(clippy::too_many_arguments)]
@@ -261,6 +366,7 @@ fn match_vector_strings(
 ) -> bool {
     let aend = abeg + alen;
     let bend = bstr + blen;
+    let mut reduced = false;
     while abeg < aend && a.get(abeg) != 0 {
         let mut amid = abeg;
         while amid < aend && a.get(amid) != 0 && a.get(amid) != b',' {
@@ -300,6 +406,16 @@ fn match_vector_strings(
             break;
         }
         abeg = amid + 1;
+        // Preserve the allocation-free early match of the first item. Once
+        // its Cartesian scan fails, large dense inputs can avoid the rest.
+        if !reduced && abeg < aend {
+            reduced = true;
+            if let Some(result) =
+                large_string_vectors(a, abeg, aend - abeg, b, bstr, blen, logic, ml)
+            {
+                return result;
+            }
+        }
     }
     false
 }
@@ -328,8 +444,8 @@ fn regex_vector_strings(
         if m {
             return true;
         }
-        let field: Vec<u8> = (str..mid).map(|k| s.get(k)).collect();
-        let mut m = re.is_match(&field);
+        let field = s.bytes(str, mid);
+        let mut m = re.is_match(field.as_ref());
         if logic == TOK_NLIKE {
             m = !m;
         }
@@ -698,17 +814,20 @@ fn cmp_vectors(a: &Token, b: &Token, r: &mut Token, op: i32, ml: &[i32; 3]) -> R
     init_samples(a, b, r);
     let mv = |t: &Token, i: isize| usize::from(is_mv(t.values.get(i)));
     if a.nsamples == 0 && b.nsamples == 0 {
-        if a.nvalues >= 64 && b.nvalues >= 64 && matches!(op, TOK_EQ | TOK_NE) {
-            if let Some(pass) = equality_vectors(a, b, op, ml) {
-                r.pass_site = i32::from(pass);
-                return Ok(());
-            }
+        if a.nvalues >= 64
+            && b.nvalues >= 64
+            && matches!(op, TOK_EQ | TOK_NE)
+            && let Some(pass) = equality_vectors(a, b, op, ml)
+        {
+            r.pass_site = i32::from(pass);
+            return Ok(());
         }
-        if a.nvalues >= 16 && b.nvalues >= 16 {
-            if let Some(pass) = ordered_vectors(a, b, op, ml) {
-                r.pass_site = i32::from(pass);
-                return Ok(());
-            }
+        if a.nvalues >= 16
+            && b.nvalues >= 16
+            && let Some(pass) = ordered_vectors(a, b, op, ml)
+        {
+            r.pass_site = i32::from(pass);
+            return Ok(());
         }
         if a.nvalues == 0 && b.nvalues == 0 {
             r.pass_site = ml[2];
@@ -1255,7 +1374,7 @@ fn cmp_string_hash(a: &Token, b: &Token, r: &mut Token) -> Result<()> {
     let s = &b.str_value;
     if b.nsamples == 0 {
         if b.idx >= 0 {
-            let mut ret = !s.is_null() && hash.contains(&s.cstr(0));
+            let mut ret = !s.is_null() && hash.contains(s.cstr(0).as_ref());
             if ne {
                 ret = !ret;
             }
@@ -1269,8 +1388,8 @@ fn cmp_string_hash(a: &Token, b: &Token, r: &mut Token) -> Result<()> {
             while s.get(eptr) != 0 && s.get(eptr) != b',' {
                 eptr += 1;
             }
-            let field: Vec<u8> = (ptr..eptr).map(|k| s.get(k)).collect();
-            ret |= hash.contains(&field);
+            let field = s.bytes(ptr, eptr);
+            ret |= hash.contains(field.as_ref());
             if s.get(eptr) == 0 {
                 break;
             }
@@ -1295,12 +1414,10 @@ fn cmp_string_hash(a: &Token, b: &Token, r: &mut Token) -> Result<()> {
         let mut ret = false;
         if b.idx >= 0 {
             let mut k = start;
-            let mut field = Vec::new();
             while byte(k) != 0 {
-                field.push(byte(k));
                 k += 1;
             }
-            ret = hash.contains(&field);
+            ret = hash.contains(s.bytes(start, k).as_ref());
         } else {
             let mut ptr = start;
             while byte(ptr) != 0 {
@@ -1308,8 +1425,8 @@ fn cmp_string_hash(a: &Token, b: &Token, r: &mut Token) -> Result<()> {
                 while byte(eptr) != 0 && byte(eptr) != b',' {
                     eptr += 1;
                 }
-                let field: Vec<u8> = (ptr..eptr).map(byte).collect();
-                ret |= hash.contains(&field);
+                let field = s.bytes(ptr, eptr);
+                ret |= hash.contains(field.as_ref());
                 if byte(eptr) == 0 {
                     break;
                 }
@@ -1348,7 +1465,7 @@ fn cmp_id(a: &Token, b: &Token, r: &mut Token, rec: &Record) -> Result<()> {
                 return Err(run_error("Error occurred while evaluating the expression"));
             }
             if r.tok_type == TOK_EQ || r.tok_type == TOK_NE {
-                pass = b.str_value.cstr(0) == id;
+                pass = b.str_value.cstr(0).as_ref() == id;
             } else {
                 if r.tok_type != TOK_LIKE && r.tok_type != TOK_NLIKE {
                     return Err(run_error(format!(
@@ -3511,6 +3628,137 @@ impl Filter {
             }
         }
         Ok(nargs)
+    }
+}
+
+#[cfg(test)]
+mod string_vector_tests {
+    use super::*;
+
+    fn literal(bytes: &[u8]) -> KStr {
+        let mut s = KStr::default();
+        s.puts(bytes);
+        s
+    }
+
+    fn items(bytes: &[u8]) -> Vec<&[u8]> {
+        let bytes = &bytes[..bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len())];
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        let mut fields: Vec<_> = bytes.split(|&c| c == b',').collect();
+        if bytes.ends_with(b",") {
+            fields.pop();
+        }
+        fields
+    }
+
+    fn expected(a: &[u8], b: &[u8], logic: i32, ml: &[i32; 3]) -> bool {
+        items(a).iter().any(|&a| {
+            items(b).iter().any(|&b| {
+                let missing = usize::from(a == b".") + usize::from(b == b".");
+                if missing != 0 {
+                    ml[missing] != 0
+                } else if logic == TOK_NE {
+                    a != b
+                } else {
+                    a == b
+                }
+            })
+        })
+    }
+
+    #[test]
+    fn large_comma_vectors_follow_existential_pair_and_missing_semantics() {
+        let ascending = |prefix: &str| {
+            (0..64)
+                .map(|i| format!("{prefix}{i:03}"))
+                .collect::<Vec<_>>()
+                .join(",")
+                .into_bytes()
+        };
+        let mut inputs = vec![
+            ascending("left"),
+            ascending("right"),
+            vec!["same"; 64].join(",").into_bytes(),
+            vec!["."; 128].join(",").into_bytes(),
+            vec![""; 192].join(",").into_bytes(),
+            vec![".,,word"; 32].join(",").into_bytes(),
+            b"".to_vec(),
+            b",".to_vec(),
+            b".,".to_vec(),
+        ];
+        let mut late = ascending("right");
+        late.extend_from_slice(b",left063");
+        inputs.push(late);
+        let mut nul = ascending("left");
+        nul[150] = 0;
+        inputs.push(nul);
+        for a in &inputs {
+            for b in &inputs {
+                let (sa, sb) = (literal(a), literal(b));
+                for logic in [TOK_EQ, TOK_NE] {
+                    for flags in 0..8 {
+                        let ml = [flags & 1, (flags >> 1) & 1, (flags >> 2) & 1];
+                        take_undefined();
+                        let wanted = expected(a, b, logic, &ml);
+                        assert_eq!(
+                            match_vector_strings(&sa, 0, a.len(), &sb, 0, b.len(), logic, &ml),
+                            wanted,
+                            "{a:?} {b:?} {logic} {ml:?}"
+                        );
+                        assert!(take_undefined().is_none());
+                        if let Some(reduced) =
+                            large_string_vectors(&sa, 0, a.len(), &sb, 0, b.len(), logic, &ml)
+                        {
+                            assert_eq!(reduced, wanted);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_unwritten_suffix_and_dense_early_match_keep_ordered_errors() {
+        let bytes = (0..64)
+            .map(|i| format!("item{i:03}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let full = literal(bytes.as_bytes());
+        let mut sparse = full.clone();
+        sparse.buf.truncate(40);
+        sparse.set(bytes.len(), 0);
+        let ml = [1, 0, 1];
+        take_undefined();
+        assert!(match_vector_strings(
+            &sparse,
+            0,
+            bytes.len(),
+            &full,
+            0,
+            bytes.len(),
+            TOK_EQ,
+            &ml
+        ));
+        assert!(take_undefined().is_none());
+        let other = literal(bytes.replace("item", "else").as_bytes());
+        take_undefined();
+        assert!(!match_vector_strings(
+            &sparse,
+            0,
+            bytes.len(),
+            &other,
+            0,
+            other.l,
+            TOK_EQ,
+            &ml
+        ));
+        assert!(take_undefined().is_some());
+        assert!(
+            large_string_vectors(&sparse, 0, bytes.len(), &other, 0, other.l, TOK_EQ, &ml)
+                .is_none()
+        );
     }
 }
 

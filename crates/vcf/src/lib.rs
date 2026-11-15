@@ -1,5 +1,5 @@
-//! VCF and BCF variant files, read whole and in order, decoded as htslib
-//! decodes them: contig, position, alleles, reference span (`rlen`, from
+//! VCF and BCF variant files, read whole and in order or (BCF) by region,
+//! decoded as htslib decodes them: contig, position, alleles, reference span (`rlen`, from
 //! REF, INFO/END, INFO/SVLEN and FORMAT/LEN), genotypes in htslib's
 //! encoding, and ID, QUAL, FILTER and every INFO and FORMAT value in the
 //! typed form htslib holds them in (see [`InfoField`], [`FormatField`] and
@@ -8,6 +8,10 @@
 //! [`VariantReader`] detects the format (VCF text or BCF) and compression
 //! (none, gzip or BGZF) from the first bytes and fills a reusable
 //! [`Record`] per call, so reading allocates only while records grow.
+//!
+//! [`BcfReader`] reads a BGZF BCF by region through its CSI index, as
+//! htslib's `bcf_itr_queryi` does, and gives the [`GenotypeMatrix`] of a
+//! region.
 //!
 //! [`read_vcf_header`], [`bcf_header_bytes`] and [`BcfEncoder`] convert VCF
 //! text to the uncompressed BCF bytes htslib writes from it, a line at a
@@ -20,6 +24,7 @@ mod fields;
 mod filter;
 mod header;
 mod hrec;
+mod indexed;
 mod reader;
 mod record;
 mod text;
@@ -32,6 +37,7 @@ pub use fields::{
 };
 pub use filter::Filter;
 pub use header::{Contig, Header, Key, LineKind, Number, ValueType};
+pub use indexed::{BcfReader, GT_ABSENT, GT_MISSING, GenotypeMatrix, Strings};
 pub use reader::{Format, VariantReader};
 pub use record::{
     GT_MISSING_VALUE, GT_VECTOR_END, Genotypes, Record, VCF_BND, VCF_INDEL, VCF_MNP, VCF_OTHER,

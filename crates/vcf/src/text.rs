@@ -168,19 +168,19 @@ impl Dictionary for Header {
     }
 
     fn info(&mut self, name: &str) -> Result<(u32, ValueType)> {
-        if let Some(id) = self.key_id(name) {
-            if let Some(ty) = self.key(id).and_then(|key| key.info) {
-                return Ok((id, ty));
-            }
+        if let Some(id) = self.key_id(name)
+            && let Some(ty) = self.key(id).and_then(|key| key.info)
+        {
+            return Ok((id, ty));
         }
         Ok((self.add_undeclared(name, false), ValueType::String))
     }
 
     fn format(&mut self, name: &str) -> Result<(u32, ValueType)> {
-        if let Some(id) = self.key_id(name) {
-            if let Some(ty) = self.key(id).and_then(|key| key.format) {
-                return Ok((id, ty));
-            }
+        if let Some(id) = self.key_id(name)
+            && let Some(ty) = self.key(id).and_then(|key| key.format)
+        {
+            return Ok((id, ty));
         }
         Ok((self.add_undeclared(name, true), ValueType::String))
     }
@@ -373,15 +373,15 @@ pub(crate) fn parse_line<D: Dictionary>(
             spans.end = span_int(v.ty, v.bytes);
         }
     }
-    if has_svlen_allele(rec) {
-        if let Some(svlen) = h.key_id("SVLEN").and_then(|id| rec.info_field(id)) {
-            spans.svlen = Some(span_values(svlen.values.ty, svlen.values.bytes));
-        }
+    if has_svlen_allele(rec)
+        && let Some(svlen) = h.key_id("SVLEN").and_then(|id| rec.info_field(id))
+    {
+        spans.svlen = Some(span_values(svlen.values.ty, svlen.values.bytes));
     }
-    if has_gvcf_allele(rec) {
-        if let Some(len) = h.key_id("LEN").and_then(|id| rec.format_field(id)) {
-            spans.len = Some(span_max(len.values.ty, len.values.bytes));
-        }
+    if has_gvcf_allele(rec)
+        && let Some(len) = h.key_id("LEN").and_then(|id| rec.format_field(id))
+    {
+        spans.len = Some(span_max(len.values.ty, len.values.bytes));
     }
     rec.rlen = rlen(rec.pos, rec, &spans)?;
     rec.end = spans.end;

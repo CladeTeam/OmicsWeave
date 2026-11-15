@@ -195,6 +195,15 @@ struct KStr {
 }
 
 impl KStr {
+    /// Dense, initialized ranges can be consumed without copying. Sparse
+    /// states still use tracked reads so unwritten bytes remain errors.
+    fn bytes(&self, begin: usize, end: usize) -> std::borrow::Cow<'_, [u8]> {
+        match self.buf.get(begin..end) {
+            Some(bytes) => std::borrow::Cow::Borrowed(bytes),
+            None => std::borrow::Cow::Owned((begin..end).map(|i| self.get(i)).collect()),
+        }
+    }
+
     fn is_null(&self) -> bool {
         self.m == 0
     }
@@ -314,13 +323,18 @@ impl KStr {
     }
 
     /// The C string at at: bytes up to the first NUL.
-    fn cstr(&self, at: usize) -> Vec<u8> {
+    fn cstr(&self, at: usize) -> std::borrow::Cow<'_, [u8]> {
+        if let Some(bytes) = self.buf.get(at..)
+            && let Some(end) = bytes.iter().position(|&c| c == 0)
+        {
+            return std::borrow::Cow::Borrowed(&bytes[..end]);
+        }
         let mut out = Vec::new();
         let mut i = at;
         loop {
             let c = self.get(i);
             if c == 0 {
-                return out;
+                return std::borrow::Cow::Owned(out);
             }
             out.push(c);
             i += 1;
@@ -867,10 +881,10 @@ fn expand_path(path: &[u8]) -> Vec<u8> {
         }
         return path.to_vec();
     }
-    if at(path, 0) == b'$' {
-        if let Some(v) = std::env::var_os(std::ffi::OsStr::from_bytes(&path[1..])) {
-            return v.as_bytes().to_vec();
-        }
+    if at(path, 0) == b'$'
+        && let Some(v) = std::env::var_os(std::ffi::OsStr::from_bytes(&path[1..]))
+    {
+        return v.as_bytes().to_vec();
     }
     path.to_vec()
 }
@@ -1008,18 +1022,18 @@ impl Init<'_> {
             }
             let mut fname = expand_path(&tag_idx[1..]);
             let mut list = read_list(&fname);
-            if list.is_none() {
-                if let Some(c) = colon {
-                    let (idxs2, idx2) = parse_idxs(&tag_idx[c + 1..])?
-                        .ok_or_else(|| init_error(format!("Could not parse the index: {ori}")))?;
-                    tok.idxs = idxs2;
-                    tok.idx = idx2;
-                    match fname.iter().rposition(|&c| c == b':') {
-                        Some(fc) => fname.truncate(fc),
-                        None => return Err(unsupported("sample list name without its colon")),
-                    }
-                    list = read_list(&fname);
+            if list.is_none()
+                && let Some(c) = colon
+            {
+                let (idxs2, idx2) = parse_idxs(&tag_idx[c + 1..])?
+                    .ok_or_else(|| init_error(format!("Could not parse the index: {ori}")))?;
+                tok.idxs = idxs2;
+                tok.idx = idx2;
+                match fname.iter().rposition(|&c| c == b':') {
+                    Some(fc) => fname.truncate(fc),
+                    None => return Err(unsupported("sample list name without its colon")),
                 }
+                list = read_list(&fname);
             }
             let list = list.ok_or_else(|| {
                 init_error(format!(
@@ -1271,10 +1285,10 @@ impl Init<'_> {
 
         let mut name = s[..len].to_vec();
         let mut is_array = 0;
-        if name.last() == Some(&b']') {
-            if let Some(i) = name.iter().position(|&c| c == b'[') {
-                is_array = i + 1;
-            }
+        if name.last() == Some(&b']')
+            && let Some(i) = name.iter().position(|&c| c == b'[')
+        {
+            is_array = i + 1;
         }
         let idx_text = if is_array > 0 {
             let t = name[is_array..].to_vec();
@@ -2076,7 +2090,7 @@ mod shadow_tests {
             s.set(i, c);
         }
         assert_eq!(s.buf, b"abcdefgZ\0");
-        assert_eq!(s.cstr(0), b"abcdefgZ");
+        assert_eq!(s.cstr(0).as_ref(), b"abcdefgZ");
         assert!(take_undefined().is_none());
         s.set(20, b'Q');
         s.reallocate(4);

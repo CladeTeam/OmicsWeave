@@ -339,10 +339,10 @@ impl Header {
                 return Err(Error::invalid("vcf header", "invalid #CHROM columns"));
             }
         }
-        if let Some(format) = fields.next() {
-            if format != "FORMAT" {
-                return Err(Error::invalid("vcf header", "invalid FORMAT column"));
-            }
+        if let Some(format) = fields.next()
+            && format != "FORMAT"
+        {
+            return Err(Error::invalid("vcf header", "invalid FORMAT column"));
         }
         h.samples = cols.split('\t').skip(9).map(str::to_owned).collect();
 
