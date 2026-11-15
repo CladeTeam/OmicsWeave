@@ -1,6 +1,6 @@
 [package]
 name = "omicsweave-bgzf"
-description = "BGZF blocks, parallel BGZF writing and reading, and BAI/CSI binning indexes for OmicsWeave"
+description = "BGZF blocks, parallel BGZF writing and reading, BAI/CSI binning indexes, and region reads at virtual offsets for OmicsWeave"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 omicsweave-core = { path = "../core" }
 libdeflater.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

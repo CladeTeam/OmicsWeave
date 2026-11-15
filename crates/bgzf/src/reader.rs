@@ -39,9 +39,13 @@ fn fill(input: &mut impl Read, buf: &mut [u8], from: usize) -> Result<usize> {
 /// Reads the next whole block from `input` into `buf` (cleared first);
 /// `false` at a clean end of the stream.
 pub fn read_block(input: &mut impl Read, buf: &mut Vec<u8>) -> Result<bool> {
+    read_block_into(input, buf, false)
+}
+
+fn read_block_into(input: &mut impl Read, buf: &mut Vec<u8>, recycled_text: bool) -> Result<bool> {
     buf.clear();
-    buf.resize(HEADER_LEN, 0);
-    let got = fill(input, buf, 0)?;
+    let mut head = [0; HEADER_LEN];
+    let got = fill(input, &mut head, 0)?;
     if got == 0 {
         buf.clear();
         return Ok(false);
@@ -52,11 +56,14 @@ pub fn read_block(input: &mut impl Read, buf: &mut Vec<u8>) -> Result<bool> {
         have: have as u64,
     };
     if got < HEADER_LEN {
+        buf.extend_from_slice(&head);
         return Err(truncated("bgzf block header", HEADER_LEN, got));
     }
-    let header = match BlockHeader::parse(buf) {
+    let header = match BlockHeader::parse(&head) {
         Err(Error::Truncated { need, .. }) => {
             let need = need as usize;
+            buf.reserve(need);
+            buf.extend_from_slice(&head);
             buf.resize(need, 0);
             let got = fill(input, buf, HEADER_LEN)?;
             if got < need {
@@ -64,9 +71,29 @@ pub fn read_block(input: &mut impl Read, buf: &mut Vec<u8>) -> Result<bool> {
             }
             BlockHeader::parse(buf)?
         }
-        r => r?,
+        Ok(header) => {
+            // The common header describes the whole allocation before any
+            // heap storage is needed, avoiding an initial header allocation.
+            if recycled_text {
+                // Incompressible framing may be slightly larger than the
+                // previous text. It must not double a nearly-full block's
+                // capacity just to accommodate a few trailer bytes.
+                buf.reserve_exact(header.block_len);
+            } else {
+                buf.reserve(header.block_len);
+            }
+            buf.extend_from_slice(&head);
+            header
+        }
+        Err(error) => {
+            buf.extend_from_slice(&head);
+            return Err(error);
+        }
     };
     let have = buf.len();
+    if recycled_text {
+        buf.reserve_exact(header.block_len - have);
+    }
     buf.resize(header.block_len, 0);
     let got = fill(input, buf, have)?;
     if got < header.block_len {
@@ -129,8 +156,12 @@ impl<R: Read> Reader<R> {
     fn fill_next(&mut self) -> Result<bool> {
         loop {
             while !self.input_done && self.pending.is_none() && !self.exec.full() {
-                let mut raw = Vec::new();
-                match read_block(&mut self.input, &mut raw) {
+                // All previous text has been copied to the consumer. Its
+                // allocation can hold a later compressed block; no decoded
+                // bytes survive the read_block clear or enter a data cache.
+                let mut raw = std::mem::take(&mut self.text);
+                self.at = 0;
+                match read_block_into(&mut self.input, &mut raw, true) {
                     Ok(true) => {}
                     Ok(false) => {
                         self.input_done = true;

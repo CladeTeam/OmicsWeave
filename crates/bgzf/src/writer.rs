@@ -180,7 +180,7 @@ impl<W: Write> Writer<W> {
         while self.exec.full() {
             self.take(true)?;
         }
-        let text = std::mem::replace(&mut self.text, Vec::with_capacity(BLOCK_TEXT_LEN));
+        let text = std::mem::take(&mut self.text);
         self.queued.push_back(self.text_pos);
         self.text_pos += text.len() as u64;
         self.cut += 1;
@@ -191,19 +191,26 @@ impl<W: Write> Writer<W> {
             Ok(block)
         }))?;
         while self.take(false)? {}
+        self.text.reserve_exact(BLOCK_TEXT_LEN);
         Ok(())
     }
 
     /// Writes the next compressed block if it is ready (or, with `wait`,
     /// once it is); returns whether one was written.
     fn take(&mut self, wait: bool) -> Result<bool> {
-        let Some(block) = self.exec.next(wait)? else {
+        let Some(mut block) = self.exec.next(wait)? else {
             return Ok(false);
         };
         let text = self.queued.pop_front().expect("a queued block per result");
         self.out.write_all(&block)?;
         self.blocks.starts.push((self.blocks.end, text));
         self.blocks.end += block.len() as u64;
+        if self.text.is_empty() && block.capacity() > self.text.capacity() {
+            // The sink has consumed these compressed bytes. Their allocation
+            // can become the next text buffer without retaining their data.
+            block.clear();
+            self.text = block;
+        }
         Ok(true)
     }
 

@@ -12,17 +12,24 @@
 //!   reader through an [`omicsweave_core::exec`] queue.
 //! - [`BinningIndex`]: the BAI / CSI index htslib builds from the same
 //!   records.
+//! - [`BinIndex`], [`SeekReader`], [`ChunkWalk`]: a BAI / CSI index loaded,
+//!   and the records of a region read through it at virtual offsets, as
+//!   htslib's region iterators read BAM and BCF.
 
+mod bins;
 mod index;
 mod reader;
+mod seek;
 mod writer;
 
 use std::cell::RefCell;
 
 use omicsweave_core::{Error, Result};
 
+pub use bins::{BinIndex, Chunk, ChunkWalk, IndexKind, locate_index};
 pub use index::{BinningIndex, IndexFormat, try_csi_levels, try_reg2bin};
 pub use reader::{Reader, is_bgzf, read_block};
+pub use seek::{SeekReader, SeekStats};
 pub use writer::{Blocks, Finished, Logical, Writer};
 
 /// Upper bound of a block's compressed and decompressed size.
