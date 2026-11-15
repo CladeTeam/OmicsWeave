@@ -53,6 +53,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "bzip2-sys"
+version = "0.1.13+1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -60,6 +70,18 @@ checksum = "4ff2a8126fff0f8c839080d619675a585e61720bb12d2baceae45769fd66f155"
 dependencies = [
  "find-msvc-tools",
  "shlex",
+]
+
+[[package]]
+name = "cellpack"
+version = "0.1.0"
+source = "git+https://github.com/CladeTeam/CellPack?rev=4ef3d7867d4ee1fd09112bee09e9480682b10a58#4ef3d7867d4ee1fd09112bee09e9480682b10a58"
+dependencies = [
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "io-uring",
+ "libc",
+ "thiserror",
 ]
 
 [[package]]
@@ -76,6 +98,21 @@ checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
 dependencies = [
  "cc",
 ]
+
+[[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "equivalent"
@@ -225,11 +262,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "htscodecs-sys"
+version = "0.1.0"
+dependencies = [
+ "bzip2-sys",
+ "cc",
+]
+
+[[package]]
 name = "htslib-sys"
 version = "0.1.0"
 dependencies = [
+ "bzip2-sys",
  "cc",
  "libz-sys",
+ "lzma-sys",
 ]
 
 [[package]]
@@ -240,6 +287,17 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed3bd0ecfbb87805f538bb7b32e5239ca0763890c623e349860ecba69469f2bb"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -319,6 +377,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lzma-sys"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fda04ab3764e6cde78b9974eec4f779acaba7c4e84b36eca3cf77c581b85d27"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "matrixmultiply"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -393,24 +462,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "omicsweave-bbi"
+name = "omicsweave-bam"
 version = "0.1.0"
 dependencies = [
- "libbigwig-sys",
- "libdeflater",
- "memchr",
- "omicsweave-bed",
+ "htslib-sys",
+ "omicsweave-bgzf",
  "omicsweave-core",
  "proptest",
  "tempfile",
 ]
 
 [[package]]
-name = "omicsweave-bed"
+name = "omicsweave-bbi"
 version = "0.1.0"
 dependencies = [
- "flate2",
- "htslib-sys",
+ "libbigwig-sys",
+ "libdeflater",
  "memchr",
  "omicsweave-core",
  "proptest",
@@ -421,6 +488,7 @@ dependencies = [
 name = "omicsweave-bgzf"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "libdeflater",
  "omicsweave-core",
  "proptest",
@@ -433,6 +501,7 @@ dependencies = [
  "bcftools-sys",
  "htslib-sys",
  "libc",
+ "omicsweave-bgzf",
  "omicsweave-core",
  "omicsweave-vcf",
  "proptest",
@@ -450,16 +519,20 @@ dependencies = [
  "htslib-sys",
  "lib2bit-sys",
  "libbigwig-sys",
+ "libdeflater",
  "memchr",
+ "omicsweave-bam",
  "omicsweave-bbi",
  "omicsweave-bgzf",
  "omicsweave-cool",
  "omicsweave-core",
+ "omicsweave-cram",
  "omicsweave-fasta",
  "omicsweave-hic",
  "omicsweave-sam",
  "omicsweave-vcf",
  "proptest",
+ "samtools-sys",
  "straw-sys",
  "tempfile",
 ]
@@ -480,7 +553,27 @@ dependencies = [
 name = "omicsweave-core"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "thiserror",
+]
+
+[[package]]
+name = "omicsweave-cram"
+version = "0.1.0"
+dependencies = [
+ "bzip2-sys",
+ "flate2",
+ "htscodecs-sys",
+ "htslib-sys",
+ "libc",
+ "libdeflater",
+ "lzma-sys",
+ "memchr",
+ "omicsweave-core",
+ "omicsweave-fasta",
+ "omicsweave-sam",
+ "proptest",
+ "tempfile",
 ]
 
 [[package]]
@@ -490,6 +583,18 @@ dependencies = [
  "htslib-sys",
  "lib2bit-sys",
  "libdeflater",
+ "memchr",
+ "omicsweave-bgzf",
+ "omicsweave-core",
+ "proptest",
+ "tempfile",
+]
+
+[[package]]
+name = "omicsweave-gtf"
+version = "0.1.0"
+dependencies = [
+ "flate2",
  "memchr",
  "omicsweave-bgzf",
  "omicsweave-core",
@@ -514,14 +619,41 @@ name = "omicsweave-python"
 version = "0.1.0"
 dependencies = [
  "numpy",
+ "omicsweave-bam",
  "omicsweave-bbi",
- "omicsweave-bed",
+ "omicsweave-bgzf",
  "omicsweave-consensus",
  "omicsweave-convert",
  "omicsweave-core",
+ "omicsweave-cram",
  "omicsweave-fasta",
+ "omicsweave-gtf",
  "omicsweave-hic",
+ "omicsweave-quant",
+ "omicsweave-vcf",
  "pyo3",
+]
+
+[[package]]
+name = "omicsweave-quant"
+version = "0.1.0"
+dependencies = [
+ "cellpack",
+ "flate2",
+ "htslib-sys",
+ "omicsweave-bam",
+ "omicsweave-bbi",
+ "omicsweave-bgzf",
+ "omicsweave-convert",
+ "omicsweave-core",
+ "omicsweave-fasta",
+ "omicsweave-gtf",
+ "omicsweave-hic",
+ "omicsweave-vcf",
+ "samtools-sys",
+ "smallvec",
+ "subread-sys",
+ "tempfile",
 ]
 
 [[package]]
@@ -543,6 +675,7 @@ dependencies = [
  "flate2",
  "htslib-sys",
  "libc",
+ "omicsweave-bgzf",
  "omicsweave-core",
  "proptest",
  "tempfile",
@@ -869,6 +1002,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "samtools-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "htslib-sys",
+ "libz-sys",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -917,6 +1059,14 @@ checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 
 [[package]]
 name = "straw-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libz-sys",
+]
+
+[[package]]
+name = "subread-sys"
 version = "0.1.0"
 dependencies = [
  "cc",
