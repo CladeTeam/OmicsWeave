@@ -1,0 +1,17 @@
+[package]
+name = "htscodecs-sys"
+description = "Vendored htscodecs (the CRAM 3.x entropy codecs) compiled and linked statically, with raw bindings to its decoders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+links = "htscodecs"
+
+[dependencies]
+bzip2-sys = { version = "0.1", features = ["static"] }
+
+[build-dependencies]
+cc.workspace = true
+
+[lints]
+workspace = true
