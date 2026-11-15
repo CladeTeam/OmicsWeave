@@ -1,5 +1,5 @@
-"""Variants applied to a reference: which alleles to take, and the
-consensus sequences that result."""
+"""Variants: the genotypes of a region, and variants applied to a reference
+(which alleles to take, and the consensus sequences that result)."""
 
 from __future__ import annotations
 
@@ -9,8 +9,61 @@ from dataclasses import dataclass
 import numpy as np
 
 from ._genome import Region
+from ._string import StringVector
 
-__all__ = ["AllAlt", "Alleles", "ConsensusBatch", "ConsensusSequence", "Haplotype", "Samples"]
+__all__ = [
+    "GT_ABSENT",
+    "GT_MISSING",
+    "AllAlt",
+    "Alleles",
+    "ConsensusBatch",
+    "ConsensusSequence",
+    "Genotypes",
+    "Haplotype",
+    "Samples",
+]
+
+GT_MISSING = -1
+"""A missing allele (``.``) in :attr:`Genotypes.gt`."""
+GT_ABSENT = -2
+"""No allele in :attr:`Genotypes.gt`: past the end of a sample's alleles
+(lower ploidy than the matrix), or a record without genotypes."""
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Genotypes:
+    """The records overlapping a region, in file order, and the genotypes
+    of the chosen samples at them.
+
+    ``gt[i, j, k]`` is allele ``k`` of sample ``j`` at record ``i``: an
+    allele index (0 = REF, 1 = the first ALT, ...), :data:`GT_MISSING` or
+    :data:`GT_ABSENT`. ``phased[i, j]`` is true when every allele after the
+    first is phased; a sample of one allele takes that allele's phase bit
+    as htslib decodes it.
+    """
+
+    region: Region
+    samples: tuple[str, ...]
+    start: np.ndarray
+    """int64: 0-based position of each record's first REF base."""
+    end: np.ndarray
+    """int64: ``start`` plus the reference span (REF, INFO/END, ...)."""
+    ids: StringVector
+    ref: StringVector
+    alt: StringVector
+    """The ALT alleles, comma-separated; empty when there are none."""
+    gt: np.ndarray
+    """int8, ``[records, samples, ploidy]``."""
+    phased: np.ndarray
+    """bool, ``[records, samples]``."""
+
+    def __len__(self) -> int:
+        return len(self.start)
+
+    @property
+    def ploidy(self) -> int:
+        """Alleles per sample: the most any record of the region gives."""
+        return self.gt.shape[2]
 
 
 @dataclass(frozen=True, slots=True)

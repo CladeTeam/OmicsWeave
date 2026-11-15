@@ -34,7 +34,7 @@ class ContactWindow:
     """The bins of ``rows`` against the bins of ``cols``, ``resolution`` units wide.
 
     A region covers every bin it overlaps; the two may lie on different
-    chromosomes.
+    chromosomes. A region on ``"-"`` reverses its axis of the dense matrix.
     """
 
     rows: Region
