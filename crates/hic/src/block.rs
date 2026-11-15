@@ -37,7 +37,19 @@ impl Inflater {
     /// Inflates a whole block, growing initialized caller storage as needed.
     /// Previous output length seeds the next block's capacity estimate.
     pub fn inflate(&mut self, raw: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        self.inflate_limited(raw, out, usize::MAX)
+    }
+
+    /// Inflates with an explicit limit on initialized output storage.
+    pub fn inflate_limited(&mut self, raw: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<()> {
+        if limit == 0 {
+            return Err(Error::Inflate("zero block output limit"));
+        }
         let mut room = out.len().max(raw.len().saturating_mul(4)).max(4096);
+        room = room.min(limit);
+        if out.len() > room {
+            out.truncate(room);
+        }
         loop {
             if out.len() < room {
                 out.try_reserve(room - out.len())
@@ -54,9 +66,11 @@ impl Inflater {
                     return Err(Error::Inflate("corrupt or truncated zlib stream"));
                 }
                 Err(libdeflater::DecompressionError::InsufficientSpace) => {
-                    room = room
-                        .checked_mul(2)
-                        .ok_or(Error::Inflate("output size overflows usize"))?;
+                    if room == limit {
+                        out.clear();
+                        return Err(Error::Inflate("block output limit exceeded"));
+                    }
+                    room = room.checked_mul(2).unwrap_or(limit).min(limit);
                 }
             }
         }

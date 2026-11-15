@@ -1,6 +1,6 @@
 [package]
 name = "omicsweave-hic"
-description = "Juicer .hic contact maps: tile-by-tile reading (v6-v9) and writing (v8, v9)"
+description = "Juicer .hic contact maps: tile-by-tile reading and writing (v8, v9)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,10 +18,3 @@ tempfile.workspace = true
 [lints]
 workspace = true
 
-[[bench]]
-name = "paths"
-harness = false
-
-[[bench]]
-name = "builder"
-harness = false

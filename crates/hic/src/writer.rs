@@ -322,10 +322,11 @@ struct Zoom {
 
 impl Zoom {
     fn settle(&mut self) {
-        if self.ended && self.in_flight == 0 {
-            if let Some(stats) = self.stats.take() {
-                self.summary = stats.summary();
-            }
+        if self.ended
+            && self.in_flight == 0
+            && let Some(stats) = self.stats.take()
+        {
+            self.summary = stats.summary();
         }
     }
 }

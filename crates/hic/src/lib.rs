@@ -43,6 +43,7 @@
 
 mod block;
 mod build;
+mod cache;
 mod cursor;
 mod matrix;
 mod meta;
@@ -52,6 +53,7 @@ mod writer;
 
 pub use block::{Deflater, Inflater, Record, decode_block, encode_block};
 pub use build::{BuildOptions, HicBuilder};
+pub use cache::{HicBlockRequest, HicCacheLimits, PreparedBlock};
 pub use matrix::{BlockEntry, Grid, ZoomData};
 pub use meta::{
     Chrom, DEPTH_BASE_ATTRIBUTE, Depth, Footer, Header, MAX_VERSION, MIN_VERSION, SiteList,
