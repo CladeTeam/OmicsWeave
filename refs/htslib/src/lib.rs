@@ -1,16 +1,20 @@
 //! Raw bindings to the vendored htslib, for the subset tests use: the FASTA
 //! index (`htslib/faidx.h`), BGZF I/O (`htslib/bgzf.h`), VCF/BCF reading,
-//! writing and typed value access (`htslib/vcf.h`), SAM/BAM reading and
-//! writing (`htslib/sam.h`) and logging (`htslib/hts_log.h`). Handles stay
-//! opaque; record and header fields are read through the accessors of
-//! `src/fields.c`.
+//! writing, typed value access, index loading and region iteration
+//! (`htslib/vcf.h`), SAM/BAM reading and
+//! writing, index loading and region iteration (`htslib/sam.h`) and logging
+//! (`htslib/hts_log.h`). Handles stay opaque; record and header fields are
+//! read through the accessors of `src/fields.c` and `src/bam.c`.
 
 #![allow(non_camel_case_types)]
 
 use std::ffi::{c_char, c_int, c_void};
 
-// htslib calls zlib; referencing the crate makes rustc link it.
+// htslib calls zlib, libbz2 and liblzma; referencing the crates makes rustc
+// link them.
+use bzip2_sys as _;
 use libz_sys as _;
+use lzma_sys as _;
 
 pub type hts_pos_t = i64;
 
@@ -125,6 +129,17 @@ unsafe extern "C" {
         type_: c_int,
     ) -> c_int;
 
+    pub fn ow_bcf_index_load(fn_: *const c_char, fnidx: *const c_char) -> *mut hts_idx_t;
+    pub fn ow_bcf_itr_queryi(
+        idx: *const hts_idx_t,
+        tid: c_int,
+        beg: i64,
+        end: i64,
+    ) -> *mut hts_itr_t;
+    /// >= 0 on success, -1 at the end, < -1 on error.
+    pub fn ow_bcf_itr_next(fp: *mut htsFile, itr: *mut hts_itr_t, r: *mut bcf1_t) -> c_int;
+    pub fn ow_bcf_hdr_name2id(h: *const bcf_hdr_t, name: *const c_char) -> c_int;
+
     pub fn ow_bcf_pos(r: *const bcf1_t) -> i64;
     pub fn ow_bcf_rlen(r: *const bcf1_t) -> i64;
     pub fn ow_bcf_n_allele(r: *const bcf1_t) -> c_int;
@@ -199,4 +214,67 @@ unsafe extern "C" {
         min_shift: c_int,
         nthreads: c_int,
     ) -> c_int;
+}
+
+#[repr(C)]
+pub struct hts_idx_t {
+    _opaque: [u8; 0],
+}
+
+#[repr(C)]
+pub struct hts_itr_t {
+    _opaque: [u8; 0],
+}
+
+// BAM record fields, index loading and region iteration (`src/bam.c`).
+unsafe extern "C" {
+    pub fn ow_bam_tid(b: *const bam1_t) -> c_int;
+    pub fn ow_bam_pos(b: *const bam1_t) -> i64;
+    pub fn ow_bam_flag(b: *const bam1_t) -> c_int;
+    pub fn ow_bam_mapq(b: *const bam1_t) -> c_int;
+    pub fn ow_bam_mtid(b: *const bam1_t) -> c_int;
+    pub fn ow_bam_mpos(b: *const bam1_t) -> i64;
+    pub fn ow_bam_isize(b: *const bam1_t) -> i64;
+    pub fn ow_bam_l_qseq(b: *const bam1_t) -> c_int;
+    pub fn ow_bam_n_cigar(b: *const bam1_t) -> c_int;
+    pub fn ow_bam_qname(b: *const bam1_t) -> *const c_char;
+    pub fn ow_bam_cigar(b: *const bam1_t) -> *const u32;
+    pub fn ow_bam_seq(b: *const bam1_t) -> *const u8;
+    pub fn ow_bam_qual(b: *const bam1_t) -> *const u8;
+    pub fn ow_bam_aux(b: *const bam1_t) -> *const u8;
+    pub fn ow_bam_l_aux(b: *const bam1_t) -> c_int;
+    pub fn ow_sam_index_load(
+        fp: *mut htsFile,
+        fn_: *const c_char,
+        fnidx: *const c_char,
+    ) -> *mut hts_idx_t;
+    pub fn ow_sam_itr_queryi(
+        idx: *const hts_idx_t,
+        tid: c_int,
+        beg: i64,
+        end: i64,
+    ) -> *mut hts_itr_t;
+    /// >= 0 on success, -1 at the end, < -1 on error.
+    pub fn ow_sam_itr_next(fp: *mut htsFile, itr: *mut hts_itr_t, b: *mut bam1_t) -> c_int;
+    pub fn ow_hts_itr_destroy(itr: *mut hts_itr_t);
+    pub fn ow_hts_idx_destroy(idx: *mut hts_idx_t);
+    pub fn sam_hdr_name2tid(h: *mut sam_hdr_t, name: *const c_char) -> c_int;
+}
+
+// Format options (`htslib/hts.h`): `key=value` strings as samtools'
+// `--output-fmt-option` takes them, and the reference of a CRAM.
+
+#[repr(C)]
+pub struct hts_opt {
+    _opaque: [u8; 0],
+}
+
+unsafe extern "C" {
+    /// Parses one `key=value` option onto the list `opts`; 0 on success.
+    pub fn hts_opt_add(opts: *mut *mut hts_opt, c_arg: *const c_char) -> c_int;
+    /// Applies the options to an open file; 0 on success.
+    pub fn hts_opt_apply(fp: *mut htsFile, opts: *mut hts_opt) -> c_int;
+    pub fn hts_opt_free(opts: *mut hts_opt);
+    /// Sets the reference FASTA (with its `.fai`) of a CRAM; 0 on success.
+    pub fn hts_set_fai_filename(fp: *mut htsFile, fn_aux: *const c_char) -> c_int;
 }

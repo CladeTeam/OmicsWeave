@@ -129,6 +129,25 @@ unsafe extern "C" {
     pub fn bwDestroyOverlappingIntervals(o: *mut bwOverlappingIntervals_t);
     pub fn bbDestroyOverlappingEntries(o: *mut bbOverlappingEntries_t);
 
+    /// `type_` is an `enum bwStatsType`: 0 mean, 1 stdev, 2 max, 3 min,
+    /// 4 coverage, 5 sum. Returns `nBins` malloc'd doubles, or NULL.
+    pub fn bwStats(
+        fp: *mut bigWigFile_t,
+        chrom: *const c_char,
+        start: u32,
+        end: u32,
+        nBins: u32,
+        type_: c_int,
+    ) -> *mut f64;
+    pub fn bwStatsFromFull(
+        fp: *mut bigWigFile_t,
+        chrom: *const c_char,
+        start: u32,
+        end: u32,
+        nBins: u32,
+        type_: c_int,
+    ) -> *mut f64;
+
     pub fn bwCreateHdr(fp: *mut bigWigFile_t, maxZooms: i32) -> c_int;
     pub fn bwCreateChromList(
         chroms: *const *const c_char,

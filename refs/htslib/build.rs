@@ -1,6 +1,7 @@
 //! Builds the vendored htslib without running its configure script. The
 //! generated headers mirror the defaults htslib's Makefile writes when it is
-//! not configured, minus the optional bzip2, lzma and libcurl backends.
+//! not configured, with bzip2 and lzma (from `bzip2-sys` and `lzma-sys`,
+//! for CRAM blocks) and without libcurl.
 
 use std::env;
 use std::fs;
@@ -64,6 +65,9 @@ const CONFIG_H: &str = "\
 #define _XOPEN_SOURCE 600
 #endif
 #define HAVE_DRAND48 1
+#define HAVE_LIBBZ2 1
+#define HAVE_LIBLZMA 1
+#define HAVE_LZMA_H 1
 #if defined __x86_64__ || defined __arm__ || defined __aarch64__
 #define HAVE_ATTRIBUTE_CONSTRUCTOR 1
 #endif
@@ -86,7 +90,7 @@ fn main() {
     fs::write(
         generated.join("config_vars.h"),
         "#define HTS_CC \"cc\"\n#define HTS_CPPFLAGS \"\"\n#define HTS_CFLAGS \"\"\n\
-         #define HTS_LDFLAGS \"\"\n#define HTS_LIBS \"-lz -lm -lpthread\"\n",
+         #define HTS_LDFLAGS \"\"\n#define HTS_LIBS \"-lz -lbz2 -llzma -lm -lpthread\"\n",
     )
     .unwrap();
 
@@ -97,13 +101,16 @@ fn main() {
         .include(vendor.join("htscodecs"))
         // Vendored upstream code is compiled as is; its warnings are not ours.
         .warnings(false);
-    if let Ok(include) = env::var("DEP_Z_INCLUDE") {
-        build.include(include);
+    for dep in ["DEP_Z_INCLUDE", "DEP_BZIP2_INCLUDE", "DEP_LZMA_INCLUDE"] {
+        if let Ok(include) = env::var(dep) {
+            build.include(include);
+        }
     }
     for file in SOURCES {
         build.file(vendor.join(file));
     }
     build.file(root.join("src/fields.c"));
+    build.file(root.join("src/bam.c"));
     build.compile("hts");
     // Dependent reference crates compile against these headers.
     println!("cargo:include={}", vendor.display());
@@ -112,4 +119,5 @@ fn main() {
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rerun-if-changed=vendor/htslib");
     println!("cargo:rerun-if-changed=src/fields.c");
+    println!("cargo:rerun-if-changed=src/bam.c");
 }

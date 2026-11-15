@@ -41,3 +41,24 @@ void ow_bcf_fmt(const bcf1_t *r, int i, int *id, int *type, int *n,
    (NULL for an unused id). */
 int ow_bcf_hdr_nkeys(const bcf_hdr_t *h) { return h->n[BCF_DT_ID]; }
 const char *ow_bcf_hdr_key(const bcf_hdr_t *h, int i) { return h->id[BCF_DT_ID][i].key; }
+
+/* BCF index loading and region iteration: the macros of htslib/vcf.h. */
+hts_idx_t *ow_bcf_index_load(const char *fn, const char *fnidx)
+{
+    return bcf_index_load2(fn, fnidx);
+}
+
+hts_itr_t *ow_bcf_itr_queryi(const hts_idx_t *idx, int tid, int64_t beg, int64_t end)
+{
+    return bcf_itr_queryi(idx, tid, beg, end);
+}
+
+int ow_bcf_itr_next(htsFile *fp, hts_itr_t *itr, bcf1_t *r)
+{
+    return bcf_itr_next(fp, itr, r);
+}
+
+int ow_bcf_hdr_name2id(const bcf_hdr_t *h, const char *name)
+{
+    return bcf_hdr_name2id(h, name);
+}

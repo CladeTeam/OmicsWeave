@@ -10,6 +10,8 @@ links = "hts"
 
 [dependencies]
 libz-sys.workspace = true
+bzip2-sys = { version = "0.1", features = ["static"] }
+lzma-sys = { version = "0.1", features = ["static"] }
 
 [build-dependencies]
 cc.workspace = true

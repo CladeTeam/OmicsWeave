@@ -16,11 +16,16 @@
 This crate (`htslib-sys`) is a dev-dependency only. `build.rs` compiles the
 library without configure, generating `config.h`, `version.h` and
 `config_vars.h` in `OUT_DIR` from the defaults htslib's own Makefile uses when
-unconfigured, without bzip2, lzma or libcurl. `src/lib.rs` declares raw
-bindings for the FASTA index, BGZF, VCF/BCF and logging API, and
-`src/fields.c` reads `bcf1_t`/`bcf_hdr_t` fields whose layout is not stable;
-neither contains test logic. `samtools faidx`, `bgzip`, bcftools and pysam all
-run on this code, so it defines the behaviour `omicsweave-fasta` matches for
-`.fa`, `.fai`, `.fa.gz` and `.gzi`, and `omicsweave-vcf` for VCF and BCF.
+unconfigured, plus bzip2 and lzma (linked from `bzip2-sys` and `lzma-sys`, so
+CRAM blocks of every method can be written and read) and without libcurl.
+`src/lib.rs` declares raw bindings for the FASTA index, BGZF, VCF/BCF,
+SAM/BAM/CRAM, format options and logging API;
+`src/fields.c` reads `bcf1_t`/`bcf_hdr_t` fields whose layout is not stable,
+and `src/bam.c` exposes `bam1_t` fields and the inline region iterator of
+`sam.h`; none contains test logic. `samtools faidx`, `bgzip`, `samtools
+index`, bcftools and pysam all run on this code, so it defines the behaviour
+`omicsweave-fasta` matches for `.fa`, `.fai`, `.fa.gz` and `.gzi`,
+`omicsweave-vcf` for VCF and BCF, `omicsweave-bam` for BAM, BAI and CSI, and
+`omicsweave-cram` for CRAM and CRAI.
 `build.rs` exports the header directories (`DEP_HTS_INCLUDE`,
 `DEP_HTS_GENERATED`) for `bcftools-sys`.

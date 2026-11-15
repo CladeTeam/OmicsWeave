@@ -1,0 +1,19 @@
+[package]
+name = "subread-sys"
+description = "Vendored featureCounts (Subread) with a raw in-process entry point, a test-only reference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-3.0-or-later"
+publish = false
+build = "build.rs"
+links = "subread"
+
+[dependencies]
+libz-sys.workspace = true
+
+[build-dependencies]
+cc.workspace = true
+
+[lints]
+workspace = true
