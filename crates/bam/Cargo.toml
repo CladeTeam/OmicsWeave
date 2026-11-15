@@ -1,0 +1,18 @@
+[package]
+name = "omicsweave-bam"
+description = "BAM by region through BAI/CSI, and BAM index building, as htslib reads them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+omicsweave-bgzf = { path = "../bgzf" }
+
+[dev-dependencies]
+htslib-sys = { path = "../../refs/htslib" }
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
