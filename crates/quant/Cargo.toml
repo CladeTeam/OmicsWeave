@@ -1,0 +1,29 @@
+[package]
+name = "omicsweave-quant"
+description = "One pass over an aligned BAM into coverage tracks, count matrices, ATAC fragments, splice junctions, metabolic labeling, DNA methylation, Hi-C contacts and allele counts, under a thread and memory budget"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+omicsweave-bgzf = { path = "../bgzf" }
+omicsweave-bam = { path = "../bam" }
+omicsweave-bbi = { path = "../bbi" }
+omicsweave-gtf = { path = "../gtf" }
+omicsweave-hic = { path = "../hic" }
+omicsweave-fasta = { path = "../fasta" }
+omicsweave-vcf = { path = "../vcf" }
+omicsweave-convert = { path = "../convert" }
+cellpack = { git = "https://github.com/CladeTeam/CellPack", rev = "4ef3d7867d4ee1fd09112bee09e9480682b10a58" }
+smallvec.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+htslib-sys = { path = "../../refs/htslib" }
+samtools-sys = { path = "../../refs/samtools" }
+subread-sys = { path = "../../refs/subread" }
+tempfile.workspace = true
+
+[lints]
+workspace = true
