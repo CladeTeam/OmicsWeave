@@ -1,11 +1,17 @@
 """NonB (G4 / R-loop) training data with a plain PyTorch DataLoader.
 
-Illustrative: paths and manifests are placeholders, and the data are taken
-to be converted already (``ow convert``):
+Illustrative: paths and manifests are placeholders. Every file is read by
+region in a format built for it; text formats are converted once
+beforehand:
 
 - reference: bgzip FASTA ``hg38.fa.gz`` with its ``.fai`` / ``.gzi``
-- signal: one bigWig per track (CUT&Tag G4 / R-loop, ...), up to 146
-- peaks: one bigBed per track, plus their union ``union_peaks.bb``
+  (``ow convert hg38.fa hg38.fa.gz``)
+- signal: one bigWig per track (CUT&Tag G4 / R-loop, ...), up to 146;
+  bedGraph or wig is converted
+  (``ow convert G4_K562_rep1.bedGraph G4_K562_rep1.bw --chrom-sizes hg38.fa.fai``)
+- peaks: one bigBed per track, plus their union ``union_peaks.bb``; BED is
+  not read by region and is converted
+  (``ow convert G4_K562.bed G4_K562.bb --chrom-sizes hg38.fa.fai``)
 
 Two pipelines:
 
@@ -17,7 +23,9 @@ Two pipelines:
 
 Readers open once per worker, on its first sample, and answer every query
 after. The sampler runs in the main process and hands out regions, so a new
-epoch's windows reach persistent workers.
+epoch's windows reach persistent workers. The track pipeline gives each
+worker one block cache shared by its readers, so overlapping windows reuse
+the reference and bigWig blocks they share.
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
+from omicsweave.cache import BlockCache
 from omicsweave.formats import BgzipFasta, BigBed, BigWig
 from omicsweave.query import IntervalReader, SequenceReader, TrackReader
 from omicsweave.types import Region
@@ -44,23 +53,11 @@ _CODE = np.full(256, 4, np.uint8)
 for i, base in enumerate(b"ACGT"):
     _CODE[base] = _CODE[base + 32] = i
 _ONE_HOT = np.vstack([np.eye(4, dtype=np.float32), np.zeros(4, np.float32)])
-_COMPLEMENT = np.arange(256, dtype=np.uint8)
-for a, b in (b"AT", b"TA", b"CG", b"GC", b"at", b"ta", b"cg", b"gc"):
-    _COMPLEMENT[a] = b
 
 
 def one_hot(bases: np.ndarray) -> np.ndarray:
     """``(L, 4)`` float32 one-hot of ASCII bases; N is all zeros."""
     return _ONE_HOT[_CODE[bases]]
-
-
-def reverse_complement(bases: np.ndarray) -> np.ndarray:
-    return _COMPLEMENT[bases[::-1]]
-
-
-def bin_mean(values: np.ndarray, resolution: int) -> np.ndarray:
-    """Means of consecutive ``resolution``-base bins along the last axis."""
-    return values.reshape(*values.shape[:-1], -1, resolution).mean(-1)
 
 
 def bin_coverage(start: np.ndarray, end: np.ndarray, region: Region, resolution: int) -> np.ndarray:
@@ -113,10 +110,11 @@ class TiledWindows(Sampler[Region]):
 
 class TrackWindows(Dataset):
     """One window: its bases and the binned, normalized signal of every track.
+    Each worker keeps ``cache_bytes`` of decoded blocks.
 
     ``sequence``: uint8 ASCII ``[L]`` (for a tokenizer); ``signal``: float32
-    ``[n_tracks, L / resolution]``. Strand-free tracks only flip under
-    reverse complement.
+    ``[n_tracks, L / resolution]``. Reverse complement reads the window on
+    the minus strand: strand-free tracks only reverse.
     """
 
     def __init__(
@@ -126,17 +124,21 @@ class TrackWindows(Dataset):
         *,
         resolution: int = 128,
         reverse_complement: bool = True,
+        cache_bytes: int = 256 << 20,
     ):
         self.reference, self.tracks = reference, list(tracks)
         self.resolution, self.rc = resolution, reverse_complement
+        self.cache_bytes = cache_bytes
         self._readers: tuple[SequenceReader, list[TrackReader], np.ndarray] | None = None
 
     def _open(self) -> tuple[SequenceReader, list[TrackReader], np.ndarray]:
         # Opened in the worker on its first sample; readers are kept for every
-        # later query (and pickle by path if a worker is spawned).
+        # later query (and pickle by path if a worker is spawned). The cache
+        # belongs to this process: it is made here and never pickled.
         if self._readers is None:
-            sequence = SequenceReader(self.reference)
-            signals = [TrackReader(track) for track in self.tracks]
+            cache = BlockCache(max_bytes=self.cache_bytes)
+            sequence = SequenceReader(self.reference, cache=cache)
+            signals = [TrackReader(track, cache=cache) for track in self.tracks]
             # Genome-wide mean of covered bases, from the bigWig header.
             means = np.array(
                 [r.summary.sum / max(r.summary.bases_covered, 1) for r in signals], np.float32
@@ -146,14 +148,19 @@ class TrackWindows(Dataset):
 
     def __getitem__(self, region: Region) -> dict[str, np.ndarray]:
         sequence, signals, means = self._open()
-        bases = sequence.fetch(region).bases
-        signal = np.empty((len(signals), len(region)), np.float32)
-        for row, reader in zip(signal, signals, strict=True):
-            reader.signal(region, out=row)  # written in place, one row per track
-        np.nan_to_num(signal, copy=False)
-        signal = bin_mean(signal / means[:, None], self.resolution)
         if self.rc and np.random.random() < 0.5:
-            bases, signal = reverse_complement(bases), signal[:, ::-1].copy()
+            # The minus strand: bases come reverse complemented, bins reversed.
+            region = region.with_strand("-")
+        bases = sequence.fetch(region).bases
+        rows = [reader.bins(region, self.resolution, "sum").values[0] for reader in signals]
+        signal = (
+            np.stack(rows)
+            if rows
+            else np.empty((0, -(-len(region) // self.resolution)), np.float32)
+        )
+        np.nan_to_num(signal, copy=False)
+        # Missing bases count as 0: the bin mean is its sum over its width.
+        signal /= self.resolution * means[:, None]
         return {"sequence": bases, "signal": signal}
 
 

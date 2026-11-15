@@ -2,9 +2,10 @@
 
 Training-data loaders for the two starting use cases (`docs/design.md` §3),
 built on a plain PyTorch `DataLoader`. They are illustrative: paths and
-manifests are placeholders, and the data are taken to be converted already
-(`ow convert`: bgzip FASTA, bigWig, bigBed, `.hic`; expression as a
-CellPack `.cpk`).
+manifests are placeholders. Every file is read by region in a format built
+for it (bgzip FASTA, bigWig, bigBed, `.hic`; expression as a CellPack
+`.cpk`); other formats are converted once beforehand with `ow convert`
+(bedGraph / wig → bigWig, BED → bigBed, `.mcool` → `.hic`).
 
 | Example | Samples | Reads |
 |---|---|---|
@@ -13,9 +14,17 @@ CellPack `.cpk`).
 
 Both follow the same pattern:
 
+- Queries return arrays directly: `fetch(...).bases`, `signal(...).values`,
+  `bins(...).values` and `matrix(...).values`. Readers allocate outputs and
+  manage decoding workspaces; the dataset assembles these results into its
+  sample arrays. Optional `out=` reuse is described in the main README.
 - The dataset holds `omicsweave.formats` file objects (cheap, picklable) and
   opens its readers in each worker on the first sample; every later query
   reuses them.
+- CENO and the NonB track pipeline make one `omicsweave.cache.BlockCache`
+  per worker (it is process-local and never pickled) and pass it to its
+  readers with `cache=`, so windows that overlap or recur reuse the decoded
+  blocks they share.
 - The sampler (or batch sampler) runs in the main process and hands out
   genomic regions, so a new epoch's windows (`set_epoch`) reach persistent
   workers.

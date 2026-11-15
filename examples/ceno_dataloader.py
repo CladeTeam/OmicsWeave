@@ -1,12 +1,18 @@
 """CENOMultiome training data with a plain PyTorch DataLoader.
 
-Illustrative: paths and the manifest are placeholders, and the data are
-taken to be converted already (``ow convert``), one set per cell:
+Illustrative: paths and the manifest are placeholders. Every file is read
+by region in a format built for it, one set per cell; other formats are
+converted once beforehand:
 
 - reference: bgzip FASTA ``hg38.fa.gz`` with its ``.fai`` / ``.gzi``
-- bp tracks (bigWig): ATAC, DNase, CAGE +/-, RNA polyA +/-, RNA total +/-
+  (``ow convert hg38.fa hg38.fa.gz``)
+- bp tracks (bigWig): ATAC, DNase, CAGE +/-, RNA polyA +/-, RNA total +/-;
+  signal kept as bedGraph or wig is converted
+  (``ow convert cage_plus.bedGraph cage_plus.bw --chrom-sizes hg38.fa.fai``)
 - coarse tracks (bigWig): 11 histone marks and CTCF, pooled to 128 bp
-- Hi-C: ``.hic`` (from ``.mcool``), read at 2048 bp bins
+- Hi-C: ``.hic``, read at 2048 bp bins; cooler files cannot be read a tile
+  at a time and are converted
+  (``ow convert k562.mcool k562.hic --resolutions 2048``)
 - expression: one CellPack matrix (``.cpk``), a row per cell, read with
   ``pycellpack``
 
@@ -19,7 +25,10 @@ complemented half the time with the +/- strands swapped.
 
 Readers open once per worker, on its first batch, and answer every query
 after; the batch sampler runs in the main process and groups the cells of
-one window, which ``__getitems__`` serves together.
+one window, which ``__getitems__`` serves together. Each worker also keeps
+one block cache that all its readers share: a window shifted onto the same
+reference, bigWig or ``.hic`` blocks as an earlier one (a neighbouring
+anchor, or the same anchor in a later epoch) reuses them decoded.
 """
 
 from __future__ import annotations
@@ -33,6 +42,7 @@ import torch
 from pycellpack import Store
 from torch.utils.data import DataLoader, Dataset, Sampler
 
+from omicsweave.cache import BlockCache
 from omicsweave.formats import BgzipFasta, BigWig, Hic
 from omicsweave.query import ContactReader, SequenceReader, TrackReader
 from omicsweave.types import ContactWindow, Region
@@ -59,6 +69,7 @@ WINDOW = 131_072
 COARSE = 128  # bp per coarse-track bin
 HIC_BIN = 2048  # bp per Hi-C bin: a 64 x 64 tile per window
 SHIFT = 1024  # largest anchor shift, either way
+CACHE_BYTES = 512 << 20  # decoded blocks kept per worker
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +161,7 @@ def _flip(a: np.ndarray) -> np.ndarray:
 
 @dataclass
 class _Readers:
+    cache: BlockCache  # decoded blocks shared by every reader of the worker
     sequence: SequenceReader
     bp: list[list[TrackReader | None]]  # [cell][assay]
     coarse: list[list[TrackReader | None]]
@@ -158,8 +170,8 @@ class _Readers:
     expression: Store
 
 
-def _track(file: BigWig | None) -> TrackReader | None:
-    return None if file is None else TrackReader(file)
+def _track(file: BigWig | None, cache: BlockCache) -> TrackReader | None:
+    return None if file is None else TrackReader(file, cache=cache)
 
 
 def _mean(reader: TrackReader | None) -> float:
@@ -176,14 +188,19 @@ class CenoWindows(Dataset):
 
     def _open(self) -> _Readers:
         # Opened in the worker on its first batch; every later query reuses
-        # them. 54 cells x 20 tracks stay open per worker.
+        # them. 54 cells x 20 tracks stay open per worker. The cache is made
+        # here too: it belongs to one process and is never pickled.
         if self._readers is None:
-            bp = [[_track(f) for f in c.bp.values()] for c in self.cells]
+            cache = BlockCache(max_bytes=CACHE_BYTES)
+            bp = [[_track(f, cache) for f in c.bp.values()] for c in self.cells]
             self._readers = _Readers(
-                sequence=SequenceReader(self.reference),
+                cache=cache,
+                sequence=SequenceReader(self.reference, cache=cache),
                 bp=bp,
-                coarse=[[_track(f) for f in c.coarse.values()] for c in self.cells],
-                hic=[None if c.hic is None else ContactReader(c.hic) for c in self.cells],
+                coarse=[[_track(f, cache) for f in c.coarse.values()] for c in self.cells],
+                hic=[
+                    None if c.hic is None else ContactReader(c.hic, cache=cache) for c in self.cells
+                ],
                 scale=np.array([[_mean(r) for r in row] for row in bp], np.float32),
                 expression=Store(self.expression).astype(np.float32),
             )
@@ -195,11 +212,28 @@ class CenoWindows(Dataset):
     ) -> tuple[np.ndarray, np.ndarray]:
         values = np.zeros((len(readers), len(region)), np.float32)
         valid = np.zeros((len(readers), len(region)), np.bool_)
+        for i, reader in enumerate(readers):
+            if reader is not None:
+                row = reader.signal(region).values
+                values[i] = row
+                valid[i] = ~np.isnan(row)
+        np.nan_to_num(values, copy=False)
+        return values, valid
+
+    @staticmethod
+    def _bins(
+        readers: Sequence[TrackReader | None], region: Region
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """``COARSE`` bp bins, binned by the reader: the mean with missing
+        bases as 0, valid where every base has data."""
+        n = len(region) // COARSE
+        values = np.zeros((len(readers), n), np.float32)
+        valid = np.zeros((len(readers), n), np.bool_)
         for row, ok, reader in zip(values, valid, readers, strict=True):
             if reader is not None:
-                reader.signal(region, out=row)
-                ok[:] = ~np.isnan(row)
-        np.nan_to_num(values, copy=False)
+                stats = reader.bins(region, COARSE, ("sum", "coverage")).values
+                row[:] = np.nan_to_num(stats[0]) / COARSE
+                ok[:] = stats[1] == 1
         return values, valid
 
     def _sample(self, key: Key, bases: np.ndarray, expression: np.ndarray) -> dict[str, np.ndarray]:
@@ -207,9 +241,7 @@ class CenoWindows(Dataset):
         assert r is not None
         bp, bp_valid = self._signal(r.bp[key.cell], key.region)
         bp /= r.scale[key.cell][:, None]
-        coarse, coarse_valid = self._signal(r.coarse[key.cell], key.region)
-        coarse = coarse.reshape(len(COARSE_ASSAYS), -1, COARSE).mean(-1)
-        coarse_valid = coarse_valid.reshape(len(COARSE_ASSAYS), -1, COARSE).all(-1)
+        coarse, coarse_valid = self._bins(r.coarse[key.cell], key.region)
 
         # The tile is read on the 2048 bp grid nearest the shifted window, so
         # it always holds WINDOW / HIC_BIN bins.
@@ -217,10 +249,11 @@ class CenoWindows(Dataset):
         grid = Region(key.region.chrom, start, start + WINDOW)
         window = ContactWindow(grid, grid, HIC_BIN)
         hic = r.hic[key.cell]
-        contacts = np.zeros(window.shape, np.float32)
         if hic is not None:
-            hic.matrix(window, out=contacts)  # raw counts, in place
+            contacts = hic.matrix(window).values
             np.log1p(contacts, out=contacts)
+        else:
+            contacts = np.zeros(window.shape, np.float32)
 
         observed = np.array([f is not None for f in self.cells[key.cell].bp.values()])
         target = np.zeros(len(BP_ASSAYS), np.bool_)
