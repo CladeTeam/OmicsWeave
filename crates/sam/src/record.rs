@@ -291,6 +291,7 @@ impl BamEncoder {
         // CIGAR
         let cigar = &mut scratch.cigar;
         cigar.clear();
+        let (mut qlen, mut rlen) = (0, 0);
         if at(line, p) != b'*' {
             let field = memchr(b'\t', &line[p..]).map_or(len, |k| p + k);
             let n_ops = line[p..field]
@@ -300,6 +301,9 @@ impl BamEncoder {
             if n_ops == 0 {
                 return Err("no CIGAR operations".into());
             }
+            // Bound speculative allocation before operation syntax has been
+            // validated; longer CIGARs can grow through the normal Vec path.
+            cigar.reserve(n_ops.min(MAX_INLINE_CIGAR + 1));
             for _ in 0..n_ops {
                 let (v, n, of) = hts_str2uint(&line[p..], 28);
                 if n == 0 {
@@ -315,6 +319,16 @@ impl BamEncoder {
                     return Err("unrecognized CIGAR operator".into());
                 }
                 cigar.push((v as u32) << 4 | op as u32);
+                // Both lengths are needed immediately after parsing. Keep
+                // them with the validated operation rather than traversing
+                // the scratch CIGAR again.
+                let ty = CIGAR_TYPE >> ((op as u32) << 1);
+                if ty & 1 != 0 {
+                    qlen += v as i64;
+                }
+                if ty & 2 != 0 {
+                    rlen += v as i64;
+                }
             }
             if at(line, p) != b'\t' {
                 return Err("malformed CIGAR".into());
@@ -324,7 +338,6 @@ impl BamEncoder {
             flag |= FUNMAP;
             p = tab(line, p)? + 1;
         }
-        let (mut qlen, mut rlen) = cigar_lens(cigar);
         let reflen = if flag & FUNMAP != 0 { 1 } else { rlen.max(1) };
         if POS_MAX - reflen <= pos {
             return Err("read ends beyond highest supported position".into());
