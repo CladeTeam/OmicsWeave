@@ -14,11 +14,11 @@ from collections.abc import Sequence
 
 from .._native import __version__
 from ..errors import OmicsWeaveError
-from . import _convert
+from . import _convert, _quant
 
 __all__ = ["main"]
 
-_COMMANDS = (_convert,)
+_COMMANDS = (_convert, _quant)
 
 
 def parser() -> argparse.ArgumentParser:
