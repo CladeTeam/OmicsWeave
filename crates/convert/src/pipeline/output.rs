@@ -20,20 +20,38 @@ fn partial_name(path: &Path, id: u64) -> PathBuf {
 /// The files a conversion writes: each is created under a unique temporary name and
 /// renamed into place by [`Outputs::commit`], in the order created; until
 /// then a failure removes them. Each rename is atomic; a set of files is
-/// not a filesystem transaction.
-#[derive(Default)]
-pub struct Outputs {
-    files: Vec<(PathBuf, PathBuf, Format)>,
+/// not a filesystem transaction. `F` describes each file (its [`Format`]
+/// for conversions).
+pub struct Outputs<F = Format> {
+    files: Vec<(PathBuf, PathBuf, F)>,
     committed: bool,
 }
 
-impl Outputs {
-    pub fn new() -> Outputs {
+impl<F> Default for Outputs<F> {
+    fn default() -> Outputs<F> {
+        Outputs {
+            files: Vec::new(),
+            committed: false,
+        }
+    }
+}
+
+impl<F: Copy> Outputs<F> {
+    pub fn new() -> Outputs<F> {
         Outputs::default()
     }
 
+    /// The temporary file standing for `path` until commit, for writers that
+    /// open their destination by name.
+    pub fn temporary(&self, path: &Path) -> Option<&Path> {
+        self.files
+            .iter()
+            .find(|(_, p, _)| p == path)
+            .map(|(tmp, _, _)| tmp.as_path())
+    }
+
     /// Creates the temporary file for `path`, which is to hold `format`.
-    pub fn create(&mut self, path: &Path, format: Format) -> Result<File> {
+    pub fn create(&mut self, path: &Path, format: F) -> Result<File> {
         if path.is_dir() {
             return Err(Error::invalid(
                 "output",
@@ -67,7 +85,7 @@ impl Outputs {
     }
 
     /// Writes `bytes` as the whole content of `path`, which holds `format`.
-    pub fn write(&mut self, path: &Path, format: Format, bytes: &[u8]) -> Result<()> {
+    pub fn write(&mut self, path: &Path, format: F, bytes: &[u8]) -> Result<()> {
         let mut f = self.create(path, format)?;
         f.write_all(bytes)?;
         Ok(())
@@ -86,7 +104,7 @@ impl Outputs {
 
     /// Syncs and renames every output into place; returns the final paths
     /// with their formats.
-    pub fn commit(mut self) -> Result<Vec<(Format, PathBuf)>> {
+    pub fn commit(mut self) -> Result<Vec<(F, PathBuf)>> {
         for (tmp, _, _) in &self.files {
             File::open(tmp)?.sync_all()?;
         }
@@ -98,7 +116,7 @@ impl Outputs {
     }
 }
 
-impl Drop for Outputs {
+impl<F> Drop for Outputs<F> {
     fn drop(&mut self) {
         if !self.committed {
             for (tmp, _, _) in &self.files {

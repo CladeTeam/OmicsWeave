@@ -2,6 +2,7 @@
 //! source, sorting out of core, encoding text lines into BGZF records, and
 //! publishing the destination files.
 
+pub(crate) mod hic;
 pub(crate) mod input;
 pub(crate) mod output;
 pub(crate) mod records;

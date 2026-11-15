@@ -88,6 +88,7 @@ impl FastaToBgzipFasta {
             bytes_read: input.read.load(std::sync::atomic::Ordering::Relaxed),
             spilled: 0,
             elapsed: Default::default(),
+            warnings: Vec::new(),
         })
     }
 }
@@ -305,6 +306,7 @@ impl FastaToTwoBit {
             bytes_read: input.read.load(std::sync::atomic::Ordering::Relaxed),
             spilled,
             elapsed: Default::default(),
+            warnings: Vec::new(),
         })
     }
 }

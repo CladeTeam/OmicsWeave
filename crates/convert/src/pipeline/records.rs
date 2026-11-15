@@ -191,5 +191,6 @@ pub(crate) fn run<E: LineEncoder>(ctx: &Context<'_>, spec: Spec<'_, E>) -> Resul
         bytes_read: spec.read.load(Ordering::Relaxed),
         spilled: 0,
         elapsed: Default::default(),
+        warnings: Vec::new(),
     })
 }

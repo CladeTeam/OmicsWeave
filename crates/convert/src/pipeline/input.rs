@@ -210,15 +210,17 @@ impl<R: BufRead> LineBatches<R> {
             return Ok(None);
         }
         let mut text = std::mem::take(&mut self.carry);
-        text.reserve(self.target + (1 << 16));
+        text.reserve(self.target.saturating_sub(text.len()));
         while text.len() < self.target {
             let buf = self.input.fill_buf()?;
             if buf.is_empty() {
                 self.done = true;
                 break;
             }
-            let n = buf.len();
-            text.extend_from_slice(buf);
+            // Queue sizing budgets one target-sized batch. A large reader
+            // buffer must not silently turn every small batch into 1 MiB.
+            let n = buf.len().min(self.target - text.len());
+            text.extend_from_slice(&buf[..n]);
             self.input.consume(n);
         }
         if !self.done {
@@ -239,8 +241,11 @@ impl<R: BufRead> LineBatches<R> {
                             self.done = true;
                             break;
                         }
-                        let n = buf.len();
-                        text.extend_from_slice(buf);
+                        // This batch holds a line longer than its target.
+                        // Stop at its first newline instead of also taking
+                        // unrelated lines from a large input buffer.
+                        let n = memchr::memchr(b'\n', buf).map_or(buf.len(), |at| at + 1);
+                        text.extend_from_slice(&buf[..n]);
                         self.input.consume(n);
                     }
                 }
@@ -279,6 +284,48 @@ pub fn lines(batch: &LineBatch) -> impl Iterator<Item = (u64, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_line_batches_obey_target_with_large_reader_buffers() {
+        let input = b"abcdefghij\n".repeat(20_000);
+        for target in [11, 37, 1024] {
+            let reader = BufReader::with_capacity(READ_CHUNK, input.as_slice());
+            let mut batches = LineBatches::new(reader, target, 1);
+            let mut actual = Vec::new();
+            let mut numbers = Vec::new();
+            while let Some(batch) = batches.next_batch().unwrap() {
+                assert!(batch.text.len() <= target);
+                numbers.extend(lines(&batch).map(|(number, _)| number));
+                actual.extend_from_slice(&batch.text);
+            }
+            assert_eq!(actual, input);
+            assert_eq!(numbers, (1..=20_000).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn oversized_line_does_not_absorb_following_short_lines() {
+        let mut input = b"first\n".to_vec();
+        input.extend(std::iter::repeat_n(b'x', 70_003));
+        input.extend_from_slice(b"\nlast\nnext\n");
+        let mut batches = LineBatches::new(input.as_slice(), 16, 8);
+        let first = batches.next_batch().unwrap().unwrap();
+        let long = batches.next_batch().unwrap().unwrap();
+        let last = batches.next_batch().unwrap().unwrap();
+        assert_eq!(
+            (first.first_line, first.text.as_slice()),
+            (8, &b"first\n"[..])
+        );
+        assert_eq!(long.first_line, 9);
+        assert_eq!(long.text.len(), 70_004);
+        assert_eq!(long.text.last(), Some(&b'\n'));
+        assert_eq!(
+            (last.first_line, last.text.as_slice()),
+            (10, &b"last\nnext\n"[..])
+        );
+        assert!(batches.next_batch().unwrap().is_none());
+        assert_eq!([first.text, long.text, last.text].concat(), input);
+    }
 
     #[test]
     fn long_lines_across_small_reads_preserve_bytes_and_numbers() {

@@ -4,7 +4,10 @@
 //!
 //! Keys must be unique (callers add a sequence number when the input order
 //! must break ties), so the order — and every output built from it — does
-//! not depend on where the buffer happened to spill.
+//! not depend on where the buffer happened to spill. A record type whose
+//! equal keys stand for one record (counts of one cell) folds them instead
+//! ([`Spill::ABSORBS`]): run files then hold each key once, and the merged
+//! stream may still yield a key once per run, for the caller to fold.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -27,6 +30,42 @@ pub trait Spill: Sized + Send + 'static {
     fn encode(&self, out: &mut Vec<u8>);
     /// The next record of a run, `None` at its end.
     fn decode(input: &mut impl Read) -> Result<Option<Self>>;
+    /// Whether records with equal keys are folded together
+    /// ([`Spill::absorb`]) where the sorter writes them out.
+    const ABSORBS: bool = false;
+    /// Folds `next`, whose key equals this record's, into this record. The
+    /// fold must be associative and commutative (exact integer sums, say),
+    /// so the result does not depend on where the buffer spilled.
+    fn absorb(&mut self, _next: Self) {}
+}
+
+/// Writes the records `next` yields, in key order, through `write`,
+/// folding equal keys of a type that absorbs them.
+fn write_folded<T: Spill>(
+    mut next: impl FnMut() -> Result<Option<T>>,
+    mut write: impl FnMut(&T) -> Result<()>,
+) -> Result<()> {
+    if !T::ABSORBS {
+        while let Some(r) = next()? {
+            write(&r)?;
+        }
+        return Ok(());
+    }
+    let mut pending: Option<T> = None;
+    while let Some(r) = next()? {
+        match &mut pending {
+            Some(p) if p.key() == r.key() => p.absorb(r),
+            _ => {
+                if let Some(p) = pending.replace(r) {
+                    write(&p)?;
+                }
+            }
+        }
+    }
+    if let Some(p) = pending {
+        write(&p)?;
+    }
+    Ok(())
 }
 
 /// Reads exactly `buf.len()` bytes, or none at a clean end.
@@ -161,11 +200,18 @@ impl<'p, T: Spill> Sorter<'p, T> {
         let splitters = {
             let want = ranges * OVERSAMPLE;
             let mut sample = Vec::with_capacity(want);
-            for seg in &segs {
-                let take = ((seg.len() as u128 * want as u128).div_ceil(n as u128))
-                    .min(seg.len() as u128) as usize;
+            for (j, seg) in segs.iter().enumerate() {
+                let len = seg.len() as u128;
+                let take = ((len * want as u128).div_ceil(n as u128)).min(len) as usize;
+                // Each segment's samples start at an offset of its own: a
+                // segment already in key order (a sorted batch) then still
+                // contributes keys from across the key space rather than
+                // the same few quantiles every other one does.
+                let offset = spread(j as u64) as u128 % (len / take as u128).max(1);
                 for i in 0..take {
-                    sample.push(seg[(i as u128 * seg.len() as u128 / take as u128) as usize].key());
+                    sample.push(
+                        seg[((offset + i as u128 * len / take as u128) % len) as usize].key(),
+                    );
                 }
             }
             sample.sort_unstable();
@@ -229,12 +275,18 @@ impl<'p, T: Spill> Sorter<'p, T> {
         let mut w = BufWriter::with_capacity(1 << 20, file);
         let mut buf = Vec::new();
         let mut merged = Ranges::new(self.pool, ranges);
-        while let Some(r) = merged.next_record()? {
-            buf.clear();
-            r.encode(&mut buf);
-            self.spilled = self.spilled.saturating_add(buf.len() as u64);
-            w.write_all(&buf)?;
-        }
+        let mut spilled = self.spilled;
+        write_folded(
+            || merged.next_record(),
+            |r| {
+                buf.clear();
+                r.encode(&mut buf);
+                spilled = spilled.saturating_add(buf.len() as u64);
+                w.write_all(&buf)?;
+                Ok(())
+            },
+        )?;
+        self.spilled = spilled;
         w.flush()?;
         self.runs.push(path);
         Ok(())
@@ -286,11 +338,15 @@ impl<'p, T: Spill> Sorter<'p, T> {
                 let file = File::create(&path).map_err(|e| with_path(e, &path))?;
                 let mut out = BufWriter::with_capacity(reader_buf, file);
                 let mut buf = Vec::new();
-                while let Some(record) = merged.next_record()? {
-                    buf.clear();
-                    record.encode(&mut buf);
-                    out.write_all(&buf)?;
-                }
+                write_folded(
+                    || merged.next_record(),
+                    |record| {
+                        buf.clear();
+                        record.encode(&mut buf);
+                        out.write_all(&buf)?;
+                        Ok(())
+                    },
+                )?;
                 out.flush()?;
                 drop(out);
                 drop(merged);
@@ -305,12 +361,38 @@ impl<'p, T: Spill> Sorter<'p, T> {
     }
 }
 
+/// A well-mixed function of `i` (splitmix64's finalizer).
+fn spread(i: u64) -> u64 {
+    let mut z = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// Merges sorted pieces into one sorted vector.
 fn merge_pieces<T: Spill>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
     if pieces.len() == 1 {
         return pieces.pop().expect("one piece");
     }
     let total = pieces.iter().map(Vec::len).sum();
+    let mut previous = None;
+    let disjoint = pieces.iter().filter(|p| !p.is_empty()).all(|piece| {
+        let first = piece.first().expect("nonempty piece").key();
+        let ordered = previous.is_none_or(|last| last < first);
+        previous = Some(piece.last().expect("nonempty piece").key());
+        ordered
+    });
+    if disjoint {
+        // Input segments often already follow key order. Their certified
+        // disjoint ranges need no per-record heap comparisons or reversal.
+        let mut pieces = pieces.into_iter();
+        let mut out = pieces.next().unwrap_or_default();
+        out.reserve(total - out.len());
+        for mut piece in pieces {
+            out.append(&mut piece);
+        }
+        return out;
+    }
     let mut out = Vec::with_capacity(total);
     for p in &mut pieces {
         p.reverse();
@@ -448,6 +530,43 @@ impl<T: Spill> Merge<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MERGE_COMPARISONS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct CountedKey(u64);
+
+    impl Ord for CountedKey {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            MERGE_COMPARISONS.fetch_add(1, Ordering::Relaxed);
+            self.0.cmp(&other.0)
+        }
+    }
+
+    impl PartialOrd for CountedKey {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    struct Counted(Rec);
+
+    impl Spill for Counted {
+        type Key = CountedKey;
+        fn key(&self) -> Self::Key {
+            CountedKey(self.0.0)
+        }
+        fn mem_size(&self) -> usize {
+            self.0.mem_size()
+        }
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.0.encode(out)
+        }
+        fn decode(input: &mut impl Read) -> Result<Option<Self>> {
+            Rec::decode(input).map(|record| record.map(Self))
+        }
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct Rec(u64, Vec<u8>);
@@ -476,6 +595,50 @@ mod tests {
             input.read_exact(&mut b)?;
             Ok(Some(Rec(k, b)))
         }
+    }
+
+    #[test]
+    fn ordered_and_overlapping_pieces_match_sort_oracle() {
+        for stride in [1, 17] {
+            let mut pieces = vec![Vec::new()];
+            let mut expected = Vec::new();
+            for i in 0..8 {
+                let mut piece = Vec::new();
+                for j in 0..257 {
+                    let k = if stride == 1 { i * 257 + j } else { j * 8 + i };
+                    piece.push(Rec(k, vec![k as u8; (k % 7) as usize]));
+                    expected.push(Rec(k, vec![k as u8; (k % 7) as usize]));
+                }
+                pieces.push(piece);
+            }
+            pieces.push(Vec::new());
+            expected.sort_unstable_by_key(|r| r.0);
+            assert_eq!(merge_pieces(pieces), expected);
+        }
+    }
+
+    #[test]
+    fn ordered_piece_merge_compares_ranges_instead_of_every_record() {
+        let pieces = (0..16)
+            .map(|i| {
+                (0..4096)
+                    .map(|j| Counted(Rec(i * 4096 + j, vec![])))
+                    .collect()
+            })
+            .collect();
+        MERGE_COMPARISONS.store(0, Ordering::Relaxed);
+        let merged = merge_pieces(pieces);
+        let comparisons = MERGE_COMPARISONS.load(Ordering::Relaxed);
+        eprintln!(
+            "ordered piece merge: records={}, pieces=16, comparisons={comparisons}",
+            merged.len()
+        );
+        assert!(
+            comparisons < 64,
+            "per-record merge comparisons: {comparisons}"
+        );
+        assert_eq!(merged.len(), 16 * 4096);
+        assert!(merged.iter().enumerate().all(|(i, r)| r.0.0 == i as u64));
     }
 
     #[test]

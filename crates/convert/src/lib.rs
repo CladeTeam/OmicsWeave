@@ -7,8 +7,15 @@
 //! | [`FastaToTwoBit`] | FASTA (plain, gzip or BGZF) | `.2bit` |
 //! | [`VcfToBcf`] | VCF (plain, gzip or BGZF) | `.bcf` (+ `.csi`) |
 //! | [`SamToBam`] | SAM (plain, gzip or BGZF) | `.bam` (+ `.bai` / `.csi`) |
+//! | [`BamSort`] | BAM | coordinate-sorted `.bam` (+ `.bai` / `.csi`) |
+//! | [`CramToBam`] | CRAM 3.0 / 3.1 (+ a reference) | `.bam` (+ `.bai` / `.csi`) |
 //! | [`BedToBigBed`] | BED (plain, gzip or BGZF) | `.bigbed` + `.sidecar` |
+//! | [`BedGraphToBigWig`] | bedGraph (plain, gzip or BGZF) | `.bigwig` + `.sidecar` |
+//! | [`WigToBigWig`] | wig (plain, gzip or BGZF) | `.bigwig` + `.sidecar` |
 //! | [`CoolToHic`] | `.cool` / `.mcool` | `.hic` + `.sidecar` |
+//! | [`PairsToHic`] | 4DN pairs, Juicer short (plain, gzip or BGZF) | `.hic` + `.sidecar` |
+//! | [`BedMethylToBigBed`] | bedMethyl (plain, gzip or BGZF) | `.bigbed` + `.sidecar` |
+//! | [`BedMethylToBigWig`] | bedMethyl (plain, gzip or BGZF) | `.bigwig` + `.sidecar` |
 //!
 //! [`Conversion::between`] chooses the conversion for a pair of formats
 //! ([`Format::detect`] tells a source's format by content,
@@ -28,23 +35,42 @@
 //! temporary files and atomic renames per file; several files are not a
 //! filesystem transaction.
 
+mod bamsort;
 mod bed;
+mod bedmethyl;
 mod budget;
 mod conversion;
 mod cool;
+mod cram;
 mod fasta;
 mod format;
+mod pairs;
 mod pipeline;
 mod sam;
 mod vcf;
+mod wig;
 
+pub use bamsort::BamSort;
 pub use bed::{BedToBigBed, ChromSizes};
+pub use bedmethyl::{BedMethylToBigBed, BedMethylToBigWig, Strand, Value};
 pub use budget::{Budget, MemoryPlan, RSS_SLACK, human, parse_size};
 pub use conversion::{
     Conversion, Index, OnProgress, Options, Plan, Progress, Report, convert, plan, run,
 };
 pub use cool::CoolToHic;
+pub use cram::CramToBam;
 pub use fasta::{FastaToBgzipFasta, FastaToTwoBit};
 pub use format::Format;
+pub use pairs::{JUICER_RESOLUTIONS, PairsDialect, PairsToHic};
 pub use sam::{BamIndex, SamToBam};
 pub use vcf::VcfToBcf;
+pub use wig::{BedGraphToBigWig, WigToBigWig};
+
+/// Pipeline stages shared with other budgeted streaming tools (the
+/// quantification layer): queue sizing, the external sorter, and
+/// destinations published atomically.
+pub mod stage {
+    pub use crate::budget::{Sizing, require, sizing, text_batch};
+    pub use crate::pipeline::output::{Outputs, TempDir};
+    pub use crate::pipeline::sort::{Merge, Sorter, Spill, read_or_end};
+}

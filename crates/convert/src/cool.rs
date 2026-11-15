@@ -1,21 +1,18 @@
 //! cool / mcool → .hic (+ sidecar).
 
 use std::collections::HashMap;
-use std::io::{BufWriter, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use omicsweave_cool::{Cool, PixelBatch, PixelScratch, StorageMode, is_mcool, mcool_resolutions};
-use omicsweave_core::exec::{Exec, Ordered};
+use omicsweave_core::exec::Ordered;
 use omicsweave_core::{ContactUnit, Error, Result};
-use omicsweave_hic::{
-    BlockLayout, Chrom, HicHeader, HicWriter, MatrixLayout, MatrixLayouts, Record,
-};
+use omicsweave_hic::{Chrom, HicHeader, MatrixLayout, MatrixLayouts};
 
 use crate::budget::{Budget, MemoryPlan, WRITE_BUF, sizing};
 use crate::conversion::{Context, Report};
-use crate::format::Format;
-use crate::pipeline::sort::{Sorter, Spill, read_or_end};
+use crate::pipeline::hic::{HicSink, Pixel, block_sizing};
+use crate::pipeline::sort::Sorter;
 
 /// cooler `.cool` / `.mcool` to Juicer `.hic` (v9) with the raw counts, one
 /// `.hic` resolution per cool resolution.
@@ -106,10 +103,6 @@ impl CoolToHic {
         )
     }
 
-    fn block_sizing(budget: &Budget) -> crate::budget::Sizing {
-        sizing(budget.threads, 1 << 20, budget.memory / 16)
-    }
-
     pub(crate) fn plan(&self, budget: &Budget) -> Result<MemoryPlan> {
         let mut fixed = 0u64;
         for (group, _) in self.groups()? {
@@ -117,9 +110,8 @@ impl CoolToHic {
             // The bins table is read and checked when a group opens.
             fixed = fixed.max(cool.n_bins().saturating_mul(24));
         }
-        let pipeline = Self::span_sizing(budget).per_queue
-            + Self::block_sizing(budget).per_queue
-            + WRITE_BUF as u64;
+        let pipeline =
+            Self::span_sizing(budget).per_queue + block_sizing(budget).per_queue + WRITE_BUF as u64;
         Ok(MemoryPlan {
             fixed,
             pipeline,
@@ -151,22 +143,10 @@ impl CoolToHic {
                 .collect(),
             resolutions,
         );
-        let mut outputs = crate::pipeline::output::Outputs::new();
-        let file = outputs.create(&self.dst, Format::Hic)?;
-        let b = Self::block_sizing(ctx.budget);
-        let mut writer = HicWriter::create_exec(
-            BufWriter::with_capacity(WRITE_BUF, file),
-            header,
-            self.level,
-            BlockLayout::default(),
-            Exec::Pool {
-                pool: &ctx.pool,
-                limit: b.limit,
-            },
-        )?;
-        let layouts = Arc::new(writer.layouts());
+        let mut sink = HicSink::create(ctx, &self.dst, header, self.level, self.sidecar)?;
+        let layouts = Arc::new(sink.layouts().clone());
         let tmp = ctx.tmp_parent(&self.dst);
-        let (mut records, mut spilled) = (0u64, 0u64);
+        let mut spilled = 0u64;
         let total: u64 = groups.len() as u64;
         for (done, (group, res)) in groups.iter().enumerate() {
             let cool = Arc::new(Cool::open(&self.src, group)?);
@@ -184,7 +164,7 @@ impl CoolToHic {
             }
             let mut sorter = Sorter::new(&ctx.pool, ctx.memory.buffer, &tmp);
             let s = Self::span_sizing(ctx.budget);
-            let mut exec = ctx.pool.ordered::<Vec<Placed>>(s.limit);
+            let mut exec = ctx.pool.ordered::<Vec<Pixel>>(s.limit);
             let spans = cool.pixel_spans(Self::rows(ctx.budget));
             for span in spans {
                 while exec.full() {
@@ -204,106 +184,20 @@ impl CoolToHic {
             ctx.progress("sort", done as u64, total);
             let mut merged = sorter.finish()?;
             ctx.progress("write", done as u64, total);
-            let mut current: Option<(u32, u32)> = None;
-            let mut block: Option<u32> = None;
-            let mut cells: Vec<Record> = Vec::new();
             while let Some(p) = merged.next_record()? {
-                records += 1;
-                if current != Some((p.c1, p.c2)) {
-                    if let Some(n) = block.take() {
-                        writer.add_block(n, std::mem::take(&mut cells))?;
-                    }
-                    if current.is_some() {
-                        writer.end_matrix()?;
-                    }
-                    let layout: MatrixLayout = layouts.layout(p.c1, p.c2, ContactUnit::Bp, *res)?;
-                    writer.begin_matrix(&layout)?;
-                    current = Some((p.c1, p.c2));
-                }
-                if block != Some(p.block) {
-                    if let Some(n) = block {
-                        writer.add_block(n, std::mem::take(&mut cells))?;
-                    }
-                    block = Some(p.block);
-                }
-                cells.push(Record {
-                    x: p.x,
-                    y: p.y,
-                    value: p.value,
-                });
-            }
-            if let Some(n) = block {
-                writer.add_block(n, cells)?;
-            }
-            if current.is_some() {
-                writer.end_matrix()?;
+                sink.push(*res, p)?;
             }
         }
-        let (out, sidecar) = writer.finish_with_sidecar()?;
-        out.into_inner().map_err(|e| e.into_error())?;
-        if self.sidecar {
-            let source = outputs.source(&self.dst)?;
-            let file = outputs.create(
-                &omicsweave_core::sidecar::sidecar_path(&self.dst),
-                Format::Sidecar,
-            )?;
-            sidecar.write_to(&source, file)?;
-        }
-        let written = outputs.commit()?;
+        let records = sink.pixels;
+        let written = sink.finish()?;
         Ok(Report {
             files: written,
             records,
             bytes_read: std::fs::metadata(&self.src).map_or(0, |m| m.len()),
             spilled,
             elapsed: Default::default(),
+            warnings: Vec::new(),
         })
-    }
-}
-
-/// A pixel placed in its `.hic` map and block (stored orientation).
-struct Placed {
-    c1: u32,
-    c2: u32,
-    block: u32,
-    x: u32,
-    y: u32,
-    value: f32,
-}
-
-impl Spill for Placed {
-    type Key = (u32, u32, u32, u32, u32);
-    fn key(&self) -> Self::Key {
-        (self.c1, self.c2, self.block, self.y, self.x)
-    }
-    fn mem_size(&self) -> usize {
-        0
-    }
-    fn encode(&self, out: &mut Vec<u8>) {
-        for v in [
-            self.c1,
-            self.c2,
-            self.block,
-            self.x,
-            self.y,
-            self.value.to_bits(),
-        ] {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-    fn decode(input: &mut impl Read) -> Result<Option<Placed>> {
-        let mut b = [0u8; 24];
-        if !read_or_end(input, &mut b)? {
-            return Ok(None);
-        }
-        let u = |i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap());
-        Ok(Some(Placed {
-            c1: u(0),
-            c2: u(1),
-            block: u(2),
-            x: u(3),
-            y: u(4),
-            value: f32::from_bits(u(5)),
-        }))
     }
 }
 
@@ -313,7 +207,7 @@ fn place(
     layouts: &MatrixLayouts,
     res: u32,
     rows: std::ops::Range<u64>,
-) -> Result<Vec<Placed>> {
+) -> Result<Vec<Pixel>> {
     let mut batch = PixelBatch::new();
     cool.read_pixels(rows, &mut PixelScratch::new(), &mut batch)?;
     let square = cool.storage_mode() == StorageMode::Square;
@@ -344,7 +238,7 @@ fn place(
         };
         let (block, x, y) = layout.place(x, y);
         let (c1, c2) = layout.chroms();
-        out.push(Placed {
+        out.push(Pixel {
             c1,
             c2,
             block,
