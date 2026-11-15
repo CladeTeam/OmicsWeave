@@ -1,4 +1,4 @@
-"""Bases by region, from FASTA (plain or bgzip, with its indexes) or 2bit."""
+"""Bases by locus, from FASTA (plain or bgzip, with its indexes) or 2bit."""
 
 from __future__ import annotations
 
@@ -9,11 +9,13 @@ from types import MappingProxyType
 import numpy as np
 
 from .. import _native
+from ..cache import BlockCache, BlockKey
+from ..cache import native as native_cache
 from ..errors import UnknownChromError
 from ..formats import BgzipFasta, Fai, Fasta, Gzi, PathLike, TwoBit
-from ..types import RegionLike, Sequence
-from ..types._genome import as_region
-from ._base import Reader, resolve
+from ..types import LocusLike, Sequence
+from ..types._genome import as_locus, native_key
+from ._base import CachedReader, resolve
 
 __all__ = ["SequenceReader"]
 
@@ -22,8 +24,10 @@ def _path(file: PathLike | None) -> str | None:
     return None if file is None else os.fspath(file)
 
 
-class SequenceReader(Reader):
-    """Reads the bases of a FASTA, bgzip FASTA or 2bit file by region.
+class SequenceReader(CachedReader):
+    """Reads the bases of a FASTA, bgzip FASTA or 2bit file by locus: a
+    :class:`~omicsweave.types.Region` or :class:`~omicsweave.types.Spliced`
+    spans, 5' to 3' of the key's strand (reverse complement on ``"-"``).
 
     FASTA is read through its ``fai`` and bgzip FASTA also through its
     ``gzi``; when not given they are the files beside it
@@ -40,14 +44,29 @@ class SequenceReader(Reader):
         gzi: Gzi | PathLike | None = None,
         *,
         soft_mask: bool = False,
+        cache: BlockCache | None = None,
     ) -> None:
         file = resolve(source, (Fasta, BgzipFasta, TwoBit), "SequenceReader")
         fai = None if fai is None else Fai(fai)
         gzi = None if gzi is None else Gzi(gzi)
-        native = _native.SequenceReader(os.fspath(file), _path(fai), _path(gzi), soft_mask)
+        native = _native.SequenceReader(
+            os.fspath(file), _path(fai), _path(gzi), soft_mask, native_cache(cache)
+        )
         self._open(native, file, fai, gzi, soft_mask=soft_mask)
         self.source = file
         self._chroms = MappingProxyType(dict(native.chroms()))
+
+    def set_cache(self, cache: BlockCache | None) -> None:
+        """Attach caller-owned blocks; plain FASTA rejects a nonempty cache."""
+        self._native.set_cache(native_cache(cache))
+
+    def describe_cache(self, locus: LocusLike) -> tuple[BlockKey, ...]:
+        """The block keys on which this locus depends, each once."""
+        return tuple(self._native.describe_cache(native_key(as_locus(locus))))
+
+    def prefetch_cache(self, locus: LocusLike) -> None:
+        """Populate the attached cache without constructing sequence output."""
+        self._native.prefetch_cache(native_key(as_locus(locus)))
 
     @property
     def chroms(self) -> Mapping[str, int]:
@@ -61,13 +80,25 @@ class SequenceReader(Reader):
         except KeyError:
             raise UnknownChromError(f"unknown chromosome {chrom!r}", chrom=chrom) from None
 
-    def fetch(self, region: RegionLike, out: np.ndarray | None = None) -> Sequence:
-        """The bases of ``region``, which must lie within its sequence.
+    def fetch(self, locus: LocusLike, out: np.ndarray | None = None) -> Sequence:
+        """The bases of ``locus``, whose spans must lie within its sequence.
 
-        ``out`` (``uint8``, one element per base) receives them in place.
+        By default, returns a new array independent of later queries and
+        the reader's lifetime. Optional ``out`` (writable, contiguous
+        ``uint8``, one element per position) receives the bases in place;
+        the returned sequence references that same array.
         """
-        r = as_region(region)
+        key = as_locus(locus)
+        native = native_key(key)
         if out is None:
-            out = np.empty(len(r), dtype=np.uint8)
-        self._native.sequence(r.chrom, r.start, r.end, out)
-        return Sequence(r, out)
+            length = len(key)
+            if length <= 4096:
+                out = self._native.fetch(native)
+            else:
+                # Long reads amortize the call boundary; empty storage avoids
+                # a separate zero-fill before the decoder overwrites it.
+                out = np.empty(length, dtype=np.uint8)
+                self._native.sequence(native, out)
+        else:
+            self._native.sequence(native, out)
+        return Sequence(key, out)

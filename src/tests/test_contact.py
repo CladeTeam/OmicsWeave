@@ -122,3 +122,20 @@ def test_sidecar_written_equals_built(tmp_path):
     sidecar.unlink()
     assert Hic(path).build_sidecar() == Sidecar(sidecar)
     assert sidecar.read_bytes() == written
+
+
+def test_reverse_strand_flips_its_axis(tmp_path):
+    rng = np.random.default_rng(3)
+    path = tmp_path / "m.hic"
+    build(path, random_contacts(rng))
+    f = ContactReader(path)
+    rows, cols = Region("chr1", 2000, 17000), Region("chr2", 0, 9000)
+    base = f.matrix(ContactWindow(rows, cols, 1000)).values
+    for rs, cs in (("-", "."), (".", "-"), ("-", "-")):
+        w = ContactWindow(rows.with_strand(rs), cols.with_strand(cs), 1000)
+        want = base[:: -1 if rs == "-" else 1, :: -1 if cs == "-" else 1]
+        np.testing.assert_array_equal(f.matrix(w).values, want)
+        # Pixels stay at genomic bins.
+        np.testing.assert_array_equal(
+            f.pixels(w).row, f.pixels(ContactWindow(rows, cols, 1000)).row
+        )

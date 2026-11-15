@@ -8,7 +8,7 @@ import omicsweave as ow
 from omicsweave import errors
 from omicsweave.formats import BgzipFasta, Fai, Fasta, FastaWriter, Gzi, TwoBit
 from omicsweave.query import SequenceReader
-from omicsweave.types import Region
+from omicsweave.types import Region, Spliced
 
 
 def random_genome(rng: np.random.Generator, n: int) -> dict[str, bytes]:
@@ -222,3 +222,52 @@ def test_two_bit(tmp_path):
     assert f.fetch(("x", 0, 12)).text == "ACGTNNACGTAC"
     masked = SequenceReader(path, soft_mask=True)
     assert masked.fetch(("x", 0, 12)).text == "ACGTNNacgtAC"
+
+
+COMPLEMENT = bytes.maketrans(b"ACGTNacgtn", b"TGCANtgcan")
+
+
+def revcomp(seq: bytes) -> bytes:
+    return seq.translate(COMPLEMENT)[::-1]
+
+
+@pytest.mark.parametrize("suffix", [".fa", ".fa.gz"])
+def test_strand_and_spliced_keys(tmp_path, suffix):
+    rng = np.random.default_rng(11)
+    genome = random_genome(rng, 3)
+    path = tmp_path / f"g{suffix}"
+    write_fasta(path, genome, line_width=7)
+    f = SequenceReader(path)
+    for _ in range(40):
+        name = list(genome)[int(rng.integers(len(genome)))]
+        seq = genome[name]
+        cuts = np.sort(rng.integers(0, len(seq) + 1, 2 * int(rng.integers(1, 5))))
+        spans = cuts.reshape(-1, 2)
+        joined = b"".join(seq[s:e] for s, e in spans)
+        assert f.fetch(Spliced(name, spans, "+")).bases.tobytes() == joined
+        assert f.fetch(Spliced(name, spans, "-")).bases.tobytes() == revcomp(joined)
+        s, e = int(spans[0][0]), int(spans[0][1])
+        assert f.fetch((name, s, e, "-")).bases.tobytes() == revcomp(seq[s:e])
+        key = Spliced(name, spans, "-")
+        out = np.zeros(len(key), dtype=np.uint8)
+        assert f.fetch(key, out=out).bases is out
+
+
+def test_spliced_coordinates():
+    key = Spliced("chr1", [(100, 110), (200, 205)], "-", name="t")
+    assert len(key) == 15
+    assert str(key) == "chr1:[100-110,200-205]:-"
+    assert key.hull == Region("chr1", 100, 205, "-")
+    # Position 0 is the 3'-most genomic base on the minus strand.
+    np.testing.assert_array_equal(key.to_genome([0, 4, 5, 14]), [204, 200, 109, 100])
+    np.testing.assert_array_equal(
+        key.to_local([204, 200, 109, 100, 150, 99]), [0, 4, 5, 14, -1, -1]
+    )
+    plus = Spliced("chr1", [(100, 110), (200, 205)])
+    np.testing.assert_array_equal(plus.to_local(plus.to_genome(np.arange(15))), np.arange(15))
+    with pytest.raises(errors.InvalidError):
+        Spliced("chr1", [(100, 110), (105, 120)])
+    with pytest.raises(ValueError):
+        Region("chr1", 0, 1, "x")
+    assert Region("chr1", 0, 1, "-") != Region("chr1", 0, 1)
+    assert str(Region("chr1", 0, 1, "-")) == "chr1:0-1:-"

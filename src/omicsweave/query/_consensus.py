@@ -1,4 +1,4 @@
-"""Consensus sequences by region: ``bcftools consensus`` of a VCF or BCF
+"""Consensus sequences by region: ``bcftools consensus`` of an indexed BCF
 over a reference, computed in memory."""
 
 from __future__ import annotations
@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .. import _native
-from ..formats import Bcf, BgzipFasta, Fasta, GzipVcf, PathLike, TwoBit, Vcf
+from ..errors import InvalidError
+from ..formats import Bcf, BgzipFasta, Csi, Fasta, File, GzipVcf, PathLike, TwoBit, Vcf, detect
 from ..types import (
     AllAlt,
     Alleles,
@@ -19,7 +20,7 @@ from ..types import (
     RegionLike,
     Samples,
 )
-from ..types._genome import as_region
+from ..types._genome import Region, Spliced, as_region
 from ._base import Reader, resolve
 from ._sequence import SequenceReader
 
@@ -62,6 +63,37 @@ class ConsensusOptions:
             raise ValueError("give include or exclude, not both")
 
 
+def _bcf(variants: Bcf | PathLike) -> Bcf:
+    """``variants`` as a BCF: VCF text is not read by region."""
+    file = variants if isinstance(variants, File) else detect(variants)
+    if isinstance(file, (Vcf, GzipVcf)):
+        detail = (
+            "ConsensusReader reads an indexed BCF by region, not VCF text; convert it "
+            f"with `ow convert {file.path} {_bcf_name(file)} --index`"
+        )
+        if isinstance(variants, File):
+            raise TypeError(detail)
+        raise InvalidError(f"{file.path}: {detail}", what=str(file.path), detail=detail)
+    return resolve(variants, (Bcf,), "ConsensusReader")
+
+
+def _bcf_name(file: Vcf | GzipVcf) -> str:
+    name = os.fspath(file.path)
+    for suffix in (".vcf.gz", ".vcf.bgz", ".vcf"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)] + ".bcf"
+    return name + ".bcf"
+
+
+def _key(region: RegionLike) -> Region:
+    if isinstance(region, Spliced):
+        raise TypeError(
+            "ConsensusReader does not read Spliced keys: a consensus edits one "
+            "contiguous region; fetch each span as a Region (with its strand)"
+        )
+    return as_region(region)
+
+
 def _selector(alleles: Alleles) -> tuple[str, list[str], str | None]:
     match alleles:
         case AllAlt():
@@ -74,22 +106,32 @@ def _selector(alleles: Alleles) -> tuple[str, list[str], str | None]:
 
 
 class ConsensusReader(Reader):
-    """Reads personal sequences by region: the records of a VCF or BCF file
-    (loaded once, whole) applied to a reference.
+    """Reads personal sequences by region: the records of a BCF, read by
+    region through its CSI index, applied to a reference.
 
-    ``reference`` is an open :class:`SequenceReader`, shared and left open,
-    or a sequence file, which this reader opens and closes. Consecutive
-    reads of one region read its reference and find its records once;
-    :meth:`fetch_batch` builds a whole batch in one call.
+    ``index`` defaults to the ``.csi`` beside the BCF; a missing index
+    raises :class:`~omicsweave.errors.IoError`. VCF text is not read by
+    region: convert it first (``ow convert cohort.vcf.gz cohort.bcf
+    --index``). ``reference`` is an open :class:`SequenceReader`, shared and
+    left open, or a sequence file, which this reader opens and closes.
+    Each region decodes the records it takes once; consecutive reads of one
+    region reuse its reference and records, and :meth:`fetch_batch` builds
+    a whole batch in one call.
+
+    A region on ``"-"`` reads the reverse complement of its consensus
+    (IUPAC codes complemented, case kept); the chain stays on the forward
+    strand. ``"+"``, ``"."`` and ``"?"`` read forward.
     """
 
     def __init__(
         self,
-        variants: Vcf | GzipVcf | Bcf | PathLike,
+        variants: Bcf | PathLike,
         reference: SequenceReader | Fasta | BgzipFasta | TwoBit | PathLike,
         options: ConsensusOptions | None = None,
+        *,
+        index: Csi | PathLike | None = None,
     ) -> None:
-        file = resolve(variants, (Vcf, GzipVcf, Bcf), "ConsensusReader")
+        file = _bcf(variants)
         options = options or ConsensusOptions()
         given = reference
         self._owns_reference = not isinstance(reference, SequenceReader)
@@ -99,6 +141,7 @@ class ConsensusReader(Reader):
         try:
             native = _native.ConsensusBuilder(
                 os.fspath(file),
+                None if index is None else os.fspath(index),
                 reference._native,
                 o.iupac_codes,
                 o.missing,
@@ -117,8 +160,9 @@ class ConsensusReader(Reader):
             if self._owns_reference:
                 reference.close()
             raise
-        self._open(native, file, given, options)
+        self._open(native, file, given, options, index=index)
         self.source = file
+        self.index = detect(native.index_path)
         self.reference = reference
         self.options = options
         self._samples = tuple(native.samples())
@@ -127,31 +171,39 @@ class ConsensusReader(Reader):
     def samples(self) -> tuple[str, ...]:
         return self._samples
 
-    @property
-    def records(self) -> int:
-        """Records kept (after ``include`` / ``exclude``)."""
-        return self._native.records()[0]
-
-    @property
-    def skipped_lines(self) -> int:
-        """Malformed VCF lines left out while reading, as htslib skips them."""
-        return self._native.records()[1]
-
     def fetch(self, region: RegionLike, alleles: Alleles | None = None) -> ConsensusSequence:
-        """The consensus of ``region`` with ``alleles`` (default :class:`AllAlt`)."""
-        r = as_region(region)
+        """The consensus of ``region`` with ``alleles`` (default
+        :class:`AllAlt`), 5' to 3' of the region's strand."""
+        r = _key(region)
         alleles = AllAlt() if alleles is None else alleles
-        bases, chain = self._native.sequence(r.chrom, r.start, r.end, _selector(alleles))
+        bases, chain = self._native.sequence(r.chrom, r.start, r.end, r.strand, _selector(alleles))
         return ConsensusSequence(r, alleles, bases, chain)
 
     def fetch_batch(self, region: RegionLike, alleles: Iterable[Alleles]) -> ConsensusBatch:
-        """The consensus of ``region`` with each of ``alleles``."""
-        r = as_region(region)
+        """The consensus of ``region`` with each of ``alleles``, each 5' to
+        3' of the region's strand."""
+        r = _key(region)
         alleles = tuple(alleles)
         offsets, bases, chains = self._native.sequences(
-            r.chrom, r.start, r.end, [_selector(a) for a in alleles]
+            r.chrom, r.start, r.end, r.strand, [_selector(a) for a in alleles]
         )
         return ConsensusBatch(r, alleles, offsets, bases, tuple(chains))
+
+    def clone(self) -> ConsensusReader:
+        """Share the BCF header, index and reference blocks with separate work state."""
+        reference = self.reference.clone()
+        try:
+            native = self._native.clone_context(reference._native)
+        except BaseException:
+            reference.close()
+            raise
+        cloned = object.__new__(type(self))
+        cloned.__dict__ = self.__dict__.copy()
+        cloned._native = native
+        cloned._closed = False
+        cloned.reference = reference
+        cloned._owns_reference = True
+        return cloned
 
     def close(self) -> None:
         """Closes the reader, and its reference if it opened it."""

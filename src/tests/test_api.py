@@ -98,7 +98,7 @@ def test_open_picks_the_reader(tmp_path):
         assert f.fetch(("x", 1, 3)).text == "CG"
     assert f.closed
     (tmp_path / "v.vcf").write_text("##fileformat=VCFv4.2\n")
-    with pytest.raises(errors.InvalidError, match="ConsensusReader"):
+    with pytest.raises(errors.InvalidError, match="convert it to BCF"):
         ow.open(tmp_path / "v.vcf")
 
 

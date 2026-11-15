@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any, Self
 
+from ..cache import CacheNamespace
 from ..errors import InvalidError
 from ..formats import File, PathLike, detect
 from ..formats._base import ensure_format
@@ -36,7 +37,14 @@ class Reader:
     """An open reader: a context manager, closed explicitly or on exit, and
     pickled as the arguments it was opened with (it reopens on unpickling,
     e.g. in a DataLoader worker). Decoding releases the GIL, so threads can
-    share one reader."""
+    share one reader.
+
+    Queries allocate result arrays automatically. Results remain valid
+    after further queries or after this reader closes. Fixed-size queries
+    optionally accept ``out=`` to write into caller-owned storage; those
+    results share that storage and reflect any subsequent writes to it.
+    Decoding workspaces are managed internally.
+    """
 
     _native: Any
     _args: tuple[Any, ...]
@@ -70,3 +78,21 @@ class Reader:
         args = ", ".join(repr(a) for a in getattr(self, "_args", ()))
         state = " (closed)" if getattr(self, "_closed", False) else ""
         return f"{type(self).__name__}({args}){state}"
+
+
+class CachedReader(Reader):
+    """A reader able to describe and reuse independently decoded blocks."""
+
+    @property
+    def cache_namespace(self) -> CacheNamespace:
+        """Process-local source session identity, shared by execution clones."""
+        return self._native.cache_namespace()
+
+    def clone(self) -> Self:
+        """Share the immutable source and cache with independent execution state."""
+        native = self._native.clone_context()
+        cloned = object.__new__(type(self))
+        cloned.__dict__ = self.__dict__.copy()
+        cloned._native = native
+        cloned._closed = False
+        return cloned

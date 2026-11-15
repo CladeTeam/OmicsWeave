@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 import omicsweave as ow
-from omicsweave import _native
+from omicsweave import _native, errors
 from omicsweave.formats import BbiOptions, Bed, BigBed, BigBedSchema, BigBedWriter, GzipBed
 from omicsweave.query import IntervalReader
 from omicsweave.types import StringVector
@@ -65,7 +65,7 @@ def test_bigbed_round_trip(tmp_path, seed):
 
 
 @pytest.mark.parametrize("compressed", [False, True])
-def test_bed(tmp_path, compressed):
+def test_bed_is_read_through_bigbed(tmp_path, compressed):
     rng = np.random.default_rng(7)
     features = random_features(rng)
     order = rng.permutation(len(features))
@@ -74,11 +74,20 @@ def test_bed(tmp_path, compressed):
     )
     path = tmp_path / ("f.bed.gz" if compressed else "f.bed")
     path.write_bytes(gzip.compress(text.encode()) if compressed else text.encode())
-    f = ow.open(path)
+    command = r"ow convert .*f\.bed(\.gz)? .*f\.bb --chrom-sizes"
+    with pytest.raises(errors.InvalidError, match=command):
+        ow.open(path)
+    with pytest.raises(errors.InvalidError, match="ow convert"):
+        IntervalReader(path)
+    with pytest.raises(TypeError, match="ow convert"):
+        IntervalReader(GzipBed(path) if compressed else Bed(path))
+    sizes = tmp_path / "sizes"
+    sizes.write_text("".join(f"{name}\t{length}\n" for name, length in CHROMS.items()))
+    ow.convert.run(path, tmp_path / "f.bb", threads=1, chrom_sizes=sizes)
+    f = ow.open(tmp_path / "f.bb")
     assert isinstance(f, IntervalReader)
-    assert f.source == (GzipBed(path) if compressed else Bed(path))
-    assert f.schema is None
-    assert set(f.chroms) == set(CHROMS) and set(f.chroms.values()) == {None}
+    assert f.source == BigBed(tmp_path / "f.bb")
+    assert dict(f.chroms) == CHROMS
     stable = sorted(features, key=lambda r: (r[0], r[1]))
     for _ in range(40):
         name = list(CHROMS)[int(rng.integers(len(CHROMS)))]

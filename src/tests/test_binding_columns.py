@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+import omicsweave as ow
 from omicsweave import _native, errors
 from omicsweave.formats import (
     BbiOptions,
@@ -25,14 +26,10 @@ def test_interval_and_track_columns_keep_order_bits_and_ownership(tmp_path):
     options = BbiOptions(zoom_levels=0)
     track_path = tmp_path / "columns.bw"
     bed_path = tmp_path / "columns.bb"
-    text_path = tmp_path / "columns.bed"
     with BigWigWriter(track_path, chroms, options) as writer:
         writer.add("c", starts, ends, values)
     with BigBedWriter(bed_path, chroms, BigBedSchema(field_count=4), options) as writer:
         writer.add("c", starts, ends, notes)
-    text_path.write_text(
-        "".join(f"c\t{s}\t{e}\t{note}\n" for s, e, note in zip(starts, ends, notes, strict=True))
-    )
     with TrackReader(track_path) as track:
         full = track.intervals(("c", 0, chroms["c"]))
         np.testing.assert_array_equal(full.start, starts)
@@ -45,19 +42,18 @@ def test_interval_and_track_columns_keep_order_bits_and_ownership(tmp_path):
         assert not np.shares_memory(full.value, again.value)
         full.value[:] = 99
         np.testing.assert_array_equal(again.value.view(np.uint32), values.view(np.uint32))
-    for path in (bed_path, text_path):
-        with IntervalReader(path) as reader:
-            full = reader.fetch(("c", 0, chroms["c"]))
-            np.testing.assert_array_equal(full.start, starts)
-            np.testing.assert_array_equal(full.end, ends)
-            assert full.annotation.to_list() == notes
-            assert len(reader.fetch(("c", 0, 0))) == 0
-            assert len(reader.fetch(("c", 0, 1))) == 1
-            again = reader.fetch(("c", 0, chroms["c"]))
-            assert not np.shares_memory(full.start, again.start)
-            assert not np.shares_memory(full.annotation.data, again.annotation.data)
-            full.start[:] = 99
-            np.testing.assert_array_equal(again.start, starts)
+    with IntervalReader(bed_path) as reader:
+        full = reader.fetch(("c", 0, chroms["c"]))
+        np.testing.assert_array_equal(full.start, starts)
+        np.testing.assert_array_equal(full.end, ends)
+        assert full.annotation.to_list() == notes
+        assert len(reader.fetch(("c", 0, 0))) == 0
+        assert len(reader.fetch(("c", 0, 1))) == 1
+        again = reader.fetch(("c", 0, chroms["c"]))
+        assert not np.shares_memory(full.start, again.start)
+        assert not np.shares_memory(full.annotation.data, again.annotation.data)
+        full.start[:] = 99
+        np.testing.assert_array_equal(again.start, starts)
 
 
 def test_contact_columns_and_matrix_shape_validation_leave_outputs_intact(tmp_path):
@@ -144,7 +140,9 @@ def test_cached_consensus_selectors_and_region_changes_recover_after_errors(tmp_
         "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts\n"
         "c\t2\t.\tC\tT\t50\tPASS\t.\tGT\t0|1\n"
     )
-    with ConsensusReader(vcf, reference) as builder:
+    bcf = tmp_path / "cache.bcf"
+    ow.convert.run(vcf, bcf, index=True, threads=1)
+    with ConsensusReader(bcf, reference) as builder:
         selectors = [Haplotype("s", "1"), Haplotype("s", "2"), AllAlt()]
         for key, expected in [
             (("c", 0, 4), ["ACGT", "ATGT", "ATGT"]),
