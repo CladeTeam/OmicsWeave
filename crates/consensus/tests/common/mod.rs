@@ -1,5 +1,5 @@
 //! bcftools consensus as the reference, run in process; an in-memory
-//! reference sequence; random fixtures.
+//! reference sequence; indexed BCF fixtures; random fixtures.
 
 #![allow(dead_code)]
 
@@ -8,7 +8,10 @@ use std::ffi::{CString, c_char};
 use std::path::Path;
 use std::sync::Mutex;
 
-use omicsweave_core::{Error, Region, Result, SequenceRead};
+use omicsweave_bgzf::{BinIndex, locate_index};
+use omicsweave_consensus::{Consensus, ConsensusOptions, RecordFilter};
+use omicsweave_core::{Error, FileSource, Locus, Result, SequenceRead, orient};
+use omicsweave_vcf::BcfReader;
 
 /// splitmix64, for deterministic fixtures from a proptest-chosen seed.
 pub struct Rng(pub u64);
@@ -46,12 +49,18 @@ impl SequenceRead for Genome {
             .ok_or_else(|| Error::UnknownChrom(chrom.to_owned()))
     }
 
-    fn sequence(&mut self, region: Region<'_>, out: &mut [u8]) -> Result<()> {
+    fn sequence(&mut self, locus: &Locus<'_>, out: &mut [u8]) -> Result<()> {
         let seq = self
             .0
-            .get(region.chrom)
-            .ok_or_else(|| Error::UnknownChrom(region.chrom.to_owned()))?;
-        out.copy_from_slice(&seq[region.start as usize..region.end as usize]);
+            .get(locus.chrom)
+            .ok_or_else(|| Error::UnknownChrom(locus.chrom.to_owned()))?;
+        let mut at = 0;
+        for span in locus.spans() {
+            let n = span.len() as usize;
+            out[at..at + n].copy_from_slice(&seq[span.start as usize..span.end as usize]);
+            at += n;
+        }
+        orient::orient_bases(locus.strand, out);
         Ok(())
     }
 }
@@ -81,6 +90,57 @@ pub fn to_indexed_bcf(vcf: &Path, bcf: &Path) {
             0
         );
     }
+}
+
+/// Rewrites raw (uncompressed) BCF bytes as BGZF with htslib and indexes
+/// them, without re-encoding the records.
+pub fn to_indexed_raw_bcf(raw: &[u8], bcf: &Path) {
+    let c = |s: &str| CString::new(s).unwrap();
+    let path = c(bcf.to_str().unwrap());
+    // SAFETY: the handle comes from htslib and is closed below.
+    unsafe {
+        htslib_sys::hts_set_log_level(htslib_sys::HTS_LOG_OFF);
+        let fp = htslib_sys::bgzf_open(path.as_ptr(), c("w").as_ptr());
+        assert!(!fp.is_null());
+        assert_eq!(
+            htslib_sys::bgzf_write(fp, raw.as_ptr().cast(), raw.len()),
+            raw.len() as isize
+        );
+        assert_eq!(htslib_sys::bgzf_close(fp), 0);
+        assert_eq!(
+            htslib_sys::bcf_index_build3(path.as_ptr(), std::ptr::null(), 14, 0),
+            0
+        );
+    }
+}
+
+/// An indexed BCF and the CSI beside it.
+pub fn open_bcf(bcf: &Path) -> BcfReader<FileSource> {
+    let csi = locate_index(bcf).expect("CSI beside the BCF");
+    BcfReader::open(
+        FileSource::open(bcf).unwrap(),
+        BinIndex::read_file(csi).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A builder over the indexed BCF at `bcf`.
+pub fn consensus(
+    bcf: &Path,
+    filter: Option<RecordFilter<'_>>,
+    options: ConsensusOptions,
+) -> Consensus {
+    Consensus::new(open_bcf(bcf), filter, options).unwrap()
+}
+
+/// Writes `vcf` as `<dir>/<name>.vcf`, then as an indexed `<dir>/<name>.bcf`,
+/// whose path it returns.
+pub fn bcf_of(dir: &Path, name: &str, vcf: &[u8]) -> std::path::PathBuf {
+    let text = dir.join(format!("{name}.vcf"));
+    let bcf = dir.join(format!("{name}.bcf"));
+    std::fs::write(&text, vcf).unwrap();
+    to_indexed_bcf(&text, &bcf);
+    bcf
 }
 
 static BCFTOOLS: Mutex<()> = Mutex::new(());

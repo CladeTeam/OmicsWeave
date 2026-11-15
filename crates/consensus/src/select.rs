@@ -3,15 +3,20 @@
 //! 602-758).
 
 use omicsweave_core::{Error, Result};
+use smallvec::SmallVec;
 
 use crate::iupac;
-use crate::store::{GT_END, Gt, Site, VcfStore};
+use crate::records::{GT_END, Gt, Records, Site};
 
 const PICK_REF: u8 = 1;
 const PICK_ALT: u8 = 2;
 const PICK_LONG: u8 = 4;
 const PICK_SHORT: u8 = 8;
 const PICK_IUPAC: u8 = 16;
+// Readable genotypes contain values 0..=127 plus the int8 missing/vector-end
+// sentinels. The unsigned missing sentinel can address allele 63; larger
+// allele numbers require a wide genotype and are rejected before selection.
+const BYTE_GT_ALLELES: usize = 64;
 
 /// A parsed `-H`: pick rules and a 1-based haplotype (0 for none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +51,7 @@ impl Haplotype {
     }
 }
 
-/// How a query chooses alleles, resolved against the store.
+/// How a query chooses alleles, resolved against the file's samples.
 #[derive(Debug, Clone)]
 pub(crate) enum Mode {
     /// Every first ALT (`-s -`).
@@ -54,7 +59,7 @@ pub(crate) enum Mode {
     /// IUPAC codes of all plain alleles (`-s - -I`).
     IupacRefAlt,
     /// IUPAC codes of these samples' genotypes (`-s a,b`).
-    IupacSamples(Vec<usize>),
+    IupacSamples(SmallVec<[usize; 4]>),
     /// One sample with `-H` (`iupac`: `-I` given as well).
     Sample {
         sample: usize,
@@ -83,7 +88,6 @@ pub(crate) enum Choice {
 pub(crate) struct Scratch {
     /// The chosen allele's bytes.
     pub allele: Vec<u8>,
-    gt: Vec<u8>,
     selected: Vec<bool>,
 }
 
@@ -106,14 +110,14 @@ fn invalid(site: &Site, what: &str) -> Error {
 
 /// Chooses the allele of `site` under `mode`; `missing` is `-M` given.
 pub(crate) fn choose(
-    store: &VcfStore,
+    records: &Records,
     site: &Site,
     mode: &Mode,
     missing: bool,
     scratch: &mut Scratch,
 ) -> Result<Choice> {
     let n_allele = site.n_allele as usize;
-    let allele = |i: usize| store.allele(site, i);
+    let allele = |i: usize| records.allele(site, i);
     let ialt = match mode {
         Mode::AllAlt => 1,
         Mode::IupacRefAlt if n_allele > 1 => {
@@ -126,11 +130,13 @@ pub(crate) fn choose(
                 return Ok(Choice::Skip);
             }
             scratch.selected.clear();
-            scratch.selected.resize(n_allele, false);
+            scratch
+                .selected
+                .resize(n_allele.min(BYTE_GT_ALLELES), false);
             let mut any = false;
             for &s in samples {
-                store.genotype(site, s, &mut scratch.gt);
-                any |= add_alleles(site, &scratch.gt, &mut scratch.selected)?;
+                let gt = records.genotype(site, s).unwrap_or_default();
+                any |= add_alleles(site, gt, &mut scratch.selected)?;
             }
             if !any {
                 return Ok(if missing {
@@ -141,7 +147,7 @@ pub(crate) fn choose(
             }
             let selected = &scratch.selected;
             return Ok(
-                match iupac::mix(n_allele, allele, |i| selected[i], &mut scratch.allele) {
+                match iupac::mix(selected.len(), allele, |i| selected[i], &mut scratch.allele) {
                     Some(i) => {
                         if n_allele == 1 {
                             Choice::Ref
@@ -161,8 +167,7 @@ pub(crate) fn choose(
             if !readable_gt(site)? {
                 return Ok(Choice::Skip);
             }
-            store.genotype(site, *sample, &mut scratch.gt);
-            let gt = &scratch.gt;
+            let gt = records.genotype(site, *sample).unwrap_or_default();
             let width = gt.len();
             let use_iupac = if haplotype.pick == PICK_IUPAC {
                 haplotype.index == 0 || (!is_phased(gt[0]) && !is_phased(gt[width - 1]))
@@ -171,7 +176,9 @@ pub(crate) fn choose(
             };
             let ialt = if use_iupac {
                 scratch.selected.clear();
-                scratch.selected.resize(n_allele, false);
+                scratch
+                    .selected
+                    .resize(n_allele.min(BYTE_GT_ALLELES), false);
                 if !add_alleles(site, gt, &mut scratch.selected)? {
                     return Ok(if missing {
                         Choice::Missing
@@ -180,12 +187,12 @@ pub(crate) fn choose(
                     });
                 }
                 let selected = &scratch.selected;
-                match iupac::mix(n_allele, allele, |i| selected[i], &mut scratch.allele) {
+                match iupac::mix(selected.len(), allele, |i| selected[i], &mut scratch.allele) {
                     Some(i) => i as i64,
                     None => -1,
                 }
             } else if haplotype.index == 0 {
-                match pick_one(site, store, gt, haplotype.pick, missing)? {
+                match pick_one(site, records, gt, haplotype.pick, missing)? {
                     Some(i) => i,
                     None => return Ok(Choice::Skip),
                 }
@@ -223,7 +230,7 @@ fn readable_gt(site: &Site) -> Result<bool> {
     match site.gt {
         Gt::Absent => Ok(false),
         Gt::Wide => Err(invalid(site, "genotype values beyond int8")),
-        Gt::Bytes | Gt::Packed => Ok(true),
+        Gt::Bytes => Ok(true),
     }
 }
 
@@ -270,7 +277,7 @@ fn use_hap(gt: &[u8], index: usize, missing: bool) -> Option<i64> {
 /// and the rules replace it only where they apply.
 fn pick_one(
     site: &Site,
-    store: &VcfStore,
+    records: &Records,
     gt: &[u8],
     pick: u8,
     missing: bool,
@@ -310,7 +317,7 @@ fn pick_one(
         if pick & (PICK_LONG | PICK_SHORT) != 0 {
             let len = match jalt {
                 0 => site.rlen,
-                j if j > 0 => store.allele(site, j as usize).len() as i64,
+                j if j > 0 => records.allele(site, j as usize).len() as i64,
                 _ => 0,
             };
             let take = if i == 0 {

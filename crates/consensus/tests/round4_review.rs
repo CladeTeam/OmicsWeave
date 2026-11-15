@@ -4,11 +4,14 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use common::{Genome, Outcome, bcftools_consensus, fasta_sequence, to_indexed_bcf};
-use omicsweave_consensus::{
-    Alleles, Consensus, ConsensusOptions, Mark, Mask, MaskWith, Overlap, RecordFilter, VcfStore,
+use common::{
+    Genome, Outcome, bcf_of, bcftools_consensus, consensus as open, fasta_sequence, to_indexed_bcf,
+    to_indexed_raw_bcf,
 };
-use omicsweave_core::{Error, Region, Result, SequenceRead};
+use omicsweave_consensus::{
+    Alleles, Consensus, ConsensusOptions, Mark, Mask, MaskWith, Overlap, RecordFilter,
+};
+use omicsweave_core::{Error, Locus, Region, Result, SequenceRead, Strand};
 
 const HEADER: &str = "##fileformat=VCFv4.3\n##contig=<ID=c,length=128>\n\
     ##INFO=<ID=END,Number=1,Type=Integer,Description=\"end\">\n\
@@ -17,7 +20,7 @@ const HEADER: &str = "##fileformat=VCFv4.3\n##contig=<ID=c,length=128>\n\
 
 fn output(consensus: &Consensus, n: usize) -> Vec<u8> {
     let mut out = vec![0; n];
-    consensus.write(&mut out).unwrap();
+    consensus.write(Strand::Unstranded, &mut out).unwrap();
     out
 }
 
@@ -27,11 +30,13 @@ fn genome() -> Genome {
 
 #[test]
 fn empty_regions_inside_masks_are_valid_for_every_mask_mode() {
-    let store = Arc::new(VcfStore::read(HEADER.as_bytes(), None).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let bcf = bcf_of(dir.path(), "in", HEADER.as_bytes());
     for with in [MaskWith::Char(b'N'), MaskWith::Lower, MaskWith::Upper] {
         let mask = Arc::new(Mask::parse(b"c\t0\t100\n", with).unwrap());
-        let mut consensus = Consensus::new(
-            store.clone(),
+        let mut consensus = open(
+            &bcf,
+            None,
             ConsensusOptions {
                 mask: Some(mask),
                 absent: Some(b'.'),
@@ -78,18 +83,21 @@ fn zero_width_gt() -> Vec<u8> {
 fn zero_width_genotypes_produce_errors_instead_of_index_panics() {
     let bytes = zero_width_gt();
     // Verify that the fixture reaches genotype decoding, independently of
-    // the store's decision to reject that layout earlier.
+    // the decision to reject that layout when a region is loaded.
     let mut reader = omicsweave_vcf::VariantReader::new(bytes.as_slice()).unwrap();
     let mut record = omicsweave_vcf::Record::default();
     assert!(reader.read(&mut record).unwrap());
     assert_eq!(record.genotypes().unwrap().width, 0);
-    let Ok(store) = VcfStore::read(bytes.as_slice(), None) else {
-        return;
-    };
-    let mut consensus = Consensus::new(Arc::new(store), ConsensusOptions::default());
-    consensus
+    let dir = tempfile::tempdir().unwrap();
+    let bcf = dir.path().join("in.bcf");
+    to_indexed_raw_bcf(&bytes, &bcf);
+    let mut consensus = open(&bcf, None, ConsensusOptions::default());
+    if consensus
         .load(&mut genome(), Region::new("c", 0, 8))
-        .unwrap();
+        .is_err()
+    {
+        return;
+    }
     for haplotype in ["1", "2", "1pIu", "I", "R"] {
         assert!(
             consensus
@@ -139,17 +147,10 @@ fn disjoint_edits_and_absent_claims_match_an_independent_spelling_oracle() {
             cursor = start + reference.len();
         }
         expected.resize(expected.len() + 128 - cursor, b'.');
-        // Disorder tests the resident store's sorting without asking an
-        // indexed external tool to accept unsorted records.
-        let header_end = text.find("c\t3\t").unwrap();
-        let rows: Vec<_> = text[header_end..].lines().collect();
-        let mut unsorted = text[..header_end].to_owned();
-        for row in rows.iter().rev() {
-            writeln!(unsorted, "{row}").unwrap();
-        }
-        let store = Arc::new(VcfStore::read(unsorted.as_bytes(), None).unwrap());
-        let mut consensus = Consensus::new(
-            store,
+        let dir = tempfile::tempdir().unwrap();
+        let mut consensus = open(
+            &bcf_of(dir.path(), "in", text.as_bytes()),
+            None,
             ConsensusOptions {
                 absent: Some(b'.'),
                 ..ConsensusOptions::default()
@@ -177,17 +178,18 @@ impl SequenceRead for FailingReference {
         Ok(128)
     }
 
-    fn sequence(&mut self, _: Region<'_>, _: &mut [u8]) -> Result<()> {
+    fn sequence(&mut self, _: &Locus<'_>, _: &mut [u8]) -> Result<()> {
         Err(Error::invalid("reference", "injected read failure"))
     }
 }
 
 #[test]
 fn failed_load_and_query_revoke_output_and_allow_recovery() {
+    let dir = tempfile::tempdir().unwrap();
     let text = format!("{HEADER}c\t2\t.\tC\tG\t.\t.\t.\tGT\t0/1\n");
-    let store = Arc::new(VcfStore::read(text.as_bytes(), None).unwrap());
-    let mut consensus = Consensus::new(
-        store,
+    let mut consensus = open(
+        &bcf_of(dir.path(), "in", text.as_bytes()),
+        None,
         ConsensusOptions {
             chain: true,
             ..ConsensusOptions::default()
@@ -206,7 +208,7 @@ fn failed_load_and_query_revoke_output_and_allow_recovery() {
     assert!(consensus.query(Alleles::AllAlt).is_err());
     let mut guard = [0xa5; 8];
     assert!(matches!(
-        consensus.write(&mut guard),
+        consensus.write(Strand::Unstranded, &mut guard),
         Err(Error::NotQueried)
     ));
     assert_eq!(guard, [0xa5; 8]);
@@ -219,7 +221,7 @@ fn failed_load_and_query_revoke_output_and_allow_recovery() {
             .is_err()
     );
     assert!(matches!(
-        consensus.write(&mut guard),
+        consensus.write(Strand::Unstranded, &mut guard),
         Err(Error::NotQueried)
     ));
     assert!(consensus.chain().is_none());
@@ -245,8 +247,6 @@ fn targeted_valid_regions_masks_and_chains_require_successful_bcftools_oracle() 
     );
     std::fs::write(path("in.vcf"), text).unwrap();
     to_indexed_bcf(&path("in.vcf"), &path("in.bcf"));
-    let store =
-        Arc::new(VcfStore::read(std::fs::File::open(path("in.bcf")).unwrap(), None).unwrap());
     let bed = b"c\t9\t12\nc\t33\t36\n";
     std::fs::write(path("mask.bed"), bed).unwrap();
     for (start, end) in [(0, 48), (2, 40), (25, 30)] {
@@ -309,7 +309,7 @@ fn targeted_valid_regions_masks_and_chains_require_successful_bcftools_oracle() 
                 );
                 let expected = fasta_sequence(&std::fs::read_to_string(path("out.fa")).unwrap());
                 let expected_chain = std::fs::read_to_string(path("out.chain")).unwrap();
-                let mut consensus = Consensus::new(store.clone(), options);
+                let mut consensus = open(&path("in.bcf"), None, options);
                 consensus
                     .load(&mut genome(), Region::new("c", start, end))
                     .unwrap();
@@ -342,6 +342,9 @@ fn insertion_can_repopulate_a_region_emptied_by_a_symbolic_deletion() {
         c\t490\t.\tG\tT,<DEL>,GCT\t.\t.\t.\tGT\t0/3\n";
     std::fs::write(path("in.vcf"), text).unwrap();
     to_indexed_bcf(&path("in.vcf"), &path("in.bcf"));
+    // TYPE uses all ALT alleles. Each record has mixed variant types, so
+    // equality to the single indel category does not match either: every
+    // filter keeps both records.
     for (filter, filter_arg) in [
         (None, None),
         (
@@ -353,11 +356,6 @@ fn insertion_can_repopulate_a_region_emptied_by_a_symbolic_deletion() {
             Some(("-i", "TYPE!=\"indel\"")),
         ),
     ] {
-        let store =
-            Arc::new(VcfStore::read(std::fs::File::open(path("in.bcf")).unwrap(), filter).unwrap());
-        // TYPE uses all ALT alleles. Each record has mixed variant types,
-        // so equality to the single indel category does not match either.
-        assert_eq!(store.n_records(), 2);
         for (input, spelling) in [(b"AAAG".as_slice(), b"CT".as_slice()), (b"aaaG", b"ct")] {
             std::fs::write(
                 path("ref.fa"),
@@ -394,8 +392,9 @@ fn insertion_can_repopulate_a_region_emptied_by_a_symbolic_deletion() {
             bases[481..483].copy_from_slice(b"GC");
             bases[486..490].copy_from_slice(input);
             let mut reference = Genome(HashMap::from([("c".to_owned(), bases)]));
-            let mut consensus = Consensus::new(
-                store.clone(),
+            let mut consensus = open(
+                &path("in.bcf"),
+                filter,
                 ConsensusOptions {
                     iupac_codes: true,
                     regions_overlap: Overlap::Variant,

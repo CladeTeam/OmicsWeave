@@ -1,16 +1,21 @@
 //! [`Consensus`]: personal sequences of a region, as `bcftools consensus`
-//! builds them, from a resident [`VcfStore`] and a reference read through
-//! [`SequenceRead`].
+//! builds them, from the records a BCF index gives for the region and a
+//! reference read through [`SequenceRead`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use omicsweave_core::{Error, Region, Result, SequenceRead, check_output};
+use omicsweave_core::orient::complement;
+use omicsweave_core::{
+    Error, FileSource, Locus, ReadAt, Region, Result, SequenceRead, Strand, check_output,
+};
+use omicsweave_vcf::{BcfReader, Filter, Header, Record};
 
 use crate::chain::Chain;
 use crate::edit::{Edit, Marks};
 use crate::mask::Mask;
+use crate::records::{Overlap, RecordFilter, Records};
 use crate::select::{Haplotype, Mode, Scratch, choose};
-use crate::store::{Overlap, VcfStore};
 
 /// The `bcftools consensus` options that shape every sequence; which
 /// alleles a sequence takes is chosen per query ([`Alleles`]).
@@ -62,25 +67,36 @@ pub enum Alleles<'a> {
     Haplotype { sample: &'a str, haplotype: &'a str },
 }
 
+/// What every context of one variant file shares: sample lookup and the
+/// compiled `-i`/`-e` expression (`true`: include).
+struct Shared {
+    sample_ids: HashMap<String, usize>,
+    filter: Option<(Filter, bool)>,
+}
+
 /// A loaded region: its reference, masked, and the records it takes.
+#[derive(Default)]
 struct Loaded {
     chrom: String,
     start: i64,
     reference: Vec<u8>,
-    contig: Option<usize>,
-    sites: Vec<usize>,
+    records: Records,
     /// Per record: left out by the mask.
     masked: Vec<bool>,
 }
 
-/// Builds consensus sequences. [`Consensus::load`] reads a region's
-/// reference and finds its records once; each [`Consensus::query`] then
-/// builds one sequence of it (one sample's haplotype, say), held until the
-/// next query and copied out by [`Consensus::write`]. Many builders, one
-/// per thread, can share a store.
-pub struct Consensus {
-    store: Arc<VcfStore>,
+/// Builds consensus sequences from a BCF read by region through its CSI.
+/// [`Consensus::load`] reads a region's reference and decodes the records
+/// the index gives for it, each once; each [`Consensus::query`] then builds
+/// one sequence of it (one sample's haplotype, say), held until the next
+/// query and copied out by [`Consensus::write`]. Builders for other threads
+/// come from [`Consensus::clone_context`] or [`Consensus::try_clone`].
+pub struct Consensus<S = FileSource> {
+    variants: BcfReader<S>,
+    header: Arc<Header>,
+    shared: Arc<Shared>,
     options: ConsensusOptions,
+    record: Record,
     loaded: Option<Loaded>,
     seq: Vec<u8>,
     ready: bool,
@@ -90,12 +106,43 @@ pub struct Consensus {
     spare: Vec<u8>,
 }
 
-impl Consensus {
-    pub fn new(store: Arc<VcfStore>, options: ConsensusOptions) -> Consensus {
+impl<S: ReadAt> Consensus<S> {
+    /// Builds from `variants`, applying the records `filter` passes. An
+    /// expression that does not compile is an error here.
+    pub fn new(
+        variants: BcfReader<S>,
+        filter: Option<RecordFilter<'_>>,
+        options: ConsensusOptions,
+    ) -> Result<Consensus<S>> {
+        let header = Arc::clone(variants.shared_header());
+        let filter = match filter {
+            None => None,
+            Some(RecordFilter::Include(e)) => Some((Filter::new(&header, e)?, true)),
+            Some(RecordFilter::Exclude(e)) => Some((Filter::new(&header, e)?, false)),
+        };
+        let sample_ids = header
+            .samples
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
+        let shared = Arc::new(Shared { sample_ids, filter });
+        Ok(Self::with_parts(variants, header, shared, options))
+    }
+
+    fn with_parts(
+        variants: BcfReader<S>,
+        header: Arc<Header>,
+        shared: Arc<Shared>,
+        options: ConsensusOptions,
+    ) -> Consensus<S> {
         let chain_builder = options.chain.then(|| Chain::new(0, 0));
         Consensus {
-            store,
+            variants,
+            header,
+            shared,
             options,
+            record: Record::default(),
             loaded: None,
             seq: Vec::new(),
             ready: false,
@@ -106,67 +153,120 @@ impl Consensus {
         }
     }
 
-    pub fn store(&self) -> &VcfStore {
-        &self.store
+    pub fn variants(&self) -> &BcfReader<S> {
+        &self.variants
+    }
+
+    /// The variant reader, e.g. to attach a block cache.
+    pub fn variants_mut(&mut self) -> &mut BcfReader<S> {
+        &mut self.variants
+    }
+
+    /// The samples, in header order.
+    pub fn samples(&self) -> &[String] {
+        &self.header.samples
+    }
+
+    pub fn sample_index(&self, name: &str) -> Option<usize> {
+        self.shared.sample_ids.get(name).copied()
     }
 
     pub fn options(&self) -> &ConsensusOptions {
         &self.options
     }
 
+    /// Shares the header, filter and options with an independent execution
+    /// context. Loaded reference, records, output and scratch start empty.
+    pub fn clone_context(&self) -> Self
+    where
+        S: Clone,
+    {
+        self.fork(self.variants.clone_context())
+    }
+
+    fn fork(&self, variants: BcfReader<S>) -> Self {
+        Self::with_parts(
+            variants,
+            Arc::clone(&self.header),
+            Arc::clone(&self.shared),
+            self.options.clone(),
+        )
+    }
+
     /// Reads the reference of `region` (which must lie within its
-    /// chromosome) and finds the records it takes, for the queries that
-    /// follow.
+    /// chromosome) and decodes the records it takes, for the queries that
+    /// follow. A chromosome the BCF does not declare has no records, as
+    /// bcftools only warns of it.
     pub fn load(&mut self, reference: &mut impl SequenceRead, region: Region<'_>) -> Result<()> {
         self.ready = false;
         region.check()?;
-        let mut loaded = self.loaded.take().unwrap_or(Loaded {
-            chrom: String::new(),
-            start: 0,
-            reference: Vec::new(),
-            contig: None,
-            sites: Vec::new(),
-            masked: Vec::new(),
-        });
+        let mut loaded = self.loaded.take().unwrap_or_default();
         loaded.reference.clear();
         loaded.reference.resize(region.len() as usize, 0);
-        reference.sequence(region, &mut loaded.reference)?;
+        reference.sequence(&Locus::from(region), &mut loaded.reference)?;
         loaded.chrom.clear();
         loaded.chrom.push_str(region.chrom);
         loaded.start = region.start as i64;
-        loaded.contig = self.store.contig_id(region.chrom);
-        loaded.sites.clear();
         loaded.masked.clear();
         if let Some(mask) = &self.options.mask {
             mask.apply(region.chrom, loaded.start, &mut loaded.reference);
         }
-        if let (Some(contig), false) = (loaded.contig, region.is_empty()) {
-            let end = region.end as i64 - 1;
-            let overlap = self.options.regions_overlap;
-            self.store
-                .overlapping(contig, loaded.start, end, overlap, &mut loaded.sites);
-            let skips = self.options.mask.as_ref().filter(|m| m.skips_records());
-            if let Some(mask) = skips {
-                mask.overlapping_records(
-                    region.chrom,
-                    loaded.sites.iter().map(|&i| {
-                        let site = self.store.site(contig, i);
-                        (site.pos, site.last())
-                    }),
-                    &mut loaded.masked,
-                );
-            } else {
-                loaded.masked.resize(loaded.sites.len(), false);
-            }
+        self.read_records(region, &mut loaded.records)?;
+        let skips = self.options.mask.as_ref().filter(|m| m.skips_records());
+        if let Some(mask) = skips {
+            mask.overlapping_records(
+                region.chrom,
+                loaded.records.sites.iter().map(|s| (s.pos, s.last())),
+                &mut loaded.masked,
+            );
+        } else {
+            loaded.masked.resize(loaded.records.sites.len(), false);
         }
         self.loaded = Some(loaded);
         Ok(())
     }
 
+    /// Decodes the records of `region` that `--regions-overlap` takes and
+    /// the filter passes, in file order: the records htslib's synced reader
+    /// gives bcftools for the region. The filter starts fresh per region,
+    /// as in a `bcftools consensus` run over that one region.
+    fn read_records(&mut self, region: Region<'_>, records: &mut Records) -> Result<()> {
+        records.clear();
+        if region.is_empty() || self.header.contig_id(region.chrom).is_none() {
+            return Ok(());
+        }
+        let Consensus {
+            variants,
+            header,
+            shared,
+            options,
+            record,
+            ..
+        } = self;
+        let header: &Header = header;
+        let n_samples = header.samples.len();
+        let (start, end) = (region.start as i64, region.end as i64 - 1);
+        let overlap = options.regions_overlap;
+        let mut filter = shared.filter.clone();
+        variants.visit(region, record, |rec| {
+            if !overlap.takes(rec, start, end) {
+                return Ok(());
+            }
+            let mut error = None;
+            if let Some((filter, include)) = &mut filter {
+                match filter.test(header, rec) {
+                    Ok(pass) if pass != *include => return Ok(()),
+                    Ok(_) => {}
+                    Err(e) => error = Some(e),
+                }
+            }
+            records.push(rec, n_samples, error)
+        })
+    }
+
     fn mode(&self, alleles: Alleles<'_>) -> Result<Mode> {
         let sample = |name: &str| {
-            self.store
-                .sample_index(name)
+            self.sample_index(name)
                 .ok_or_else(|| Error::invalid("consensus", format!("no sample {name:?}")))
         };
         Ok(match alleles {
@@ -174,7 +274,11 @@ impl Consensus {
             Alleles::AllAlt => Mode::AllAlt,
             Alleles::Samples([]) => return Err(Error::invalid("consensus", "no samples")),
             Alleles::Samples(names) => {
-                Mode::IupacSamples(names.iter().map(|n| sample(n)).collect::<Result<_>>()?)
+                let mut selected = smallvec::SmallVec::with_capacity(names.len());
+                for name in names {
+                    selected.push(sample(name)?);
+                }
+                Mode::IupacSamples(selected)
             }
             Alleles::Haplotype {
                 sample: name,
@@ -196,7 +300,6 @@ impl Consensus {
         self.ready = false;
         let mode = self.mode(alleles)?;
         let Consensus {
-            store,
             options: o,
             loaded,
             seq,
@@ -209,6 +312,7 @@ impl Consensus {
         let loaded = loaded
             .as_ref()
             .ok_or_else(|| Error::invalid("consensus", "query before load"))?;
+        let records = &loaded.records;
         let marks = Marks {
             missing: o.missing,
             absent: o.absent,
@@ -221,35 +325,32 @@ impl Consensus {
             chain.reset(loaded.start, loaded.reference.len() as i64);
         }
         let mut edit = Edit::new(&loaded.reference, loaded.start, std::mem::take(seq));
-        if let Some(contig) = loaded.contig {
-            for (&i, &masked) in loaded.sites.iter().zip(&loaded.masked) {
-                let site = store.site(contig, i);
-                if let Some(e) = store.error(site) {
-                    *seq = edit.abandon();
-                    return Err(e.clone());
-                }
-                if let Some(a) = o.absent {
-                    edit.absent(site.pos, a);
-                }
-                if (site.n_allele == 1 && o.missing.is_none() && o.absent.is_none()) || masked {
-                    continue;
-                }
-                let applied =
-                    choose(store, site, &mode, o.missing.is_some(), scratch).and_then(|choice| {
-                        edit.apply(
-                            site,
-                            choice,
-                            store.allele(site, 0),
-                            &mut scratch.allele,
-                            spare,
-                            &marks,
-                            chain.as_deref_mut(),
-                        )
-                    });
-                if let Err(e) = applied {
-                    *seq = edit.abandon();
-                    return Err(e);
-                }
+        for (site, &masked) in records.sites.iter().zip(&loaded.masked) {
+            if let Some(e) = records.error(site) {
+                *seq = edit.abandon();
+                return Err(e.clone());
+            }
+            if let Some(a) = o.absent {
+                edit.absent(site.pos, a);
+            }
+            if (site.n_allele == 1 && o.missing.is_none() && o.absent.is_none()) || masked {
+                continue;
+            }
+            let applied =
+                choose(records, site, &mode, o.missing.is_some(), scratch).and_then(|choice| {
+                    edit.apply(
+                        site,
+                        choice,
+                        records.allele(site, 0),
+                        &mut scratch.allele,
+                        spare,
+                        &marks,
+                        chain.as_deref_mut(),
+                    )
+                });
+            if let Err(e) = applied {
+                *seq = edit.abandon();
+                return Err(e);
             }
         }
         if let Some(a) = o.absent {
@@ -263,13 +364,22 @@ impl Consensus {
         Ok(self.seq.len())
     }
 
-    /// Copies the last query's sequence into `out` (its length).
-    pub fn write(&self, out: &mut [u8]) -> Result<()> {
+    /// Copies the last query's sequence into `out` (its length), 5' to 3'
+    /// of `strand`: the reverse complement (IUPAC codes complemented, case
+    /// kept) for `-`, the sequence itself otherwise. The chain stays on the
+    /// forward strand.
+    pub fn write(&self, strand: Strand, out: &mut [u8]) -> Result<()> {
         if !self.ready {
             return Err(Error::NotQueried);
         }
         check_output("consensus sequence", out.len(), self.seq.len())?;
-        out.copy_from_slice(&self.seq);
+        if strand.is_reverse() {
+            for (o, &b) in out.iter_mut().zip(self.seq.iter().rev()) {
+                *o = complement(b);
+            }
+        } else {
+            out.copy_from_slice(&self.seq);
+        }
         Ok(())
     }
 
@@ -277,5 +387,13 @@ impl Consensus {
     /// [`ConsensusOptions::chain`].
     pub fn chain(&self) -> Option<&str> {
         (self.ready && self.options.chain).then_some(self.chain.as_str())
+    }
+}
+
+impl Consensus<FileSource> {
+    /// Another execution context on a duplicated file handle, sharing the
+    /// header, index, filter and options.
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(self.fork(self.variants.try_clone()?))
     }
 }

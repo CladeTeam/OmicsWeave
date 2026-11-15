@@ -3,9 +3,11 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common::{Genome, Outcome, bcftools_consensus, fasta_sequence, to_indexed_bcf};
-use omicsweave_consensus::{Alleles, Consensus, ConsensusOptions, Mask, MaskWith, VcfStore};
-use omicsweave_core::Region;
+use common::{
+    Genome, Outcome, bcftools_consensus, consensus as open, fasta_sequence, to_indexed_bcf,
+};
+use omicsweave_consensus::{Alleles, ConsensusOptions, Mask, MaskWith};
+use omicsweave_core::{Region, Strand};
 
 #[test]
 fn repeated_masked_loads_and_gapped_chains_match_bcftools() {
@@ -24,13 +26,12 @@ fn repeated_masked_loads_and_gapped_chains_match_bcftools() {
     std::fs::write(path("in.vcf"), vcf).unwrap();
     std::fs::write(path("mask.bed"), bed).unwrap();
     to_indexed_bcf(&path("in.vcf"), &path("in.bcf"));
-    let store =
-        Arc::new(VcfStore::read(std::fs::File::open(path("in.bcf")).unwrap(), None).unwrap());
     let mut genome = Genome(HashMap::from([("c".to_owned(), vec![b'A'; 128])]));
     for (with, text) in [(MaskWith::Char(b'N'), "N"), (MaskWith::Lower, "lc")] {
         for absent in [false, true] {
-            let mut consensus = Consensus::new(
-                store.clone(),
+            let mut consensus = open(
+                &path("in.bcf"),
+                None,
                 ConsensusOptions {
                     chain: true,
                     absent: absent.then_some(b'.'),
@@ -77,7 +78,7 @@ fn repeated_masked_loads_and_gapped_chains_match_bcftools() {
                         })
                         .unwrap();
                     let mut out = vec![0; len];
-                    consensus.write(&mut out).unwrap();
+                    consensus.write(Strand::Unstranded, &mut out).unwrap();
                     assert_eq!(
                         out,
                         fasta_sequence(&std::fs::read_to_string(path("out.fa")).unwrap())

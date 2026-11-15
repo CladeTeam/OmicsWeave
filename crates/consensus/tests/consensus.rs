@@ -9,11 +9,11 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common::{Genome, Outcome, Rng, bcftools_consensus, fasta_sequence, to_indexed_bcf};
+use common::{Genome, Outcome, Rng, bcftools_consensus, fasta_sequence, open_bcf, to_indexed_bcf};
 use omicsweave_consensus::{
-    Alleles, Consensus, ConsensusOptions, Mark, Mask, MaskWith, Overlap, RecordFilter, VcfStore,
+    Alleles, Consensus, ConsensusOptions, Mark, Mask, MaskWith, Overlap, RecordFilter,
 };
-use omicsweave_core::Region;
+use omicsweave_core::{Region, Strand};
 use proptest::prelude::*;
 
 const BASES: &[u8] = b"ACGT";
@@ -344,9 +344,9 @@ fn run(seed: u64) -> Result<(), String> {
 
     // Both read the same BCF: htslib reads genotype phasing of BCF and VCF
     // text differently before VCF 4.4.
-    let bcf = std::fs::File::open(path("in.bcf")).unwrap();
-    let store = match VcfStore::read(bcf, filter) {
-        Ok(store) => Arc::new(store),
+    let bcf = open_bcf(dir.path().join("in.bcf").as_path());
+    let mut consensus = match Consensus::new(bcf, filter, options.clone()) {
+        Ok(consensus) => consensus,
         // An expression that does not compile: bcftools must reject it too.
         Err(e) => {
             let mut run_args = args.clone();
@@ -359,7 +359,6 @@ fn run(seed: u64) -> Result<(), String> {
             };
         }
     };
-    let mut consensus = Consensus::new(store, options.clone());
     let mut reference = Genome(genome.iter().cloned().collect::<HashMap<_, _>>());
 
     for _ in 0..4 {
@@ -416,7 +415,7 @@ fn run(seed: u64) -> Result<(), String> {
             match (theirs, ours) {
                 (Outcome::Done(0), Ok(n)) => {
                     let mut seq = vec![0u8; n];
-                    consensus.write(&mut seq).unwrap();
+                    consensus.write(Strand::Unstranded, &mut seq).unwrap();
                     let want = fasta_sequence(&std::fs::read_to_string(path("out.fa")).unwrap());
                     if seq != want {
                         return Err(format!(
@@ -424,6 +423,12 @@ fn run(seed: u64) -> Result<(), String> {
                             String::from_utf8_lossy(&seq),
                             String::from_utf8_lossy(&want)
                         ));
+                    }
+                    let mut reverse = vec![0u8; n];
+                    consensus.write(Strand::Reverse, &mut reverse).unwrap();
+                    omicsweave_core::orient::reverse_complement(&mut reverse);
+                    if reverse != seq {
+                        return Err(format!("reverse strand\n{what}"));
                     }
                     if options.chain {
                         let want = std::fs::read_to_string(path("out.chain")).unwrap();

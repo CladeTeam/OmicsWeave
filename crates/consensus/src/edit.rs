@@ -12,8 +12,8 @@ use omicsweave_vcf::{VCF_INDEL, VCF_OTHER, variant};
 
 use crate::chain::Chain;
 use crate::consensus::Mark;
+use crate::records::Site;
 use crate::select::Choice;
-use crate::store::Site;
 
 /// What every record of a query is applied with.
 pub(crate) struct Marks {
@@ -560,11 +560,11 @@ mod tests {
         for at in -2..logical.len() as i64 + 3 {
             for len in 0..logical.len() + 3 {
                 let mut bytes = vec![b'A'; len];
-                if let Ok(start) = usize::try_from(at) {
-                    if let Some(span) = logical.get(start..).and_then(|s| s.get(..len)) {
-                        bytes.copy_from_slice(span);
-                        bytes.make_ascii_lowercase();
-                    }
+                if let Ok(start) = usize::try_from(at)
+                    && let Some(span) = logical.get(start..).and_then(|s| s.get(..len))
+                {
+                    bytes.copy_from_slice(span);
+                    bytes.make_ascii_lowercase();
                 }
                 for mismatch in [false, true] {
                     if mismatch && !bytes.is_empty() {

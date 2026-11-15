@@ -48,7 +48,7 @@ pub(crate) fn mix<'a>(
     selected: impl Fn(usize) -> bool,
     out: &mut Vec<u8>,
 ) -> Option<usize> {
-    // Alleles are borrowed from the immutable store, so the reusable output
+    // Alleles are borrowed from the loaded records, so the reusable output
     // can hold their bitmasks until the chosen ALT length is known.
     out.clear();
     let mut longest = None;

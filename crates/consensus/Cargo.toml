@@ -1,6 +1,6 @@
 [package]
 name = "omicsweave-consensus"
-description = "Personal consensus sequences: bcftools consensus ported to Rust, in memory"
+description = "Personal consensus sequences: bcftools consensus ported to Rust, over indexed BCF"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,15 +11,13 @@ omicsweave-vcf = { path = "../vcf" }
 smallvec.workspace = true
 
 [dev-dependencies]
+omicsweave-bgzf = { path = "../bgzf" }
 bcftools-sys = { path = "../../refs/bcftools" }
 htslib-sys = { path = "../../refs/htslib" }
 libc.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 
-[[bench]]
-name = "paths"
-harness = false
 
 [lints]
 workspace = true

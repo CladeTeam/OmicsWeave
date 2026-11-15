@@ -2,11 +2,12 @@ mod common;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
 
-use common::{Genome, Outcome, bcftools_consensus, fasta_sequence, to_indexed_bcf};
-use omicsweave_consensus::{Alleles, Consensus, ConsensusOptions, Mark, VcfStore};
-use omicsweave_core::Region;
+use common::{
+    Genome, Outcome, bcftools_consensus, consensus as open, fasta_sequence, to_indexed_bcf,
+};
+use omicsweave_consensus::{Alleles, ConsensusOptions, Mark};
+use omicsweave_core::{Region, Strand};
 
 #[test]
 fn iupac_reused_output_matches_bcftools_across_lengths_and_symbolic_fallbacks() {
@@ -28,9 +29,6 @@ fn iupac_reused_output_matches_bcftools_across_lengths_and_symbolic_fallbacks() 
                 writeln!(vcf, "c\t1\t.\t{reference}\t{alts}\t.\t.\t.\tGT\t0/1\t2/2").unwrap();
                 std::fs::write(path("in.vcf"), &vcf).unwrap();
                 to_indexed_bcf(&path("in.vcf"), &path("in.bcf"));
-                let store = Arc::new(
-                    VcfStore::read(std::fs::File::open(path("in.bcf")).unwrap(), None).unwrap(),
-                );
                 for lower in [false, true] {
                     let bases = if lower {
                         reference.to_ascii_lowercase()
@@ -39,8 +37,9 @@ fn iupac_reused_output_matches_bcftools_across_lengths_and_symbolic_fallbacks() 
                     };
                     std::fs::write(path("ref.fa"), format!(">c\n{bases}\n")).unwrap();
                     let mut genome = Genome(HashMap::from([("c".to_owned(), bases.into_bytes())]));
-                    let mut consensus = Consensus::new(
-                        store.clone(),
+                    let mut consensus = open(
+                        &path("in.bcf"),
+                        None,
                         ConsensusOptions {
                             iupac_codes: true,
                             mark_snv: Some(Mark::Lower),
@@ -81,7 +80,7 @@ fn iupac_reused_output_matches_bcftools_across_lengths_and_symbolic_fallbacks() 
                         };
                         let n = consensus.query(chosen).unwrap();
                         let mut out = vec![0; n];
-                        consensus.write(&mut out).unwrap();
+                        consensus.write(Strand::Unstranded, &mut out).unwrap();
                         assert_eq!(
                             out,
                             fasta_sequence(&std::fs::read_to_string(path("out.fa")).unwrap()),

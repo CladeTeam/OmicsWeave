@@ -3,11 +3,11 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common::{Genome, Outcome, bcftools_consensus, fasta_sequence, to_indexed_bcf};
-use omicsweave_consensus::{
-    Alleles, Consensus, ConsensusOptions, Mask, MaskWith, Overlap, RecordFilter, VcfStore,
+use common::{
+    Genome, Outcome, bcf_of, bcftools_consensus, consensus as open, fasta_sequence, to_indexed_bcf,
 };
-use omicsweave_core::Region;
+use omicsweave_consensus::{Alleles, ConsensusOptions, Mask, MaskWith, Overlap, RecordFilter};
+use omicsweave_core::{Region, Strand};
 
 #[test]
 fn absent_skipped_records_and_claims_match_bcftools() {
@@ -31,8 +31,6 @@ fn absent_skipped_records_and_claims_match_bcftools() {
         c\t24\t.\tA\tC\t.\t.\t.\tGT\t1/1\n";
     std::fs::write(path("input.vcf"), text).unwrap();
     to_indexed_bcf(&path("input.vcf"), &path("input.bcf"));
-    let store =
-        Arc::new(VcfStore::read(std::fs::File::open(path("input.bcf")).unwrap(), None).unwrap());
     for missing in [None, Some(b'?')] {
         for masked in [false, true] {
             let mut options = ConsensusOptions {
@@ -70,7 +68,7 @@ fn absent_skipped_records_and_claims_match_bcftools() {
             assert_eq!(bcftools_consensus(&args), Outcome::Done(0));
             let expected = fasta_sequence(&std::fs::read_to_string(path("out.fa")).unwrap());
             let mut genome = Genome(HashMap::from([("c".to_owned(), bases)]));
-            let mut consensus = Consensus::new(store.clone(), options);
+            let mut consensus = open(&path("input.bcf"), None, options);
             consensus
                 .load(&mut genome, Region::new("c", 0, 64))
                 .unwrap();
@@ -82,7 +80,7 @@ fn absent_skipped_records_and_claims_match_bcftools() {
                     })
                     .unwrap();
                 let mut out = vec![0; size];
-                consensus.write(&mut out).unwrap();
+                consensus.write(Strand::Unstranded, &mut out).unwrap();
                 assert_eq!(out, expected, "missing={missing:?} masked={masked}");
                 assert_eq!(
                     consensus.chain().unwrap(),
@@ -95,20 +93,20 @@ fn absent_skipped_records_and_claims_match_bcftools() {
 
 #[test]
 fn insertion_can_restore_bases_after_the_loaded_region_is_deleted() {
+    let dir = tempfile::tempdir().unwrap();
     let text = b"##fileformat=VCFv4.3\n##contig=<ID=c,length=20>\n\
         ##INFO=<ID=END,Number=1,Type=Integer,Description=\"end\">\n\
         ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"gt\">\n\
         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n\
         c\t2\t.\tGC\tG,<DEL>\t.\t.\tEND=16\tGT\t0/2\n\
         c\t10\t.\tG\tT,<DEL>,GCT\t.\t.\t.\tGT\t0/3\n";
+    let bcf = bcf_of(dir.path(), "in", text);
     for filter in [
         None,
         Some(RecordFilter::Exclude("TYPE=\"indel\"")),
         Some(RecordFilter::Include("TYPE!=\"indel\"")),
     ] {
         for lower in [false, true] {
-            let store = Arc::new(VcfStore::read(&text[..], filter).unwrap());
-            assert_eq!(store.n_records(), 2);
             let mut bases = vec![b'A'; 20];
             bases[1..3].copy_from_slice(b"GC");
             bases[9] = b'G';
@@ -116,8 +114,9 @@ fn insertion_can_restore_bases_after_the_loaded_region_is_deleted() {
                 bases.make_ascii_lowercase();
             }
             let mut genome = Genome(HashMap::from([("c".to_owned(), bases)]));
-            let mut consensus = Consensus::new(
-                store,
+            let mut consensus = open(
+                &bcf,
+                filter,
                 ConsensusOptions {
                     iupac_codes: true,
                     regions_overlap: Overlap::Variant,
@@ -135,7 +134,7 @@ fn insertion_can_restore_bases_after_the_loaded_region_is_deleted() {
                     })
                     .unwrap();
                 let mut out = vec![0; size];
-                consensus.write(&mut out).unwrap();
+                consensus.write(Strand::Unstranded, &mut out).unwrap();
                 assert_eq!(out, if lower { b"ct" } else { b"CT" });
             }
         }
