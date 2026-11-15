@@ -4,7 +4,7 @@ mod common;
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 
-use omicsweave_core::{ReadAt, Region, Result, SequenceRead};
+use omicsweave_core::{Locus, ReadAt, Region, Result, SequenceRead};
 use omicsweave_fasta::{BgzfWriter, EOF_BLOCK, Fai, FaiEntry, FastaReader, Gzi, MAX_BLOCK_LEN};
 
 struct Source {
@@ -70,7 +70,7 @@ fn leading_empty_members_read_bounded_windows_without_repeated_suffixes() {
         let mut reader = FastaReader::new(&source, fai, Some(gzi));
         let mut guarded = [0xA5; 14];
         reader
-            .sequence(Region::new("s", 0, 12), &mut guarded[1..13])
+            .sequence(&Locus::from(Region::new("s", 0, 12)), &mut guarded[1..13])
             .unwrap();
         assert_eq!(&guarded, b"\xA5ACGTacgtNNNN\xA5", "count={count}");
         assert!(source.largest.get() <= MAX_BLOCK_LEN);
@@ -115,7 +115,7 @@ fn partial_header_and_data_windows_match_htslib() {
         for (start, end) in [(0, 4096), (1, 2), (27, 100), (4000, 4096)] {
             let mut out = vec![0; (end - start) as usize];
             reader
-                .sequence(Region::new("s", start, end), &mut out)
+                .sequence(&Locus::from(Region::new("s", start, end)), &mut out)
                 .unwrap();
             assert_eq!(out, bases[start as usize..end as usize]);
             assert_eq!(Some(out), oracle.fetch("s", start, end));
@@ -136,13 +136,13 @@ fn failed_empty_crc_and_truncated_data_allow_repaired_source_queries() {
     source.bytes.borrow_mut()[crc] ^= 1;
     assert!(
         reader
-            .sequence(Region::new("s", 0, 12), &mut out[1..13])
+            .sequence(&Locus::from(Region::new("s", 0, 12)), &mut out[1..13])
             .is_err()
     );
     assert_eq!(out, [0xA5; 14]);
     source.bytes.borrow_mut()[crc] ^= 1;
     reader
-        .sequence(Region::new("s", 0, 12), &mut out[1..13])
+        .sequence(&Locus::from(Region::new("s", 0, 12)), &mut out[1..13])
         .unwrap();
     assert_eq!(&out, b"\xA5ACGTacgtNNNN\xA5");
 
@@ -152,12 +152,12 @@ fn failed_empty_crc_and_truncated_data_allow_repaired_source_queries() {
         .truncate(count * EOF_BLOCK.len() + 20);
     assert!(
         reader
-            .sequence(Region::new("s", 0, 12), &mut out[1..13])
+            .sequence(&Locus::from(Region::new("s", 0, 12)), &mut out[1..13])
             .is_err()
     );
     *source.bytes.borrow_mut() = good;
     reader
-        .sequence(Region::new("s", 0, 12), &mut out[1..13])
+        .sequence(&Locus::from(Region::new("s", 0, 12)), &mut out[1..13])
         .unwrap();
     assert_eq!(&out, b"\xA5ACGTacgtNNNN\xA5");
 }

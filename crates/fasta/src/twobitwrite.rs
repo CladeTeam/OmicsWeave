@@ -63,7 +63,7 @@ impl TwoBitPiece {
     /// a multiple of 4 so that pieces pack to whole bytes; only a
     /// sequence's last piece may have a length that is not.
     pub fn encode(start: u64, bases: &[u8]) -> Result<TwoBitPiece> {
-        if start % 4 != 0 {
+        if !start.is_multiple_of(4) {
             return Err(invalid("2bit piece", "start is not a multiple of 4"));
         }
         start
@@ -131,7 +131,7 @@ impl TwoBitRecord {
     /// Rejects inconsistent packed lengths or runs outside the piece,
     /// without changing this record.
     pub fn push(&mut self, piece: &TwoBitPiece) -> Result<()> {
-        if piece.start != self.len || (self.len % 4 != 0) {
+        if piece.start != self.len || !self.len.is_multiple_of(4) {
             return Err(invalid(
                 "2bit record",
                 "pieces must follow each other and all but the last span a multiple of 4 bases",
@@ -379,7 +379,7 @@ pub fn encode_twobit(seq: &[u8]) -> Result<(TwoBitRecord, Vec<u8>)> {
 mod tests {
     use super::*;
     use crate::TwoBitReader;
-    use omicsweave_core::{Region, SequenceRead};
+    use omicsweave_core::{Locus, Region, SequenceRead};
     use std::io::Cursor;
 
     /// What the reader returns: N blocks read as `N` whatever their mask
@@ -424,7 +424,10 @@ mod tests {
                 for (name, seq) in [("a", &a), ("b", &b), ("c", &c)] {
                     let mut out = vec![0u8; seq.len()];
                     reader
-                        .sequence(Region::new(name, 0, seq.len() as u32), &mut out)
+                        .sequence(
+                            &Locus::from(Region::new(name, 0, seq.len() as u32)),
+                            &mut out,
+                        )
                         .unwrap();
                     assert_eq!(out, expected(seq), "{name} piece {piece} v{version}");
                 }

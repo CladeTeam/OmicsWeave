@@ -3,8 +3,11 @@
 
 use std::iter::FusedIterator;
 use std::ops::Range;
+use std::sync::Arc;
 
-use omicsweave_core::{ReadAt, Region, SequenceRead, check_output};
+use omicsweave_core::cache::{BlockCache, SourceToken};
+use omicsweave_core::orient::orient_bases;
+use omicsweave_core::{Locus, ReadAt, Region, SequenceRead, check_output};
 
 use crate::bgzf::{Inflater, MAX_BLOCK_LEN};
 use crate::error::{Error, Result};
@@ -14,7 +17,7 @@ use crate::twobit::{Directory, HEADER_LEN, Parsed, Record, TwoBitHeader};
 
 const READ_BATCH_LEN: u64 = 1 << 20;
 
-fn read_len(range: &Range<u64>, file_len: u64) -> Result<usize> {
+pub(crate) fn read_len(range: &Range<u64>, file_len: u64) -> Result<usize> {
     if range.start > range.end || range.end > file_len {
         return Err(Error::OutOfRange {
             what: "sequence bytes",
@@ -27,7 +30,7 @@ fn read_len(range: &Range<u64>, file_len: u64) -> Result<usize> {
         .map_err(|_| Error::invalid("sequence bytes", "range exceeds usize"))
 }
 
-fn grow(buf: &mut Vec<u8>, need: usize) -> Result<()> {
+pub(crate) fn grow(buf: &mut Vec<u8>, need: usize) -> Result<()> {
     if need > buf.len() {
         buf.try_reserve(need - buf.len())
             .map_err(|e| Error::invalid("sequence buffer", e.to_string()))?;
@@ -36,7 +39,7 @@ fn grow(buf: &mut Vec<u8>, need: usize) -> Result<()> {
     Ok(())
 }
 
-fn entry<'f>(fai: &'f Fai, chrom: &str) -> Result<&'f FaiEntry> {
+pub(crate) fn entry<'f>(fai: &'f Fai, chrom: &str) -> Result<&'f FaiEntry> {
     fai.get(chrom)
         .ok_or_else(|| Error::UnknownChrom(chrom.to_owned()))
 }
@@ -44,12 +47,16 @@ fn entry<'f>(fai: &'f Fai, chrom: &str) -> Result<&'f FaiEntry> {
 /// A FASTA file with its `.fai`: plain text, or bgzip when its `.gzi` is
 /// given. Bases come back as stored.
 pub struct FastaReader<S> {
-    source: S,
-    fai: Fai,
-    gzi: Option<Gzi>,
-    inflater: Option<Inflater>,
-    raw: Vec<u8>,
-    text: Vec<u8>,
+    pub(crate) source: S,
+    pub(crate) fai: Arc<Fai>,
+    pub(crate) gzi: Option<Arc<Gzi>>,
+    pub(crate) inflater: Option<Inflater>,
+    pub(crate) raw: Vec<u8>,
+    pub(crate) text: Vec<u8>,
+    /// Bases of a run of spans that share BGZF blocks, decoded once.
+    pub(crate) hull: Vec<u8>,
+    pub(crate) cache: Option<Arc<BlockCache>>,
+    pub(crate) namespace: SourceToken,
 }
 
 impl<S: ReadAt> FastaReader<S> {
@@ -57,11 +64,14 @@ impl<S: ReadAt> FastaReader<S> {
     pub fn new(source: S, fai: Fai, gzi: Option<Gzi>) -> FastaReader<S> {
         FastaReader {
             source,
-            fai,
-            gzi,
+            fai: Arc::new(fai),
+            gzi: gzi.map(Arc::new),
             inflater: None,
             raw: Vec::new(),
             text: Vec::new(),
+            hull: Vec::new(),
+            cache: None,
+            namespace: SourceToken::new(),
         }
     }
 
@@ -70,7 +80,25 @@ impl<S: ReadAt> FastaReader<S> {
     }
 
     pub fn gzi(&self) -> Option<&Gzi> {
-        self.gzi.as_ref()
+        self.gzi.as_deref()
+    }
+
+    /// Attaches an externally managed decoded-block cache. The source and
+    /// indexes must remain unchanged while this reader or its clones exist.
+    /// Plain FASTA is read directly and does not accept a block cache.
+    pub fn set_cache(&mut self, cache: Option<Arc<BlockCache>>) -> Result<()> {
+        if cache.is_some() && self.gzi.is_none() {
+            return Err(Error::Unsupported(
+                "plain FASTA does not use a decoded-block cache",
+            ));
+        }
+        self.cache = cache;
+        Ok(())
+    }
+
+    /// The immutable-source session used to isolate external cache entries.
+    pub fn cache_namespace(&self) -> SourceToken {
+        self.namespace
     }
 }
 
@@ -79,7 +107,83 @@ impl<S: ReadAt> SequenceRead for FastaReader<S> {
         Ok(entry(&self.fai, chrom)?.len)
     }
 
-    fn sequence(&mut self, region: Region<'_>, out: &mut [u8]) -> Result<()> {
+    fn sequence(&mut self, locus: &Locus<'_>, out: &mut [u8]) -> Result<()> {
+        locus.check()?;
+        let entry_len = entry(&self.fai, locus.chrom)?.len;
+        locus.check_within(entry_len)?;
+        check_output("sequence", out.len(), locus.len() as usize)?;
+        if locus.spans().len() == 1 {
+            self.read_region(locus.hull(), out)?;
+        } else {
+            self.read_spans(locus, out)?;
+        }
+        orient_bases(locus.strand, out);
+        Ok(())
+    }
+}
+
+impl<S: ReadAt> FastaReader<S> {
+    /// The forward concatenation of a multi-span locus. In bgzip files,
+    /// consecutive spans that share a BGZF block are decoded together, so
+    /// every block is inflated once; cached and plain files read span by
+    /// span, which repeats no decoding.
+    fn read_spans(&mut self, locus: &Locus<'_>, out: &mut [u8]) -> Result<()> {
+        let pieces: Vec<(u32, Region<'_>)> = locus.pieces().collect();
+        let Some(gzi) = self
+            .gzi
+            .as_ref()
+            .filter(|_| self.cache.is_none())
+            .map(Arc::clone)
+        else {
+            for (at, region) in pieces {
+                let at = at as usize;
+                self.read_region(region, &mut out[at..at + region.len() as usize])?;
+            }
+            return Ok(());
+        };
+        let fai = Arc::clone(&self.fai);
+        let entry = entry(&fai, locus.chrom)?;
+        let blocks = pieces
+            .iter()
+            .map(|(_, r)| Ok(gzi.indices(entry.text_range(r.start, r.end)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut i = 0;
+        while i < pieces.len() {
+            let mut j = i + 1;
+            while j < pieces.len() && blocks[j].start < blocks[j - 1].end {
+                j += 1;
+            }
+            let (at, first) = pieces[i];
+            let at = at as usize;
+            if j == i + 1 {
+                self.read_region(first, &mut out[at..at + first.len() as usize])?;
+            } else {
+                let hull = Region::new(locus.chrom, first.start, pieces[j - 1].1.end);
+                let mut bases = std::mem::take(&mut self.hull);
+                let result = grow(&mut bases, hull.len() as usize)
+                    .and_then(|()| self.read_region(hull, &mut bases[..hull.len() as usize]));
+                if result.is_ok() {
+                    for &(at, region) in &pieces[i..j] {
+                        let lo = (region.start - hull.start) as usize;
+                        let len = region.len() as usize;
+                        out[at as usize..at as usize + len].copy_from_slice(&bases[lo..lo + len]);
+                    }
+                }
+                self.hull = bases;
+                result?;
+            }
+            i = j;
+        }
+        Ok(())
+    }
+}
+
+impl<S: ReadAt> FastaReader<S> {
+    /// The bases of one region, as stored.
+    fn read_region(&mut self, region: Region<'_>, out: &mut [u8]) -> Result<()> {
+        if let Some(cache) = self.cache.as_ref().map(Arc::clone) {
+            return self.sequence_cached(region, out, &cache);
+        }
         let FastaReader {
             source,
             fai,
@@ -87,6 +191,7 @@ impl<S: ReadAt> SequenceRead for FastaReader<S> {
             inflater,
             raw,
             text,
+            ..
         } = self;
         let entry = entry(fai, region.chrom)?;
         region.check_within(entry.len)?;
@@ -117,16 +222,16 @@ impl<S: ReadAt> SequenceRead for FastaReader<S> {
     }
 }
 
-struct BgzfRead<'a, S> {
-    source: &'a S,
-    gzi: &'a Gzi,
-    inflater: &'a mut Inflater,
-    raw: &'a mut Vec<u8>,
-    text: &'a mut Vec<u8>,
+pub(crate) struct BgzfRead<'a, S> {
+    pub(crate) source: &'a S,
+    pub(crate) gzi: &'a Gzi,
+    pub(crate) inflater: &'a mut Inflater,
+    pub(crate) raw: &'a mut Vec<u8>,
+    pub(crate) text: &'a mut Vec<u8>,
 }
 
 impl<S: ReadAt> BgzfRead<'_, S> {
-    fn block(&self, index: usize, file_len: u64) -> BlockRef {
+    pub(crate) fn block(&self, index: usize, file_len: u64) -> BlockRef {
         let mut block = self.gzi.block(index, file_len);
         // An index may skip empty members. Only the member at this offset
         // is needed, and its BSIZE cannot exceed 64 KiB.
@@ -247,7 +352,7 @@ impl<S: ReadAt> BgzfRead<'_, S> {
     /// `offset` and returns its length. htslib indexes a file that begins
     /// with empty members at offset 0 all the same, so the first indexed
     /// block can start with them.
-    fn after_empty_members(&mut self, mut offset: u64, file_len: u64) -> Result<usize> {
+    pub(crate) fn after_empty_members(&mut self, mut offset: u64, file_len: u64) -> Result<usize> {
         let mut raw = Vec::new();
         grow(self.text, MAX_BLOCK_LEN)?;
         let mut filled = (file_len.saturating_sub(offset)).min(MAX_BLOCK_LEN as u64) as usize;
@@ -293,7 +398,7 @@ impl<S: ReadAt> BgzfRead<'_, S> {
 
 /// Hands the part of an inflated block (`text`, starting at text offset
 /// `text_start`) that falls in `range` to the decoder.
-fn push_block(
+pub(crate) fn push_block(
     decoder: &mut TextDecoder<'_>,
     text: &[u8],
     text_start: u64,
@@ -319,11 +424,14 @@ fn push_block(
 /// come back uppercase with `N` runs; with `mask`, soft-masked runs are
 /// lowercase, as `twoBitToFa` writes them.
 pub struct TwoBitReader<S> {
-    source: S,
-    directory: Directory,
-    records: Vec<Record>,
-    mask: bool,
-    packed: Vec<u8>,
+    pub(crate) source: S,
+    pub(crate) directory: Arc<Directory>,
+    pub(crate) records: Arc<[Record]>,
+    pub(crate) mask: bool,
+    pub(crate) packed: Vec<u8>,
+    pub(crate) cache: Option<Arc<BlockCache>>,
+    pub(crate) namespace: SourceToken,
+    pub(crate) tile_bases: u32,
 }
 
 fn read<S: ReadAt>(source: &S, offset: u64, len: u64) -> Result<Vec<u8>> {
@@ -398,11 +506,14 @@ impl<S: ReadAt> TwoBitReader<S> {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(TwoBitReader {
-            directory,
+            directory: Arc::new(directory),
             source,
-            records,
+            records: records.into(),
             mask,
             packed: Vec::new(),
+            cache: None,
+            namespace: SourceToken::new(),
+            tile_bases: crate::DEFAULT_CACHE_TILE_BASES,
         })
     }
 
@@ -422,6 +533,35 @@ impl<S: ReadAt> TwoBitReader<S> {
             .map(|i| &self.records[i])
             .ok_or_else(|| Error::UnknownChrom(chrom.to_owned()))
     }
+
+    /// Attaches an externally managed fixed-tile cache. The input must
+    /// remain unchanged while this reader or its clones exist.
+    pub fn set_cache(&mut self, cache: Option<Arc<BlockCache>>) -> Result<()> {
+        self.cache = cache;
+        Ok(())
+    }
+
+    /// Chooses the tile size explicitly, in bases. Different tile layouts
+    /// have distinct cache keys. Sizes must be powers of two, at least four.
+    pub fn set_cache_with_tile(
+        &mut self,
+        cache: Option<Arc<BlockCache>>,
+        tile_bases: u32,
+    ) -> Result<()> {
+        if tile_bases < 4 || !tile_bases.is_power_of_two() {
+            return Err(Error::invalid(
+                "2bit cache",
+                "tile size must be a power of two >= 4",
+            ));
+        }
+        self.tile_bases = tile_bases;
+        self.cache = cache;
+        Ok(())
+    }
+
+    pub fn cache_namespace(&self) -> SourceToken {
+        self.namespace
+    }
 }
 
 impl<S: ReadAt> SequenceRead for TwoBitReader<S> {
@@ -429,13 +569,38 @@ impl<S: ReadAt> SequenceRead for TwoBitReader<S> {
         Ok(self.record(chrom)?.len())
     }
 
-    fn sequence(&mut self, region: Region<'_>, out: &mut [u8]) -> Result<()> {
+    /// Spans are unpacked one by one: 2bit is not compressed, so no
+    /// decoding repeats.
+    fn sequence(&mut self, locus: &Locus<'_>, out: &mut [u8]) -> Result<()> {
+        locus.check()?;
+        locus.check_within(self.record(locus.chrom)?.len())?;
+        check_output("sequence", out.len(), locus.len() as usize)?;
+        if locus.spans().len() == 1 {
+            self.read_region(locus.hull(), out)?;
+        } else {
+            for (at, region) in locus.pieces() {
+                let at = at as usize;
+                self.read_region(region, &mut out[at..at + region.len() as usize])?;
+            }
+        }
+        orient_bases(locus.strand, out);
+        Ok(())
+    }
+}
+
+impl<S: ReadAt> TwoBitReader<S> {
+    /// The bases of one region, as stored.
+    fn read_region(&mut self, region: Region<'_>, out: &mut [u8]) -> Result<()> {
+        if let Some(cache) = self.cache.as_ref().map(Arc::clone) {
+            return self.sequence_cached(region, out, &cache);
+        }
         let TwoBitReader {
             source,
             directory,
             records,
             mask,
             packed,
+            ..
         } = self;
         let record = directory
             .index(region.chrom)

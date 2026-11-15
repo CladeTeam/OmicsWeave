@@ -3,7 +3,7 @@
 mod common;
 
 use common::htslib;
-use omicsweave_core::{Region, SequenceRead};
+use omicsweave_core::{Locus, Region, SequenceRead};
 use omicsweave_fasta::{Directory, Fai, FastaReader, Parsed, TwoBitHeader, compress_fasta};
 
 #[test]
@@ -61,7 +61,7 @@ fn all_c_locale_line_gaps_match_htslib_in_plain_and_bgzf_reads() {
                 let mut guarded = vec![0xAA; expected.len() + 2];
                 reader
                     .sequence(
-                        Region::new("s", start, end),
+                        &Locus::from(Region::new("s", start, end)),
                         &mut guarded[1..expected.len() + 1],
                     )
                     .unwrap();

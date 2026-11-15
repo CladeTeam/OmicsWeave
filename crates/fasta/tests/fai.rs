@@ -3,7 +3,7 @@
 mod common;
 
 use common::{Rng, build_fai, fetch_plain, htslib, random_fasta};
-use omicsweave_core::{Region, SequenceRead};
+use omicsweave_core::{Locus, Region, SequenceRead};
 use omicsweave_fasta::{Fai, FastaReader};
 use proptest::prelude::*;
 
@@ -95,7 +95,7 @@ proptest! {
                 let expected = theirs.fetch(&entry.name, start, end).unwrap();
                 prop_assert_eq!(&fetch_plain(entry, &text, start, end), &expected, "{}:{}-{}", entry.name, start, end);
                 let mut out = vec![0u8; (end - start) as usize];
-                reader.sequence(Region::new(&entry.name, start, end), &mut out).unwrap();
+                reader.sequence(&Locus::from(Region::new(&entry.name, start, end)), &mut out).unwrap();
                 prop_assert_eq!(&out, &expected);
             }
         }

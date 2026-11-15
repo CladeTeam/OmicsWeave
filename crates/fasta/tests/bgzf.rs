@@ -5,7 +5,7 @@
 mod common;
 
 use common::{Bgzipped, Rng, build_fai, htslib, random_fasta};
-use omicsweave_core::{Region, SequenceRead};
+use omicsweave_core::{Locus, Region, SequenceRead};
 use omicsweave_fasta::{BLOCK_TEXT_LEN, FastaReader, Gzi, compress_fasta};
 use proptest::prelude::*;
 
@@ -62,20 +62,20 @@ fn reader_carries_split_crlf_between_bgzf_blocks_and_recovers_after_error() {
         let mut reader = FastaReader::new(bytes.as_slice(), fai.clone(), Some(gzi));
         let mut out = [0xAA; 14];
         reader
-            .sequence(Region::new("s", 0, 12), &mut out[1..13])
+            .sequence(&Locus::from(Region::new("s", 0, 12)), &mut out[1..13])
             .unwrap();
         assert_eq!(&out, b"\xAAACGTacgtNNNN\xAA");
         assert!(
             reader
-                .sequence(Region::new("s", 0, 13), &mut out[1..13])
+                .sequence(&Locus::from(Region::new("s", 0, 13)), &mut out[1..13])
                 .is_err()
         );
         reader
-            .sequence(Region::new("s", 3, 5), &mut out[1..3])
+            .sequence(&Locus::from(Region::new("s", 3, 5)), &mut out[1..3])
             .unwrap();
         assert_eq!(&out[1..3], b"Ta");
         reader
-            .sequence(Region::new("s", 0, 12), &mut out[1..13])
+            .sequence(&Locus::from(Region::new("s", 0, 12)), &mut out[1..13])
             .unwrap();
         assert_eq!(&out, b"\xAAACGTacgtNNNN\xAA");
     }
@@ -135,7 +135,9 @@ fn reader_bounds_reads_when_htslib_indexes_skip_empty_members() {
     };
     let mut reader = FastaReader::new(&source, fai, Some(gzi));
     let mut out = [0; 12];
-    reader.sequence(Region::new("s", 0, 12), &mut out).unwrap();
+    reader
+        .sequence(&Locus::from(Region::new("s", 0, 12)), &mut out)
+        .unwrap();
     assert_eq!(&out, expected.as_slice());
     assert_eq!(source.calls.get(), 2);
     assert!(source.largest.get() <= MAX_BLOCK_LEN);
@@ -175,7 +177,7 @@ proptest! {
                     prop_assert_eq!(&ours.fetch_span(entry, start, end), &expected, "{}:{}-{}", entry.name, start, end);
                     prop_assert_eq!(&ours.fetch_blocks(entry, start, end), &expected, "{}:{}-{}", entry.name, start, end);
                     let mut out = vec![0u8; (end - start) as usize];
-                    reader.sequence(Region::new(&entry.name, start, end), &mut out).unwrap();
+                    reader.sequence(&Locus::from(Region::new(&entry.name, start, end)), &mut out).unwrap();
                     prop_assert_eq!(&out, &expected);
                 }
             }

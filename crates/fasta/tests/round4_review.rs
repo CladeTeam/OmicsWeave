@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use omicsweave_core::{Region, SequenceRead};
+use omicsweave_core::{Locus, Region, SequenceRead};
 use omicsweave_fasta::{
     BgzfWriter, BlockHeader, Directory, Error, Fai, FaiEntry, FastaReader, Parsed, TwoBitHeader,
 };
@@ -91,7 +91,7 @@ fn vertical_tab_gaps_decode_at_every_member_split_and_window() {
                 let mut guarded = vec![0xAA; end - start + 2];
                 reader
                     .sequence(
-                        Region::new("s", start as u32, end as u32),
+                        &Locus::from(Region::new("s", start as u32, end as u32)),
                         &mut guarded[1..end - start + 1],
                     )
                     .unwrap();
@@ -137,13 +137,15 @@ fn plain_reads_exclude_unrequested_bases_and_trailing_layout_bytes() {
         source.requests.borrow_mut().clear();
         let mut out = vec![0; (end - start) as usize];
         reader
-            .sequence(Region::new("s", start, end), &mut out)
+            .sequence(&Locus::from(Region::new("s", start, end)), &mut out)
             .unwrap();
         assert_eq!(&out, &b"ACGTacgtNNNN"[start as usize..end as usize]);
         assert_eq!(source.requests.borrow().as_slice(), &[expected_read]);
     }
     source.requests.borrow_mut().clear();
-    reader.sequence(Region::new("s", 4, 4), &mut []).unwrap();
+    reader
+        .sequence(&Locus::from(Region::new("s", 4, 4)), &mut [])
+        .unwrap();
     assert!(source.requests.borrow().is_empty());
 }
 
@@ -173,11 +175,11 @@ fn decoding_and_crc_failures_do_not_poison_later_queries() {
         let mut guarded = [0xAA; 14];
         for _ in 0..2 {
             reader
-                .sequence(Region::new("s", 0, 4), &mut guarded[1..5])
+                .sequence(&Locus::from(Region::new("s", 0, 4)), &mut guarded[1..5])
                 .unwrap();
             assert_eq!(&guarded[1..5], b"ACGT");
             let error = reader
-                .sequence(Region::new("s", 0, 12), &mut guarded[1..13])
+                .sequence(&Locus::from(Region::new("s", 0, 12)), &mut guarded[1..13])
                 .unwrap_err();
             if corrupt_crc {
                 assert!(matches!(error, Error::Inflate(_)));
@@ -187,7 +189,7 @@ fn decoding_and_crc_failures_do_not_poison_later_queries() {
             assert_eq!((guarded[0], guarded[13]), (0xAA, 0xAA));
             if !corrupt_crc {
                 reader
-                    .sequence(Region::new("s", 8, 12), &mut guarded[1..5])
+                    .sequence(&Locus::from(Region::new("s", 8, 12)), &mut guarded[1..5])
                     .unwrap();
                 assert_eq!(&guarded[1..5], b"NNNN");
             }

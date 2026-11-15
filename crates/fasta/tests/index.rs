@@ -7,7 +7,7 @@ mod common;
 use std::path::Path;
 
 use common::{Rng, build_fai, htslib, random_fasta};
-use omicsweave_core::{Region, SequenceRead};
+use omicsweave_core::{Locus, Region, SequenceRead};
 use omicsweave_fasta::{
     EOF_BLOCK, Error, Fai, FastaReader, FastaWriter, Gzi, build_index, build_index_files, fai_path,
     gzi_path,
@@ -78,7 +78,7 @@ fn check_reads(
         for (start, end) in ranges {
             let mut out = vec![0u8; (end - start) as usize];
             reader
-                .sequence(Region::new(name, start, end), &mut out)
+                .sequence(&Locus::from(Region::new(name, start, end)), &mut out)
                 .unwrap();
             prop_assert_eq!(&out[..], &seq[start as usize..end as usize]);
         }
@@ -179,7 +179,7 @@ fn leading_empty_members_index_and_read_like_htslib() {
     for (name, start, end) in [("s", 0, 10), ("s", 3, 9), ("t", 0, 4), ("t", 1, 2)] {
         let mut out = vec![0u8; end as usize - start as usize];
         reader
-            .sequence(Region::new(name, start, end), &mut out)
+            .sequence(&Locus::from(Region::new(name, start, end)), &mut out)
             .unwrap();
         assert_eq!(out, reference.fetch(name, start, end).unwrap());
     }
@@ -364,7 +364,7 @@ proptest! {
                         let start = rng.coord(0, entry.len - 1);
                         for (start, end) in [(0, entry.len), (start, rng.coord(start + 1, entry.len))] {
                             let mut out = vec![0u8; (end - start) as usize];
-                            reader.sequence(Region::new(&entry.name, start, end), &mut out).unwrap();
+                            reader.sequence(&Locus::from(Region::new(&entry.name, start, end)), &mut out).unwrap();
                             prop_assert_eq!(out, reference.fetch(&entry.name, start, end).unwrap());
                         }
                     }

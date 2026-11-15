@@ -1,5 +1,6 @@
 //! Malformed input and invalid requests yield errors, never panics.
 
+use omicsweave_core::Locus;
 use omicsweave_fasta::{
     BgzfWriter, BlockHeader, Error, Fai, FaiEntry, Gzi, Inflater, MAX_BLOCK_LEN, Parsed, Record,
     TwoBitHeader,
@@ -142,15 +143,17 @@ fn readers_check_keys_and_outputs() {
     let fai = Fai::parse(b"s\t10\t3\t4\t5\n").unwrap();
     let mut reader = FastaReader::new(&text[..], fai, None);
     let mut out = [0u8; 4];
-    reader.sequence(Region::new("s", 2, 6), &mut out).unwrap();
+    reader
+        .sequence(&Locus::from(Region::new("s", 2, 6)), &mut out)
+        .unwrap();
     assert_eq!(&out, b"GTAC");
     assert_eq!(reader.chrom_len("t"), Err(Error::UnknownChrom("t".into())));
     assert!(matches!(
-        reader.sequence(Region::new("s", 8, 12), &mut out),
+        reader.sequence(&Locus::from(Region::new("s", 8, 12)), &mut out),
         Err(Error::RegionOutOfRange { .. })
     ));
     assert!(matches!(
-        reader.sequence(Region::new("s", 0, 3), &mut out),
+        reader.sequence(&Locus::from(Region::new("s", 0, 3)), &mut out),
         Err(Error::OutputSize { .. })
     ));
 }

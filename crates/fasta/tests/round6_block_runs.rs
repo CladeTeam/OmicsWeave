@@ -2,7 +2,7 @@
 mod common;
 
 use common::{OpenTwoBit, TwoBitSeq, lib2bit, write_twobit};
-use omicsweave_core::{Region, SequenceRead};
+use omicsweave_core::{Locus, Region, SequenceRead};
 use omicsweave_fasta::{Block, TwoBitReader};
 
 fn expected(seq: &TwoBitSeq, start: u32, end: u32, mask: bool) -> Vec<u8> {
@@ -74,7 +74,7 @@ fn empty_and_adjacent_blocks_preserve_wire_metadata_and_lib2bit_bases() {
                     let mut guarded = vec![0xA5; wanted.len() + 2];
                     reader
                         .sequence(
-                            Region::new("s", start, end),
+                            &Locus::from(Region::new("s", start, end)),
                             &mut guarded[1..wanted.len() + 1],
                         )
                         .unwrap();
@@ -90,11 +90,13 @@ fn empty_and_adjacent_blocks_preserve_wire_metadata_and_lib2bit_bases() {
             }
             assert!(
                 reader
-                    .sequence(Region::new("s", 0, 33), &mut [0; 33])
+                    .sequence(&Locus::from(Region::new("s", 0, 33)), &mut [0; 33])
                     .is_err()
             );
             let mut out = [0; 6];
-            reader.sequence(Region::new("s", 0, 6), &mut out).unwrap();
+            reader
+                .sequence(&Locus::from(Region::new("s", 0, 6)), &mut out)
+                .unwrap();
             assert_eq!(out.as_slice(), expected(&seq, 0, 6, mask));
         }
     }
@@ -122,7 +124,7 @@ fn short_queries_cross_many_empty_blocks_and_adjacent_n_runs() {
         for (start, end) in [(0, 2), (0, 3), (1, 3), (2, 4), (0, 2)] {
             let mut out = vec![0; (end - start) as usize];
             reader
-                .sequence(Region::new("s", start, end), &mut out)
+                .sequence(&Locus::from(Region::new("s", start, end)), &mut out)
                 .unwrap();
             assert_eq!(out, expected(&seq, start, end, true));
         }

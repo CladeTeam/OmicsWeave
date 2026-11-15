@@ -23,6 +23,16 @@
 //! standard [`omicsweave_core::SequenceRead`] access: a
 //! [`omicsweave_core::Region`] in, ASCII bases out.
 //!
+//! Repeated BGZF reads can explicitly attach an externally owned
+//! [`omicsweave_core::cache::BlockCache`] with [`FastaReader::set_cache`].
+//! [`TwoBitReader::set_cache_with_tile`] enables decoded fixed tiles. Both
+//! expose `describe_cache` and `cache_namespace` for external management;
+//! ordinary constructors keep caching disabled. Cached sources and their
+//! indexes must stay unchanged for the lifetime of a shared source session.
+//! Plain FASTA has no decoded-block cache. File-backed readers can
+//! `try_clone` their execution context, sharing immutable metadata and the
+//! external cache while keeping work buffers independent.
+//!
 //! Coordinates are 0-based, half-open. Ranges outside a sequence are errors;
 //! padding is the caller's decision.
 //!
@@ -55,6 +65,7 @@
 //! [`TwoBitRecord`] joins, then written record by record.
 
 mod bgzf;
+mod cache;
 mod error;
 mod fai;
 mod faibuild;
@@ -74,6 +85,8 @@ pub use faibuild::FaiBuilder;
 pub use gzi::{BlockRef, GZI_SUFFIX, Gzi, Span, gzi_path};
 pub use index::{build_index, build_index_files};
 pub use reader::{FastaReader, TwoBitReader};
+/// Default size, in bases, of an explicitly enabled 2bit decoded tile.
+pub const DEFAULT_CACHE_TILE_BASES: u32 = 1 << 16;
 pub use twobit::{
     Block, Directory, HEADER_LEN as TWOBIT_HEADER_LEN, Parsed, Record, TWOBIT_MAGIC, TwoBitHeader,
 };

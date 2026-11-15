@@ -3,7 +3,7 @@
 mod common;
 
 use common::{OpenTwoBit, Rng, lib2bit, random_twobit, write_twobit};
-use omicsweave_core::{Region, SequenceRead};
+use omicsweave_core::{Locus, Region, SequenceRead};
 use omicsweave_fasta::TwoBitReader;
 use proptest::prelude::*;
 
@@ -47,7 +47,7 @@ proptest! {
                         "{}:{}-{} mask={}", s.name, start, end, mask
                     );
                     let mut out = vec![0u8; (end - start) as usize];
-                    reader.sequence(Region::new(&s.name, start, end), &mut out).unwrap();
+                    reader.sequence(&Locus::from(Region::new(&s.name, start, end)), &mut out).unwrap();
                     prop_assert_eq!(&out, &expected);
                 }
             }

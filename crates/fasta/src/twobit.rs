@@ -444,15 +444,22 @@ impl Record {
             out[dst..].copy_from_slice(&BYTE_BASES[packed[byte] as usize][..rest]);
         }
 
+        self.mask_output(start, out, mask);
+        Ok(())
+    }
+
+    /// Applies metadata to an already decoded, checked range. N runs take
+    /// precedence over soft masking, including tiles cached in uppercase.
+    pub(crate) fn mask_output(&self, start: u32, out: &mut [u8], mask: bool) {
+        let end = start as u64 + out.len() as u64;
         if mask {
-            for (lo, hi) in overlaps(self.mask_blocks.query(), start as u64, end as u64) {
+            for (lo, hi) in overlaps(self.mask_blocks.query(), start as u64, end) {
                 out[lo..hi].make_ascii_lowercase();
             }
         }
-        for (lo, hi) in overlaps(self.n_blocks.query(), start as u64, end as u64) {
+        for (lo, hi) in overlaps(self.n_blocks.query(), start as u64, end) {
             out[lo..hi].fill(b'N');
         }
-        Ok(())
     }
 }
 

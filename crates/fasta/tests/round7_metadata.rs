@@ -2,7 +2,7 @@
 mod common;
 
 use common::{TwoBitSeq, lib2bit, write_twobit};
-use omicsweave_core::{ReadAt, Region, Result, SequenceRead};
+use omicsweave_core::{Locus, ReadAt, Region, Result, SequenceRead};
 use omicsweave_fasta::{TwoBitPiece, TwoBitReader, TwoBitRecord, TwoBitWriter, encode_twobit};
 use std::{cell::Cell, io::Cursor};
 
@@ -55,7 +55,7 @@ fn minimal_record_headers_match_lib2bit_across_directory_read_boundary() {
             for (start, end) in [(0, 17), (123, 1024), (16380, 16384)] {
                 let mut out = vec![0; (end - start) as usize];
                 reader
-                    .sequence(Region::new(&seq.name, start, end), &mut out)
+                    .sequence(&Locus::from(Region::new(&seq.name, start, end)), &mut out)
                     .unwrap();
                 assert_eq!(out, reference.sequence(&seq.name, start, end).unwrap());
             }
@@ -102,7 +102,9 @@ fn invalid_public_pieces_leave_the_record_unchanged() {
     let bytes = writer.finish().unwrap().into_inner();
     let mut reader = TwoBitReader::open(bytes, true).unwrap();
     let mut out = [0; 8];
-    reader.sequence(Region::new("s", 0, 8), &mut out).unwrap();
+    reader
+        .sequence(&Locus::from(Region::new("s", 0, 8)), &mut out)
+        .unwrap();
     assert_eq!(&out, b"acNNNNAC");
     assert!(TwoBitPiece::encode(u64::MAX - 3, b"ACGT").is_err());
 }
