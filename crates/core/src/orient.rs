@@ -88,6 +88,12 @@ pub fn flip_tile<T>(tile: &mut [T], rows: usize, cols: usize, flip_rows: bool, f
     if cols == 0 {
         return;
     }
+    if flip_rows && flip_cols {
+        // Flipping both axes is the flat tile's reversal, so each pair
+        // is swapped only once.
+        tile.reverse();
+        return;
+    }
     if flip_rows {
         for r in 0..rows / 2 {
             let (top, bottom) = tile.split_at_mut((rows - 1 - r) * cols);

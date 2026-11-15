@@ -111,6 +111,27 @@ fn tiles_flip_by_axis() {
 }
 
 #[test]
+fn tile_axes_match_coordinate_mapping_for_empty_odd_and_even_shapes() {
+    for rows in 0..12 {
+        for cols in 0..12 {
+            for flip_rows in [false, true] {
+                for flip_cols in [false, true] {
+                    let mut tile: Vec<usize> = (0..rows * cols).collect();
+                    flip_tile(&mut tile, rows, cols, flip_rows, flip_cols);
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            let from_row = if flip_rows { rows - 1 - r } else { r };
+                            let from_col = if flip_cols { cols - 1 - c } else { c };
+                            assert_eq!(tile[r * cols + c], from_row * cols + from_col);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn tile_shape_multiplication_cannot_wrap_into_a_valid_buffer() {
     assert!(
         std::panic::catch_unwind(|| {
