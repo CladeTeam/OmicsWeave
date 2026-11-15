@@ -88,7 +88,13 @@ def ensure_format(file: File) -> None:
 class Writer[F: File]:
     """A file being written: finished by :meth:`close`, or on leaving a
     ``with`` block without an exception. Leaving with an exception abandons
-    the file unfinished."""
+    the file unfinished.
+
+    Writers are process-local. After a normal CPython fork, the child must
+    create its own writers. Closing or collecting an inherited buffered sink
+    does not flush the parent's data; its inherited buffers and descriptors
+    remain reserved in the child until process exit.
+    """
 
     _native: Any
     file: F
@@ -98,6 +104,7 @@ class Writer[F: File]:
         self.file = file
         self._native = native
         self._closed = False
+        self._process = os.getpid()
 
     def _finish(self) -> tuple[File, ...]:
         raise NotImplementedError
@@ -107,6 +114,11 @@ class Writer[F: File]:
         if self._closed:
             return ()
         self._closed = True
+        if self._process != os.getpid():
+            # Foreign sinks are abandoned without running finish or flushing
+            # the parent's buffered data. Their native drop policy is inert.
+            self._native = None
+            return ()
         return self._finish()
 
     @property

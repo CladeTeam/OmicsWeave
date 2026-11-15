@@ -8,7 +8,8 @@ __all__ = ["Bcf"]
 
 
 class Bcf(File):
-    """A BCF file (version 2), read whole."""
+    """A BCF file (version 2). Read by region through its CSI index
+    (:class:`~omicsweave.query.VariantReader`)."""
 
     __slots__ = ()
     format = "bcf"
