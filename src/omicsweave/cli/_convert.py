@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import warnings
 from collections import defaultdict
 from typing import Any, TextIO
 
@@ -66,7 +67,9 @@ def register(commands: Any) -> None:
         description=(
             "Convert SOURCE into TARGET, streaming and in parallel within a memory budget.\n\n"
             "SOURCE's format is told by its content, TARGET's by its name (.fa.gz,\n"
-            ".2bit, .bcf, .bam, .bb, .hic); --from and --to state them instead.\n"
+            ".2bit, .bcf, .bam, .bb, .bw, .hic); --from and --to state them instead.\n"
+            "What a conversion passes over (rows of unknown chromosomes) is printed\n"
+            "as a warning.\n"
             "TARGET and its companion files (.fai, .gzi, .csi, .bai, .sidecar) appear\n"
             "only once the whole conversion succeeded."
         ),
@@ -118,7 +121,7 @@ def register(commands: Any) -> None:
         "--level",
         type=int,
         metavar="L",
-        help="compression level: bgzip, BCF, BAM 0-12; bigBed, hic 1-9",
+        help="compression level: bgzip, BCF, BAM 0-12; bigBed, bigWig, hic 1-9",
     )
     output.add_argument(
         "--index",
@@ -130,25 +133,56 @@ def register(commands: Any) -> None:
     output.add_argument(
         "--chrom-sizes",
         metavar="FILE",
-        help="bigBed chromosome lengths (chrom.sizes, .fai or .2bit; default: "
-        "each chromosome's largest interval end)",
+        help="bigBed / bigWig chromosome lengths (chrom.sizes, .fai or .2bit; "
+        "default: each chromosome's largest interval end); pairs to hic: the "
+        "chromosomes in order (default: the #chromsize lines; short text needs it)",
     )
     output.add_argument(
         "--resolutions",
         type=_resolutions,
         metavar="R,R,...",
-        help=".mcool resolutions to convert (default: all)",
+        help=".mcool resolutions to convert (default: all); pairs to hic: bin sizes, "
+        "each a multiple of the finest (default: Juicer pre's, 2.5M down to 5k)",
+    )
+    methyl = p.add_argument_group("bedMethyl to bigWig")
+    methyl.add_argument(
+        "--value",
+        metavar="COLUMN",
+        help="the column stored: percent (default), coverage, score, nmod, ncanonical, "
+        "nother_mod, ndelete, nfail, ndiff, nnocall",
+    )
+    methyl.add_argument(
+        "--mod",
+        metavar="CODE",
+        help="the items of this modification code (column 4: m, h, a, ...); "
+        "required when there are several",
+    )
+    methyl.add_argument(
+        "--strand",
+        choices=("+", "-", "."),
+        help="the items of this strand (default: all; overlapping strands are an error)",
     )
     output.add_argument(
         "--no-sidecar",
         dest="sidecar",
         action="store_false",
-        help="do not write the bigBed / hic .sidecar",
+        help="do not write the bigBed / bigWig / hic .sidecar",
     )
     output.add_argument(
         "--add-contigs",
         action="store_true",
         help="BCF: declare contigs the VCF header lacks (one more pass over SOURCE)",
+    )
+    output.add_argument(
+        "--sort",
+        action="store_true",
+        help="BAM to BAM: sort the records by coordinate, as samtools sort does",
+    )
+    output.add_argument(
+        "--reference",
+        metavar="FASTA",
+        help="CRAM to BAM: the reference the CRAM was compressed against "
+        "(FASTA + .fai, bgzip FASTA + .fai/.gzi, or 2bit)",
     )
 
     p.add_argument(
@@ -195,7 +229,18 @@ def run(args: argparse.Namespace) -> int:
     target = _file(args.target, args.target_format)
     threads = args.threads or os.cpu_count() or 1
     if args.dry_run:
-        plan = convert.plan(source, target, threads=threads, memory=args.memory)
+        plan = convert.plan(
+            source,
+            target,
+            threads=threads,
+            memory=args.memory,
+            chrom_sizes=args.chrom_sizes,
+            resolutions=args.resolutions,
+            value=args.value,
+            mod=args.mod,
+            strand=args.strand,
+            sort=args.sort,
+        )
         b, m = plan.budget, plan.memory
         print(f"source  {plan.source.path}  ({plan.source.format})")
         print(f"target  {plan.target.path}  ({plan.target.format})")
@@ -206,23 +251,33 @@ def run(args: argparse.Namespace) -> int:
         return 0
     progress = None if args.quiet or not sys.stderr.isatty() else _Progress(sys.stderr)
     try:
-        done = convert.run(
-            source,
-            target,
-            threads=threads,
-            memory=args.memory,
-            tmp_dir=args.tmp_dir,
-            level=args.level,
-            index=args.index or False,
-            chrom_sizes=args.chrom_sizes,
-            resolutions=args.resolutions,
-            sidecar=args.sidecar,
-            add_contigs=args.add_contigs,
-            progress=progress,
-        )
+        # Warnings are printed below, after the progress line is gone.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", convert.ConvertWarning)
+            done = convert.run(
+                source,
+                target,
+                threads=threads,
+                memory=args.memory,
+                tmp_dir=args.tmp_dir,
+                level=args.level,
+                index=args.index or False,
+                chrom_sizes=args.chrom_sizes,
+                resolutions=args.resolutions,
+                value=args.value,
+                mod=args.mod,
+                strand=args.strand,
+                sidecar=args.sidecar,
+                add_contigs=args.add_contigs,
+                sort=args.sort,
+                reference=args.reference,
+                progress=progress,
+            )
     finally:
         if progress is not None:
             progress.clear()
+    for note in done.warnings:
+        print(f"warning: {note}", file=sys.stderr)
     for file in done.files:
         print(file.path)
     if not args.quiet:

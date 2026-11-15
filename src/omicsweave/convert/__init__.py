@@ -5,8 +5,14 @@ budget of threads and memory.
 - FASTA (any storage) to ``.2bit``
 - VCF (any storage) to ``.bcf``, with a ``.csi`` given ``index``
 - SAM (any storage) to ``.bam``, with a ``.bai`` / ``.csi`` given ``index``
-- BED (any storage) to ``.bigbed`` / ``.bb``, with its ``.sidecar``
+- ``.bam`` to a coordinate-sorted ``.bam`` given ``sort``, indexed given ``index``
+- BED or bedGraph (any storage) to ``.bigbed`` / ``.bb``, with its ``.sidecar``
+- bedGraph or wig (any storage) to ``.bigwig`` / ``.bw``, with its ``.sidecar``
 - ``.cool`` / ``.mcool`` to ``.hic``, with its ``.sidecar``
+- 4DN pairs or Juicer short text (any storage) to ``.hic``, with its
+  ``.sidecar``
+- bedMethyl (any storage) to ``.bigbed`` (every column) or ``.bigwig`` (one
+  column), with its ``.sidecar``
 
 "Any storage" is plain text, gzip or BGZF. :func:`run` converts,
 :func:`plan` only checks the budget, :func:`routes` lists the pairs of
@@ -19,6 +25,6 @@ threads, nor on whether a sort had to spill to disk.
 
 from ._plan import Budget, MemoryPlan, Plan, plan
 from ._routes import routes
-from ._run import Report, run
+from ._run import ConvertWarning, Report, run
 
-__all__ = ["Budget", "MemoryPlan", "Plan", "Report", "plan", "routes", "run"]
+__all__ = ["Budget", "ConvertWarning", "MemoryPlan", "Plan", "Report", "plan", "routes", "run"]

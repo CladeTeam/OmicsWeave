@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from .. import _native
 from ..formats import File, PathLike
@@ -47,12 +50,27 @@ def plan(
     *,
     threads: int | None = None,
     memory: int | str = "4G",
+    chrom_sizes: PathLike | None = None,
+    resolutions: Sequence[int] | None = None,
+    value: str | None = None,
+    mod: str | None = None,
+    strand: Literal["+", "-", "."] | None = None,
+    sort: bool = False,
 ) -> Plan:
-    """Checks the conversion of ``source`` into ``target`` against its budget
-    (see :func:`run`) without reading any data."""
+    """Checks the conversion of ``source`` into ``target`` (a BAM sort given
+    ``sort``) against its budget (see :func:`run`, which also explains the
+    options) without reading any data."""
     files = native_files(source, target)
     src, dst, threads, budget, fixed, pipeline, buffer = _native.plan_convert(
-        **files, threads=threads, memory=str(memory)
+        **files,
+        threads=threads,
+        memory=str(memory),
+        chrom_sizes=None if chrom_sizes is None else os.fspath(chrom_sizes),
+        resolutions=None if resolutions is None else list(resolutions),
+        value=value,
+        mod=mod,
+        strand=strand,
+        sort=sort,
     )
     return Plan(
         file_of(src, files["src"]),

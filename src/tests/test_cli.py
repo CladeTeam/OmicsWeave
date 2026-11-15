@@ -46,6 +46,26 @@ def test_dry_run_writes_nothing(tmp_path, capsys):
     assert not dst.exists()
 
 
+def test_bam_sort(tmp_path, capsys):
+    sam = tmp_path / "r.sam"
+    sam.write_text(
+        "@SQ\tSN:c\tLN:1000\n"
+        "r1\t0\tc\t500\t9\t4M\t*\t0\t0\tACGT\t*\n"
+        "r2\t16\tc\t10\t9\t4M\t*\t0\t0\tACGT\t*\n"
+    )
+    unsorted, out = tmp_path / "r.bam", tmp_path / "s.bam"
+    assert main(["convert", str(sam), str(unsorted), "-q"]) == 0
+    capsys.readouterr()
+    assert main(["convert", str(unsorted), str(out), "--index"]) == 1
+    assert "pass sort" in capsys.readouterr().err
+    assert main(["convert", str(unsorted), str(out), "--dry-run"]) == 1
+    assert main(["convert", str(unsorted), str(out), "--sort", "--dry-run"]) == 0
+    assert not out.exists()
+    capsys.readouterr()
+    assert main(["convert", str(unsorted), str(out), "--sort", "--index", "-q"]) == 0
+    assert capsys.readouterr().out.splitlines() == [str(out), f"{out}.bai"]
+
+
 def test_failures_and_usage(tmp_path, capsys):
     src = tmp_path / "a.fa"
     src.write_bytes(FASTA)
