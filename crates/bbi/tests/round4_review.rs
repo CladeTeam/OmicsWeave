@@ -3,7 +3,8 @@ use omicsweave_bbi::{
     BIGBED_MAGIC, BIGWIG_MAGIC, BbiReader, BlockRef, CHROM_TREE_MAGIC, INDEX_MAGIC, Index,
 };
 use omicsweave_core::{
-    IntervalEntry, IntervalRead, IntervalsOut, ReadAt, Region, StringColumn, TrackEntry, TrackRead,
+    IntervalEntry, IntervalRead, IntervalsOut, Locus, ReadAt, Region, StringColumn, TrackEntry,
+    TrackRead,
 };
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
@@ -238,7 +239,9 @@ fn bigwig_geometric_growth_declared_ceiling_and_truncated_stream() {
             reader.write_entries(&mut entries).unwrap();
             assert!(entries.iter().all(|r| r.value.to_bits() == 0x8000_0000));
             let mut values = [9.0; 10];
-            reader.values(Region::new("s", 0, 10), &mut values).unwrap();
+            reader
+                .values(&Locus::from(Region::new("s", 0, 10)), &mut values)
+                .unwrap();
             assert_eq!(values[1].to_bits(), 0x8000_0000);
             assert_eq!(values[2].to_bits(), 0x8000_0000);
             assert!(values[0].is_nan() && values[3..].iter().all(|v| v.is_nan()));

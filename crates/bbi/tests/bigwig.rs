@@ -3,6 +3,7 @@
 
 mod common;
 
+use omicsweave_core::Locus;
 use std::path::Path;
 
 use common::libbigwig::{Reader, Writer};
@@ -260,7 +261,7 @@ fn standard_reader_reuses_prepared_index_across_windows() {
                 for start in [0, len / 2, len.saturating_sub(64), len + 3] {
                     let region = Region::new(name, start, start + 64);
                     let mut out = [f32::NAN; 64];
-                    reader.values(region, &mut out).unwrap();
+                    reader.values(&Locus::from(region), &mut out).unwrap();
                     let expected = reference.values(name, start, start + 64).unwrap();
                     assert!(out.iter().zip(expected).all(|(&a, b)| same(a, b)));
                     let expected = reference.intervals(name, start, start + 64).unwrap();

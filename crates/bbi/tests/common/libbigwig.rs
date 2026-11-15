@@ -152,6 +152,36 @@ impl Reader {
         }
     }
 
+    /// `bwStatsFromFull` (`exact`) or `bwStats` over `bins` equal bins of
+    /// `[start, end)`; `kind` is the `enum bwStatsType` value. `None` when
+    /// libBigWig fails.
+    pub fn stats(
+        &mut self,
+        chrom: &str,
+        start: u32,
+        end: u32,
+        bins: u32,
+        kind: i32,
+        exact: bool,
+    ) -> Option<Vec<f64>> {
+        let chrom = c_str(chrom);
+        // SAFETY: a non-NULL result holds `bins` doubles allocated with
+        // malloc; it is copied and freed here.
+        unsafe {
+            let o = if exact {
+                ffi::bwStatsFromFull(self.fp, chrom.as_ptr(), start, end, bins, kind)
+            } else {
+                ffi::bwStats(self.fp, chrom.as_ptr(), start, end, bins, kind)
+            };
+            if o.is_null() {
+                return None;
+            }
+            let out = std::slice::from_raw_parts(o, bins as usize).to_vec();
+            free(o.cast());
+            Some(out)
+        }
+    }
+
     /// `bwGetOverlappingIntervals`: unclipped (start, end, value) items.
     pub fn intervals(&mut self, chrom: &str, start: u32, end: u32) -> Option<Vec<(u32, u32, f32)>> {
         let chrom = c_str(chrom);

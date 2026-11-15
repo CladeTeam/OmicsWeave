@@ -1,5 +1,5 @@
 //! The standard access of `BbiReader` against libBigWig, and bigBed against
-//! the same records loaded from BED text: one family, one output.
+//! a brute-force overlap scan of the records it was written from.
 
 mod common;
 
@@ -7,10 +7,9 @@ use common::bigbed::{Record, Spec, write};
 use common::libbigwig::{Reader, Writer};
 use common::{Rng, same};
 use omicsweave_bbi::BbiReader;
-use omicsweave_bed::BedTable;
 use omicsweave_core::{
-    Error, IntervalEntry, IntervalRead, IntervalsOut, Region, StringColumn, Strings, TrackEntry,
-    TrackRead,
+    Error, IntervalEntry, IntervalRead, IntervalsOut, Locus, Region, StringColumn, Strings,
+    TrackEntry, TrackRead,
 };
 use proptest::prelude::*;
 
@@ -43,7 +42,7 @@ fn dense_values_preserve_last_record_wins_across_overlap_shapes() {
         ] {
             let region = Region::new("s", start, end);
             let mut out = vec![0.0; region.len() as usize];
-            reader.values(region, &mut out).unwrap();
+            reader.values(&Locus::from(region), &mut out).unwrap();
             let mut expected = vec![f32::NAN; out.len()];
             for &(s, e, v) in &records {
                 if s.max(start) < e.min(end) {
@@ -114,7 +113,7 @@ proptest! {
         for (chrom, start, end) in regions(&mut rng, &chroms) {
             let region = Region::new(&chrom, start, end);
             let mut values = vec![0f32; region.len() as usize];
-            ours.values(region, &mut values).unwrap();
+            ours.values(&Locus::from(region), &mut values).unwrap();
             let n = ours.query_entries(region).unwrap();
             let mut entries = vec![TrackEntry::default(); n];
             ours.write_entries(&mut entries).unwrap();
@@ -137,12 +136,12 @@ proptest! {
 
         prop_assert_eq!(ours.chrom_len("chrUn"), Err(Error::UnknownChrom("chrUn".into())));
         let mut none: [f32; 0] = [];
-        prop_assert!(matches!(ours.values(Region::new("chrUn", 0, 0), &mut none), Err(Error::UnknownChrom(_))));
+        prop_assert!(matches!(ours.values(&Locus::from(Region::new("chrUn", 0, 0)), &mut none), Err(Error::UnknownChrom(_))));
         prop_assert!(matches!(ours.query(Region::new("chr0", 0, 10)), Err(Error::Unsupported(_))));
     }
 
     #[test]
-    fn interval_access_matches_libbigwig_and_bed(seed in any::<u64>()) {
+    fn interval_access_matches_libbigwig_and_a_scan(seed in any::<u64>()) {
         let mut rng = Rng::new(seed);
         let spec = random_spec(&mut rng);
         prop_assume!(!spec.records.is_empty());
@@ -153,22 +152,21 @@ proptest! {
 
         let mut ours = BbiReader::open(&bigbed[..]).unwrap();
         let mut theirs = Reader::open(&path).unwrap();
-        let mut table = BedTable::load(&bed_text(&spec)).unwrap();
 
         let mut queries = regions(&mut rng, &spec.chroms);
         queries.push(("chrUn".into(), 0, 1_000));
         for (chrom, start, end) in queries {
             let region = Region::new(&chrom, start, end);
             let a = answer(&mut ours, region);
-            prop_assert_eq!(&a, &answer(&mut table, region), "{}:{}-{}", chrom, start, end);
+            let got: Vec<(u32, u32, Vec<u8>)> =
+                a.0.iter().zip(&a.1).map(|(e, note)| (e.start, e.end, note.clone())).collect();
+            prop_assert_eq!(&got, &scan(&spec, region), "{}:{}-{}", chrom, start, end);
             if region.is_empty() || chrom == "chrUn" {
                 prop_assert!(a.0.is_empty());
                 continue;
             }
             let expected: Vec<(u32, u32, Vec<u8>)> =
                 theirs.entries(&chrom, start, end).unwrap().into_iter().map(|e| (e.start, e.end, e.rest)).collect();
-            let got: Vec<(u32, u32, Vec<u8>)> =
-                a.0.iter().zip(&a.1).map(|(e, note)| (e.start, e.end, note.clone())).collect();
             prop_assert_eq!(got, expected, "{}:{}-{}", chrom, start, end);
         }
         prop_assert!(matches!(ours.query_entries(Region::new(&spec.chroms[0].0, 0, 1)), Err(Error::Unsupported(_))));
@@ -222,23 +220,26 @@ fn random_spec(rng: &mut Rng) -> Spec {
     }
 }
 
-fn bed_text(spec: &Spec) -> Vec<u8> {
-    let mut out = Vec::new();
-    for r in &spec.records {
-        out.extend_from_slice(
-            format!(
-                "{}\t{}\t{}",
-                spec.chroms[r.chrom as usize].0, r.start, r.end
-            )
-            .as_bytes(),
-        );
-        if !r.rest.is_empty() {
-            out.push(b'\t');
-            out.extend_from_slice(&r.rest);
-        }
-        out.push(b'\n');
-    }
-    out
+/// The records of `region` in file order: those starting before its end
+/// and ending after its start (an empty region has none).
+fn scan(spec: &Spec, region: Region<'_>) -> Vec<(u32, u32, Vec<u8>)> {
+    let Some(id) = spec
+        .chroms
+        .iter()
+        .position(|(name, _)| name == region.chrom)
+    else {
+        return Vec::new();
+    };
+    spec.records
+        .iter()
+        .filter(|r| {
+            r.chrom == id as u32
+                && !region.is_empty()
+                && r.start < region.end
+                && r.end > region.start
+        })
+        .map(|r| (r.start, r.end, r.rest.clone()))
+        .collect()
 }
 
 /// A query's entries and their annotations.

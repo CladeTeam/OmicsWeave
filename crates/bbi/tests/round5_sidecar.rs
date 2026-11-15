@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::io::Cursor;
 
 use omicsweave_bbi::{BbiReader, BbiSidecar, BigWigWriter, Chrom, Level, WriteOptions};
-use omicsweave_core::{Region, TrackRead};
+use omicsweave_core::{Locus, Region, TrackRead};
 
 struct Counted;
 thread_local! {
@@ -171,7 +171,7 @@ fn writer_tree_fanout_fits_the_encoded_node_count() {
     let mut reader = BbiReader::open(output.into_inner()).unwrap();
     let mut out = [0.0; 2];
     reader
-        .values(Region::new("c", count - 2, count), &mut out)
+        .values(&Locus::from(Region::new("c", count - 2, count)), &mut out)
         .unwrap();
     assert_eq!(out, [(count - 2) as f32, (count - 1) as f32]);
 }

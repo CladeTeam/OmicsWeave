@@ -11,7 +11,6 @@ libdeflater.workspace = true
 memchr.workspace = true
 
 [dev-dependencies]
-omicsweave-bed = { path = "../bed" }
 libbigwig-sys = { path = "../../refs/libbigwig" }
 libdeflater.workspace = true
 proptest.workspace = true
@@ -20,14 +19,3 @@ tempfile.workspace = true
 [lints]
 workspace = true
 
-[[bench]]
-name = "paths"
-harness = false
-
-[[bench]]
-name = "reader"
-harness = false
-
-[[bench]]
-name = "sidecar"
-harness = false

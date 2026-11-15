@@ -72,6 +72,7 @@ pub struct WigBlock<'a> {
     kind: WigKind,
     count: u16,
     order: Order,
+    prepared: bool,
 }
 
 impl<'a> WigBlock<'a> {
@@ -94,6 +95,7 @@ impl<'a> WigBlock<'a> {
             kind,
             count: u16_at(buf, 22),
             order: Order::UNKNOWN,
+            prepared: false,
         };
         require(
             buf,
@@ -122,6 +124,9 @@ impl<'a> WigBlock<'a> {
     /// without allocating. Sorted records use binary search; unsorted records
     /// retain stored-order semantics. Keep this view with the cached block.
     pub fn prepare(mut self) -> Self {
+        if self.prepared {
+            return self;
+        }
         if self.kind != WigKind::FixedStep {
             self.order = Order::scan(self.len(), |i| {
                 // SAFETY: scan only requests indices below the parsed count.
@@ -129,6 +134,7 @@ impl<'a> WigBlock<'a> {
                 ((self.chrom, s), (self.chrom, e))
             });
         }
+        self.prepared = true;
         self
     }
 
@@ -728,6 +734,93 @@ pub struct PreparedBedBlock<'a> {
     order: Order,
 }
 
+/// Immutable storage owned by the caller's cache. Only offsets and copied
+/// metadata are retained, so moving the owner cannot invalidate a view.
+pub(crate) struct OwnedBedBlock {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+    order: Order,
+}
+
+impl OwnedBedBlock {
+    pub(crate) fn new(bytes: Vec<u8>) -> Result<Self> {
+        let mut offsets = Vec::new();
+        let order = BedBlock::parse(&bytes)?.prepare(&mut offsets)?.order;
+        Ok(Self {
+            bytes,
+            offsets,
+            order,
+        })
+    }
+
+    pub(crate) fn view(&self) -> PreparedBedBlock<'_> {
+        PreparedBedBlock {
+            buf: &self.bytes,
+            offsets: &self.offsets,
+            order: self.order,
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.bytes
+            .capacity()
+            .saturating_add(self.offsets.capacity().saturating_mul(size_of::<u32>()))
+    }
+}
+
+pub(crate) struct OwnedWigBlock {
+    bytes: Vec<u8>,
+    chrom: ChromId,
+    start: u32,
+    end: u32,
+    step: u32,
+    span: u32,
+    kind: WigKind,
+    count: u16,
+    order: Order,
+}
+
+impl OwnedWigBlock {
+    pub(crate) fn new(bytes: Vec<u8>) -> Result<Self> {
+        let block = WigBlock::parse(&bytes)?.prepare();
+        let result = Self {
+            chrom: block.chrom,
+            start: block.start,
+            end: block.end,
+            step: block.step,
+            span: block.span,
+            kind: block.kind,
+            count: block.count,
+            order: block.order,
+            bytes,
+        };
+        Ok(result)
+    }
+
+    pub(crate) fn view(&self) -> WigBlock<'_> {
+        WigBlock {
+            buf: &self.bytes,
+            chrom: self.chrom,
+            start: self.start,
+            end: self.end,
+            step: self.step,
+            span: self.span,
+            kind: self.kind,
+            count: self.count,
+            order: self.order,
+            prepared: true,
+        }
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.bytes.capacity()
+    }
+}
+
 impl<'a> PreparedBedBlock<'a> {
     pub fn len(&self) -> usize {
         self.offsets.len()
@@ -917,6 +1010,11 @@ mod fill_tests {
             let got = block.fill_reusing(0, start, &mut actual[1..len + 1], &mut scratch).unwrap();
             prop_assert_eq!(got, count);
             prop_assert!(actual.iter().zip(&expected).all(|(a, b)| a.to_bits() == b.to_bits()));
+            let owned = OwnedWigBlock::new(buf.clone()).unwrap();
+            let mut cached = vec![f32::from_bits(0xDEAD_BEEF); len + 2];
+            let got = owned.view().fill_reusing(0, start, &mut cached[1..len + 1], &mut scratch).unwrap();
+            prop_assert_eq!(got, count);
+            prop_assert!(cached.iter().zip(&expected).all(|(a,b)| a.to_bits() == b.to_bits()));
             // Reuse capacity with a different destination length and window.
             let mut small = [0.0; 17];
             let mut reference = small;
@@ -957,7 +1055,7 @@ pub struct ZoomBlock<'a> {
 
 impl<'a> ZoomBlock<'a> {
     pub fn parse(buf: &'a [u8]) -> Result<ZoomBlock<'a>> {
-        if buf.len() % ZOOM_RECORD_LEN != 0 {
+        if !buf.len().is_multiple_of(ZOOM_RECORD_LEN) {
             return Err(invalid(
                 "zoom block",
                 format!("{} bytes is not a multiple of {ZOOM_RECORD_LEN}", buf.len()),

@@ -17,7 +17,7 @@ use omicsweave_bbi::{
 };
 use omicsweave_core::sidecar::{SourceIdentity, sidecar_path};
 use omicsweave_core::{
-    Error, FileSource, IntervalRead, IntervalsOut, Region, StringColumn, TrackRead,
+    Error, FileSource, IntervalRead, IntervalsOut, Locus, Region, StringColumn, TrackRead,
 };
 use proptest::prelude::*;
 
@@ -186,7 +186,7 @@ fn bigwig_case(seed: u64) {
         let lib = theirs.values(&c.name, 0, c.len).expect("libBigWig values");
         let mut mine = vec![0.0; c.len as usize];
         reader
-            .values(Region::new(&c.name, 0, c.len), &mut mine)
+            .values(&Locus::from(Region::new(&c.name, 0, c.len)), &mut mine)
             .unwrap();
         for (i, t) in truth.iter().enumerate() {
             let want = t.map_or(f32::NAN, |v| v as f32);
@@ -441,7 +441,9 @@ fn empty_files_are_readable() {
         let mut reader = BbiReader::open(FileSource::open(&path).unwrap()).unwrap();
         if kind == Kind::BigWig {
             let mut v = [0.0; 10];
-            reader.values(Region::new("chr1", 0, 10), &mut v).unwrap();
+            reader
+                .values(&Locus::from(Region::new("chr1", 0, 10)), &mut v)
+                .unwrap();
             assert!(v.iter().all(|x| x.is_nan()));
         }
         check_sidecar(&path, &sidecar);

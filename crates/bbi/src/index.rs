@@ -315,11 +315,11 @@ impl<'a> Index<'a> {
             done: start >= end,
             pending: None,
         };
-        if !query.done {
-            if let Err(e) = query.push(self.base + INDEX_HEADER_LEN as u64) {
-                query.done = true;
-                query.pending = Some(e);
-            }
+        if !query.done
+            && let Err(e) = query.push(self.base + INDEX_HEADER_LEN as u64)
+        {
+            query.done = true;
+            query.pending = Some(e);
         }
         query
     }

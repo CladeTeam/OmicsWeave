@@ -3,7 +3,8 @@ use omicsweave_bbi::{
     BIGBED_MAGIC, BIGWIG_MAGIC, BbiReader, CHROM_TREE_MAGIC, Chroms, INDEX_MAGIC, Index,
 };
 use omicsweave_core::{
-    IntervalEntry, IntervalRead, IntervalsOut, ReadAt, Region, StringColumn, TrackEntry, TrackRead,
+    IntervalEntry, IntervalRead, IntervalsOut, Locus, ReadAt, Region, StringColumn, TrackEntry,
+    TrackRead,
 };
 use std::{cell::Cell, rc::Rc};
 
@@ -186,7 +187,7 @@ fn high_level_bigwig_sorts_entries_but_preserves_overwrite_order() {
         let mut reader = BbiReader::open(container(BIGWIG_MAGIC, &blocks, compressed)).unwrap();
         let region = Region::new("s", 0, 40);
         let mut values = [0.0f32; 40];
-        reader.values(region, &mut values).unwrap();
+        reader.values(&Locus::from(region), &mut values).unwrap();
         let mut expected = [f32::NAN; 40];
         for &(start, end, bits) in &records {
             expected[start as usize..end as usize].fill(f32::from_bits(bits));
