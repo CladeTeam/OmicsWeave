@@ -11,7 +11,7 @@ cd "$TEST_DIR"
 
 for version in "$@"; do
     uv python install "$version"
-    uv venv --python "$version" "env-$version"
+    uv venv --managed-python --python "$version" "env-$version"
     PYTHON="$TEST_DIR/env-$version/bin/python"
     uv pip install --python "$PYTHON" "$WHEEL_DIR"/*.whl 'pytest>=8'
     uv pip check --python "$PYTHON"

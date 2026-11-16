@@ -9,9 +9,9 @@ The `CI passed` job is the aggregate status for branch protection.
   latest stable compiler, including the vendored
   reference-tool comparisons. Tests marked `ignore` need external datasets
   or are manual benchmarks and are not part of CI.
-- Release wheels are built for Linux x86_64 / AArch64 (manylinux_2_28) and
-  macOS Intel / Apple Silicon (macOS 11+). The native engine uses Unix APIs;
-  Windows wheels are not built.
+- Release wheels are built for Linux x86_64 / AArch64 (manylinux_2_28,
+  glibc 2.28+). The pinned CellPack dependency unconditionally builds its
+  Linux io_uring runtime; macOS and Windows wheels are not supported.
 - Each wheel is installed into isolated environments outside the checkout
   and tested on CPython 3.12, 3.13, 3.14 and 3.15. The extension uses the
   CPython 3.12 stable ABI, so one wheel serves these Python versions.
@@ -29,7 +29,7 @@ The `CI passed` job is the aggregate status for branch protection.
 3. Create a tag `vMAJOR.MINOR.PATCH` on that commit and publish its GitHub
    Release. For example, version `0.1.0` requires tag `v0.1.0`.
 4. `Publish to PyPI` checks the tag against both package versions, reruns
-   the entire CI workflow, and uploads the four tested wheels and source
+   the entire CI workflow, and uploads the two tested wheels and source
    distribution after all checks pass.
 
 The upload job uses the `pypi` GitHub environment and its `PYPI_API_TOKEN`
