@@ -1,20 +1,26 @@
-"""Planning and running a quantification task."""
+"""A quantification task, its plan, and what a run wrote."""
 
 from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import KW_ONLY, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
-from .. import _native
-from ..annotation import Annotation
+from .. import _budget, _native
+from .._budget import Budget, MemoryPlan
 from ..formats import PathLike
 from ._products import Product
 
-__all__ = ["MemoryPlan", "Plan", "Report", "Task", "plan", "run"]
+if TYPE_CHECKING:
+    from ..annotation import Annotation
+
+__all__ = ["Input", "OutputFile", "Plan", "Report", "Task", "plan", "run"]
+
+Progress = Callable[[str, int, int], None]
+"""Called now and then with (phase, bytes read, bytes total)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,127 +30,154 @@ class Task:
 
     ``annotation`` is needed by gene products (and the ATAC gene activity
     and TSS metrics); ``aliases`` match chromosome names that differ beyond
-    the built-in ``chr1`` ↔ ``1``, ``chrM`` ↔ ``MT`` rules. Matrices are
-    stored as ``matrix`` (``"cpk"``: CellPack, ``"mtx"``: Matrix Market,
-    ``"csv"``: dense). ``reference`` is the genome the BAMs were aligned to
-    (bgzip or plain FASTA with ``.fai`` / ``.gzi``, or 2bit), for labeling
-    junction motifs and methylation calls; ``variants`` a BCF (with its
-    CSI) of known sites, masked when counting conversions and methylation.
+    the built-in ``chr1`` ↔ ``1``, ``chrM`` ↔ ``MT`` rules (annotation name
+    → BAM name). Matrices are stored as ``matrix`` (``"cpk"``: CellPack,
+    ``"mtx"``: Matrix Market, ``"csv"``: dense). ``reference`` is the genome
+    the BAMs were aligned to (bgzip or plain FASTA with ``.fai`` /
+    ``.gzi``, or 2bit), for labeling, junction motifs and methylation
+    calls; ``variants`` a BCF (with its CSI) of known sites, masked when
+    counting conversions and methylation.
     """
 
     inputs: Sequence[PathLike]
     out_dir: PathLike
     products: Sequence[Product] = field(default_factory=tuple)
+    _: KW_ONLY
     annotation: Annotation | None = None
-    aliases: Sequence[tuple[str, str]] | None = None
+    aliases: Mapping[str, str] | None = None
     matrix: Literal["cpk", "mtx", "csv"] = "cpk"
     reference: PathLike | None = None
     variants: PathLike | None = None
 
-    def _native(self) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    def __post_init__(self) -> None:
         if isinstance(self.inputs, (str, os.PathLike)):
-            raise TypeError("inputs is a sequence of paths")
-        args = (
-            [os.fspath(p) for p in self.inputs],
-            os.fspath(self.out_dir),
-            [p._native() for p in self.products],
-        )
-        kwargs = {
-            "annotation": None if self.annotation is None else self.annotation._native,
-            "aliases": None if self.aliases is None else [tuple(a) for a in self.aliases],
-            "matrix": self.matrix,
-            "reference": None if self.reference is None else os.fspath(self.reference),
-            "variants": None if self.variants is None else os.fspath(self.variants),
-        }
-        return args, kwargs
+            raise TypeError("inputs is a sequence of paths, not one path")
+        object.__setattr__(self, "inputs", tuple(self.inputs))
+        object.__setattr__(self, "products", tuple(self.products))
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryPlan:
-    """How a task divides its memory budget, in bytes."""
+class Input:
+    """An input BAM as its header describes it."""
 
-    fixed: int
-    """Feature tables, indexes, whitelists, the annotation."""
-    pipeline: int
-    """Blocks and record batches in flight."""
-    buffer: int
-    """Sort buffers and spools of the products, spilled to disk when full."""
+    path: Path
+    references: tuple[tuple[str, int], ...]
+    """``(name, length)`` by reference id."""
+    read_groups: tuple[str, ...]
+    """The ``ID`` of each ``@RG`` line, in header order."""
+    size: int
+    """Compressed bytes."""
 
 
-@dataclass(frozen=True, slots=True)
-class Plan:
-    """A task checked against its budget."""
+class OutputFile(NamedTuple):
+    """A file a run wrote, with its kind (``bigwig``, ``cpk``, ``mtx``,
+    ``barcodes``, ``features``, ``fragments``, ``tbi``, ``json``, ...)."""
 
-    threads: int
-    memory_budget: int
-    memory: MemoryPlan
-    needs: tuple[str, ...]
-    """What the products read from records (``cigar``, ``tags``, ...)."""
-    stages: tuple[tuple[str, int], ...]
-    """Each accumulator with the buffer bytes it is granted."""
+    kind: str
+    path: Path
 
 
 @dataclass(frozen=True, slots=True)
 class Report:
     """What a finished run wrote."""
 
-    files: tuple[tuple[str, Path], ...]
-    """``(kind, path)`` of every file: ``bigwig``, ``cpk``, ``mtx``,
-    ``barcodes``, ``features``, ``fragments``, ``tbi``, ``json``, ..."""
+    files: tuple[OutputFile, ...]
     records: int
     """Placed records read, every input."""
     bytes_read: int
     seconds: float
+    scan_seconds: float
+    """Of which the pass over the inputs; the rest writes the products."""
     summary: dict[str, Any]
     """The content of ``summary.json``."""
 
 
-def plan(task: Task, *, threads: int | None = None, memory: int | str = "16G") -> Plan:
-    """Checks ``task`` against a budget of ``threads`` (default: every core)
-    and ``memory``, reading only the BAM headers (and building the feature
-    spaces); raises when the smallest working set does not fit."""
-    args, kwargs = task._native()
-    t, budget, fixed, pipeline, buffer, needs, stages = _native.plan_quant(
-        *args, **kwargs, threads=threads, memory=str(memory)
+class Plan:
+    """A task checked against its budget: the BAM headers read and the
+    feature spaces built. :meth:`run` makes the pass, as often as asked."""
+
+    __slots__ = ("_native", "task")
+
+    def __init__(self, task: Task, native: Any) -> None:
+        self.task = task
+        self._native = native
+
+    @property
+    def budget(self) -> Budget:
+        return _budget.budget(self._native.budget)
+
+    @property
+    def memory(self) -> MemoryPlan:
+        return _budget.memory_plan(self._native.memory)
+
+    @property
+    def needs(self) -> tuple[str, ...]:
+        """What the products read from records (``cigar``, ``tags``, ...)."""
+        return tuple(self._native.needs)
+
+    @property
+    def stages(self) -> tuple[tuple[str, int], ...]:
+        """Each accumulator with the buffer bytes it is granted."""
+        return tuple((n, b) for n, b in self._native.stages)
+
+    @property
+    def inputs(self) -> tuple[Input, ...]:
+        return tuple(
+            Input(Path(p), tuple(refs), tuple(groups), size)
+            for p, refs, groups, size in self._native.inputs
+        )
+
+    def run(self, *, progress: Progress | None = None) -> Report:
+        """One pass over each input, then every product is written; the
+        files appear only once all of them are. The output does not depend
+        on the number of threads."""
+        files, records, bytes_read, seconds, scan, summary = self._native.run(progress)
+        return Report(
+            tuple(OutputFile(k, Path(p)) for k, p in files),
+            records,
+            bytes_read,
+            seconds,
+            scan,
+            json.loads(summary),
+        )
+
+    def __reduce__(self) -> Any:
+        raise TypeError("a quantification plan is process-local; plan the task again")
+
+    def __repr__(self) -> str:
+        b = self.budget
+        return f"<quant.Plan {len(self.task.inputs)} inputs, {b.threads} threads, {b.memory} B>"
+
+
+def plan(
+    task: Task,
+    *,
+    threads: int | None = None,
+    memory: int | str | None = None,
+    tmp_dir: PathLike | None = None,
+) -> Plan:
+    """Checks ``task`` against a budget of ``threads`` (default: every core
+    the process may run on) and ``memory`` (bytes or a size such as
+    ``"16G"``; default 4 GiB), reading only the BAM headers (and building
+    the feature spaces); raises when the smallest working set does not fit.
+    Products spill to ``tmp_dir`` (default: the output directory) when they
+    outgrow their share of memory."""
+    native = _native.QuantPlan(
+        task,
+        threads=_budget.threads(threads),
+        memory=_budget.memory(memory),
+        tmp_dir=_budget.path(tmp_dir),
     )
-    return Plan(
-        t,
-        budget,
-        MemoryPlan(fixed, pipeline, buffer),
-        tuple(needs),
-        tuple((n, b) for n, b in stages),
-    )
+    return Plan(task, native)
 
 
 def run(
     task: Task,
     *,
     threads: int | None = None,
-    memory: int | str = "16G",
+    memory: int | str | None = None,
     tmp_dir: PathLike | None = None,
-    progress: Callable[[str, int, int], None] | None = None,
+    progress: Progress | None = None,
 ) -> Report:
-    """Runs ``task``: one pass over each input, then every product is
-    written; the files appear only once all of them are.
-
-    Products spill to ``tmp_dir`` (default: the output directory) when they
-    outgrow their share of ``memory``. The output does not depend on
-    ``threads``. ``progress`` is called now and then with (phase, bytes
-    read, bytes total).
-    """
-    args, kwargs = task._native()
-    files, records, bytes_read, seconds, summary = _native.quantify(
-        *args,
-        **kwargs,
-        threads=threads,
-        memory=str(memory),
-        tmp_dir=None if tmp_dir is None else os.fspath(tmp_dir),
-        progress=progress,
-    )
-    return Report(
-        tuple((k, Path(p)) for k, p in files),
-        records,
-        bytes_read,
-        seconds,
-        json.loads(summary),
-    )
+    """Plans ``task`` (see :func:`plan`) and runs it."""
+    return plan(task, threads=threads, memory=memory, tmp_dir=tmp_dir).run(progress=progress)

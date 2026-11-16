@@ -3,6 +3,7 @@ sorted BAM, checked against counts computed here."""
 
 import gzip
 import json
+import pickle
 import random
 
 import numpy as np
@@ -95,12 +96,14 @@ def test_coverage_and_single_cell_genes(data):
     tmp, recs, bam, ann = data
     out = tmp / "out"
     task = quant.Task(
-        [bam], out, [quant.Coverage(), quant.Genes("single-cell")], annotation=ann, matrix="mtx"
+        [bam], out, [quant.Coverage(), quant.Counts.rna_single_cell()], annotation=ann, matrix="mtx"
     )
     p = quant.plan(task, threads=2, memory="256M")
     assert [s[0] for s in p.stages] == ["coverage", "genes"]
-    assert p.memory.fixed + p.memory.pipeline + p.memory.buffer == p.memory_budget
-    report = quant.run(task, threads=2, memory="256M")
+    assert p.memory.total == p.budget.memory == 256 << 20
+    assert p.budget.threads == 2
+    assert [i.path for i in p.inputs] == [bam]
+    report = p.run()
     assert report.records == len(recs)
     kinds = {k for k, _ in report.files}
     assert {"bigwig", "mtx", "barcodes", "features", "json"} <= kinds
@@ -178,7 +181,7 @@ def test_refusals(tmp_path, data):
     with pytest.raises(OmicsWeaveError, match="needs at least"):
         quant.plan(task, threads=4, memory="4M")
     with pytest.raises(OmicsWeaveError, match="annotation"):
-        quant.plan(quant.Task([bam], tmp_path / "o", [quant.Genes()]))
+        quant.plan(quant.Task([bam], tmp_path / "o", [quant.Counts.rna_single_cell()]))
     assert main(["quant", str(bam), "-o", str(tmp_path / "x")]) == 2
 
 
@@ -280,7 +283,7 @@ def test_splicing_and_labeling(tmp_path, capsys):
     task = quant.Task(
         [bam],
         tmp_path / "p",
-        [quant.Genes(velocity=True, labeled=quant.Labeled()), quant.Labeling()],
+        [quant.Counts.rna_single_cell(velocity=True, labeled=quant.Labeled()), quant.Labeling()],
         annotation=Annotation.read(gtf),
         reference=ref,
     )
@@ -288,7 +291,7 @@ def test_splicing_and_labeling(tmp_path, capsys):
     with pytest.raises(OmicsWeaveError, match="velocity and labeled layers"):
         quant.plan(
             quant.Task(
-                [bam], tmp_path / "p", [quant.Counts("x", "bins", bin_size=100, velocity=True)]
+                [bam], tmp_path / "p", [quant.Counts(quant.Bins(100), name="x", velocity=True)]
             )
         )
 
@@ -471,3 +474,102 @@ def test_hic_and_alleles(tmp_path):
         assert _layer(out / "alleles", layer) == want[layer], layer
     table = gzip.decompress((out / "alleles/variants.tsv.gz").read_bytes()).decode().splitlines()
     assert len(table) == 4 and table[0].startswith("chrom\tpos\tref\talt")
+
+
+def test_regions_count_as_their_own_features(data):
+    tmp, _, bam, _ = data
+    size = 2_000
+    chroms = [c for c, _ in CHROMS]
+    seqid, start, end = [], [], []
+    for i, (_, n) in enumerate(CHROMS):
+        for s in range(0, n, size):
+            seqid.append(i)
+            start.append(s)
+            end.append(min(s + size, n))
+    tiles = ow.annotation.IntervalSet.from_arrays(
+        chroms, np.array(seqid), np.array(start), np.array(end)
+    )
+    task = quant.Task(
+        [bam],
+        tmp / "regions",
+        [
+            quant.Counts.chip(quant.Bins(size), name="bins"),
+            quant.Counts.chip(quant.Regions(tiles), name="regions"),
+        ],
+        matrix="mtx",
+    )
+    quant.run(task, threads=2, memory="256M")
+    bins = read_10x(tmp / "regions" / "bins")
+    assert bins and read_10x(tmp / "regions" / "regions") == bins
+
+
+def test_presets_come_from_the_native_layer():
+    single, bulk = quant.Counts.rna_single_cell(), quant.Counts.rna_bulk(unit="pair")
+    assert (single.rows, single.dedup, single.strand) == ("CB", "umi", "forward")
+    assert single.filter.unique and isinstance(single.features, quant.GeneExons)
+    assert (bulk.rows, bulk.unit, bulk.table, bulk.strand) == ("@file", "pair", True, "unstranded")
+    chip = quant.Counts.chip(quant.Peaks("p.bb"))
+    assert chip.features == quant.Peaks("p.bb") and chip.multi_overlap
+    assert quant.Atac().gene_activity == quant.GeneActivity(2000, 0)
+    assert quant.Alleles.bulk("s.bcf").unit == "fragment"
+    assert quant.JunctionMatrix.bulk().rows == "@file"
+    assert quant.Contacts().resolutions[-1] == 5_000
+
+
+def test_products_are_checked_by_the_native_layer(data):
+    tmp, _, bam, _ = data
+
+    def plan(*products):
+        return quant.plan(quant.Task([bam], tmp / "x", products), memory="256M")
+
+    with pytest.raises(ValueError, match="split strands"):
+        plan(quant.Coverage(strand="forward"))
+    with pytest.raises(ValueError, match="fragment unit"):
+        plan(quant.Coverage(max_fragment=500))
+    with pytest.raises(ValueError, match="strand must be"):
+        plan(quant.Coverage(strands="split", strand="sense"))
+    with pytest.raises(ValueError, match="two characters"):
+        plan(quant.Counts(quant.Bins(1000), umi_tag="UMI"))
+    with pytest.raises(ValueError, match="none or umi"):
+        plan(quant.Junctions(matrix=quant.JunctionMatrix(dedup="position")))
+    with pytest.raises(AttributeError):
+        quant.plan(quant.Task([bam], tmp / "x", [object()]))
+
+
+def test_a_plan_runs_without_planning_again(data):
+    tmp, recs, bam, _ = data
+    p = quant.plan(quant.Task([bam], tmp / "once", [quant.Coverage()]), threads=1, memory="256M")
+    ((path, refs, groups, size),) = [
+        (i.path, i.references, i.read_groups, i.size) for i in p.inputs
+    ]
+    assert path == bam and refs == tuple(CHROMS) and groups == () and size > 0
+    report = p.run(progress=lambda *a: None)
+    assert report.records == len(recs) and 0 <= report.scan_seconds <= report.seconds
+    assert [f.kind for f in report.files if f.path.name == "coverage.bw"] == ["bigwig"]
+    with pytest.raises(TypeError, match="process-local"):
+        pickle.dumps(p)
+
+
+def test_a_subset_of_the_annotation_picks_the_genes(data):
+    tmp, _, bam, ann = data
+    only_a = ann.subset(genes=["A"])
+    task = quant.Task(
+        [bam],
+        tmp / "subset",
+        [
+            quant.Counts.rna_single_cell(name="all"),
+            quant.Counts.rna_single_cell(name="a", subset=only_a, velocity=True),
+        ],
+        annotation=ann,
+        matrix="mtx",
+    )
+    quant.run(task, threads=2, memory="256M")
+    every, a = read_10x(tmp / "subset" / "all"), read_10x(tmp / "subset" / "a")
+    assert a and {f for _, f in a} == {"A"}
+    assert a == {k: v for k, v in every.items() if k[1] == "A"}
+    other = Annotation.read(tmp / "genes.gtf").subset(genes=["C"])
+    rows = type(other)(other.genes + 10, other.transcripts)
+    with pytest.raises(OmicsWeaveError, match="rows of the annotation"):
+        quant.plan(
+            quant.Task([bam], tmp / "x", [quant.Counts.rna_bulk(subset=rows)], annotation=ann)
+        )
