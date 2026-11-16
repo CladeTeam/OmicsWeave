@@ -29,6 +29,11 @@ A :class:`Task` names the BAMs, the products and the output directory;
 must be sorted by coordinate (``ow convert in.bam sorted.bam --sort``).
 The native layer does the work; the results do not depend on the number of
 threads.
+
+Molecule deduplication encodes uppercase ACGT UMIs up to 31 bases without
+collisions. Other UMIs use 63-bit fingerprints; read-name-based molecule
+keys use 64-bit fingerprints. Fingerprint collisions are not disambiguated.
+Matching the two mates of a pair compares their full read names separately.
 """
 
 from ._products import (

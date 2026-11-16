@@ -142,6 +142,9 @@ class Counts:
       (genes; velocyto / STARsolo ``Velocyto`` rules), written as
       ``spliced.cpk`` etc. beside ``matrix.cpk``.
     - ``labeled``: add a ``labeled`` layer (:class:`Labeled`).
+
+    UMI and molecule identity follows the encoding and fingerprint rules
+    documented in :mod:`omicsweave.quant`.
     """
 
     name: str
@@ -563,8 +566,9 @@ class Alleles:
     ``variants.tsv.gz`` (per site: REF / ALT / other units, ALT fraction),
     and with ``genes`` (needs an annotation) ``<name>/genes/``.
 
-    ``unit``: ``"molecule"`` (distinct ``umi_tag`` values) or
-    ``"fragment"`` (distinct read names: a pair once). Bases below
+    ``unit``: ``"molecule"`` (UMI-based) or
+    ``"fragment"`` (read-name-based: a pair once), with the identity
+    encoding documented in :mod:`omicsweave.quant`. Bases below
     ``min_quality`` are not counted. :meth:`bulk` gives the per-BAM
     defaults.
     """
