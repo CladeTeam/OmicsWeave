@@ -11,6 +11,9 @@
 //!   [`Writer::new_streaming`] omits that directory for non-indexed output.
 //! - [`Reader`]: inflates consecutive blocks of a stream ahead of the
 //!   reader through an [`omicsweave_core::exec`] queue.
+//! - [`Scanner`]: a whole stream front to back with the [`Logical`]
+//!   position of every byte consumed (and the block directory resolving
+//!   them), for sequential record decoders and index builders.
 //! - [`BinningIndex`]: the BAI / CSI index htslib builds from the same
 //!   records.
 //! - [`BinIndex`], [`SeekReader`], [`ChunkWalk`]: a BAI / CSI index loaded,
@@ -20,6 +23,7 @@
 mod bins;
 mod index;
 mod reader;
+mod scan;
 mod seek;
 mod writer;
 
@@ -30,6 +34,7 @@ use omicsweave_core::{Error, Result};
 pub use bins::{BinIndex, Chunk, ChunkWalk, IndexKind, locate_index};
 pub use index::{BinningIndex, IndexFormat, try_csi_levels, try_reg2bin};
 pub use reader::{Reader, is_bgzf, read_block};
+pub use scan::{Scanner, inflate_queue};
 pub use seek::{SeekReader, SeekStats};
 pub use writer::{Blocks, Finished, Logical, Writer};
 
