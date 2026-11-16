@@ -20,10 +20,7 @@ type ZoomKey = (u32, u32, ContactUnit, u32);
 const CACHE_BYPASS: &str = "hic cache admission bypass";
 
 fn cache_limit_error(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::Unsupported(CACHE_BYPASS) | Error::Inflate("block output limit exceeded")
-    ) || matches!(error, Error::Invalid { what: "hic cache", detail } if detail == "block record limit exceeded" || detail == "cached block exceeds current limits")
+    matches!(error, Error::Unsupported(CACHE_BYPASS))
 }
 
 /// A `.hic` file (v8 or v9). Opening reads the header and the footer's
@@ -184,8 +181,8 @@ impl<S: ReadAt> HicReader<S> {
         self.context_with_source(self.source.clone())
     }
 
-    /// Records selected from prepared blocks in the most recent cached query.
-    /// This excludes unrelated records skipped by the row/column index.
+    /// Records inspected in the most recent cached query. A broad query may
+    /// scan wire order; narrow queries exclude records skipped by the indexes.
     pub fn cached_records_visited(&self) -> usize {
         self.cached_records_visited
     }
@@ -319,19 +316,19 @@ impl<S: ReadAt> HicReader<S> {
                 (entry.position - loaded.as_ref().expect("read batch populated").start) as usize;
             *inflated = None;
             self.block_inflations = self.block_inflations.saturating_add(1);
-            if let Err(error) = inflater.inflate_limited(
-                &raw[at..at + entry.size as usize],
-                &mut block,
-                limits.max_inflated_bytes,
-            ) {
-                if !self.strict_cache_limits
-                    && error == Error::Inflate("block output limit exceeded")
-                {
-                    return Err(Error::Unsupported(CACHE_BYPASS));
-                }
-                return Err(error);
+            let compressed = &raw[at..at + entry.size as usize];
+            if self.strict_cache_limits {
+                inflater.inflate_limited(compressed, &mut block, limits.max_inflated_bytes)?;
+            } else {
+                // Admission thresholds select storage, not valid query inputs.
+                // The fallback needs the complete wire block too, so retain
+                // this one inflation when a prepared index is too expensive.
+                inflater.inflate(compressed, &mut block)?;
             }
             *inflated = Some(request.key);
+            if block.len() > limits.max_inflated_bytes {
+                return Err(Error::Unsupported(CACHE_BYPASS));
+            }
             if PreparedBlock::estimated_heap_bytes(self.header.version, &block)
                 .and_then(|heap| heap.checked_add(512))
                 .is_none_or(|charge| charge > max_bytes)

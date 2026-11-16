@@ -335,7 +335,40 @@ fn cache_preparation_limits_do_not_reject_larger_valid_blocks() {
         let mut requests = Vec::new();
         reader.cache_plan(q, &mut requests).unwrap();
         assert!(reader.load_cached_block(&requests[0]).unwrap().is_none());
+        let inflations = reader.block_inflations();
         assert_eq!(matrix(&mut reader, q), expected);
+        assert_eq!(
+            reader.block_inflations() - inflations,
+            requests.len() as u64,
+            "admission fallback inflates each dependency once"
+        );
         assert_eq!(cache.stats().resident_entries, 0);
+    }
+}
+
+#[test]
+fn strict_limits_return_the_first_decode_error_without_retrying() {
+    for limits in [
+        HicCacheLimits {
+            max_inflated_bytes: 1,
+            max_records: 1,
+        },
+        HicCacheLimits {
+            max_inflated_bytes: 1 << 20,
+            max_records: 1,
+        },
+    ] {
+        let source = Counted::new(fixture(9, 1.0));
+        let mut reader = HicReader::open(source)
+            .unwrap()
+            .with_cache(Arc::new(BlockCache::new(32 << 20, 1000)));
+        reader.set_cache_limits(limits).unwrap();
+        let before = reader.block_inflations();
+        assert!(
+            reader
+                .matrix(query("a", "a", 2, 7), &mut [0.0; 25])
+                .is_err()
+        );
+        assert_eq!(reader.block_inflations() - before, 1);
     }
 }

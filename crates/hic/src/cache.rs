@@ -94,6 +94,45 @@ mod tests {
             assert!(PreparedBlock::decode(version, &bytes, 1).unwrap().is_none());
         }
     }
+
+    #[test]
+    fn narrow_columns_skip_unrelated_rows_and_keep_wire_order() {
+        let records: Vec<_> = (0..8192i16).rev().map(|y| (y % 16, y, 0.5)).collect();
+        for version in [8, 9] {
+            let bytes = literal(version, &records);
+            let block = PreparedBlock::decode(version, &bytes, records.len())
+                .unwrap()
+                .unwrap();
+            assert!(
+                block.allocated_bytes()
+                    <= PreparedBlock::estimated_heap_bytes(version, &bytes).unwrap()
+            );
+            for x in [10..11, 17..18] {
+                let first = block
+                    .columns
+                    .partition_point(|&i| block.records[i].x < x.start);
+                let last = block
+                    .columns
+                    .partition_point(|&i| block.records[i].x < x.end);
+                println!(
+                    "v{version}: covered rows={}, column candidates={}",
+                    block.rows.len(),
+                    last - first
+                );
+                assert!(last - first < block.rows.len());
+                let mut actual = Vec::new();
+                block.visit(&x, &(0..8192), false, &mut Vec::new(), |a, b, v| {
+                    actual.push((a, b, v));
+                });
+                let expected: Vec<_> = records
+                    .iter()
+                    .filter(|&&(a, _, _)| x.contains(&(a as u32)))
+                    .map(|&(a, b, v)| (a as u32, b as u32, v))
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 }
 
 impl Default for HicCacheLimits {
@@ -147,6 +186,9 @@ pub struct PreparedBlock {
     records: Vec<Record>,
     order: Vec<usize>,
     rows: Vec<Row>,
+    /// Wire ordinals sorted by x, allowing a narrow column to bypass rows
+    /// that cannot contribute. Single-row blocks need only their row index.
+    columns: Vec<usize>,
 }
 
 impl PreparedBlock {
@@ -219,6 +261,7 @@ impl PreparedBlock {
         capacity(records)?
             .checked_mul(std::mem::size_of::<Record>())?
             .checked_add(records.checked_mul(std::mem::size_of::<usize>())?)?
+            .checked_add(records.checked_mul(std::mem::size_of::<usize>())?)?
             .checked_add(capacity(rows)?.checked_mul(std::mem::size_of::<Row>())?)
     }
 
@@ -279,11 +322,22 @@ impl PreparedBlock {
             });
             first = end;
         }
+        let mut columns = Vec::new();
+        if rows.len() > 1 {
+            columns
+                .try_reserve_exact(records.len())
+                .map_err(|_| Error::invalid("hic cache", "column allocation failed"))?;
+            columns.extend(0..records.len());
+            if !records.windows(2).all(|w| w[0].x <= w[1].x) {
+                columns.sort_unstable_by_key(|&i| (records[i].x, i));
+            }
+        }
         Ok(Some(Self {
             wire_bytes: bytes.len(),
             records,
             order,
             rows,
+            columns,
         }))
     }
 
@@ -302,6 +356,11 @@ impl PreparedBlock {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Row>()),
             )
+            .saturating_add(
+                self.columns
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
     }
 
     pub fn len(&self) -> usize {
@@ -318,7 +377,31 @@ impl PreparedBlock {
 
     fn select(&self, x: &Range<u32>, y: &Range<u32>, selected: &mut Vec<usize>) {
         let first = self.rows.partition_point(|r| r.y < y.start);
-        for row in self.rows[first..].iter().take_while(|r| r.y < y.end) {
+        let last = first + self.rows[first..].partition_point(|r| r.y < y.end);
+        if first == last {
+            return;
+        }
+        // A handful of row searches costs less than another pair of
+        // whole-block binary searches on ordinary compact rectangles.
+        if last - first > 8 && !self.columns.is_empty() {
+            let lo = self
+                .columns
+                .partition_point(|&i| self.records[i].x < x.start);
+            let hi = self.columns.partition_point(|&i| self.records[i].x < x.end);
+            // Each covered row otherwise costs two binary searches. Scan the
+            // column candidates only when there are no more than those rows;
+            // wire ordering is restored once after both symmetric selections.
+            if hi - lo <= last - first {
+                selected.extend(
+                    self.columns[lo..hi]
+                        .iter()
+                        .copied()
+                        .filter(|&i| y.contains(&self.records[i].y)),
+                );
+                return;
+            }
+        }
+        for row in &self.rows[first..last] {
             let entries = &self.order[row.range.clone()];
             let lo = entries.partition_point(|&i| self.records[i].x < x.start);
             let hi = entries.partition_point(|&i| self.records[i].x < x.end);
@@ -335,22 +418,52 @@ impl PreparedBlock {
         mut emit: impl FnMut(u32, u32, f32),
     ) -> usize {
         selected.clear();
-        self.select(x, y, selected);
-        if intra {
-            self.select(y, x, selected);
-        }
-        if !selected.is_sorted() {
-            selected.sort_unstable();
-        }
-        selected.dedup();
-        for &i in selected.iter() {
-            let r = self.records[i];
+        let mut emit_record = |r: &Record| {
             if x.contains(&r.x) && y.contains(&r.y) {
                 emit(r.x, r.y, r.value);
             }
             if intra && r.x != r.y && x.contains(&r.y) && y.contains(&r.x) {
                 emit(r.y, r.x, r.value);
             }
+        };
+        let x_order = if self.columns.is_empty() {
+            &self.order
+        } else {
+            &self.columns
+        };
+        if let (Some(&first), Some(&last), Some(first_row), Some(last_row)) = (
+            x_order.first(),
+            x_order.last(),
+            self.rows.first(),
+            self.rows.last(),
+        ) && x.start <= self.records[first].x
+            && x.end > self.records[last].x
+            && y.start <= first_row.y
+            && y.end > last_row.y
+        {
+            for record in &self.records {
+                emit_record(record);
+            }
+            return self.records.len();
+        }
+        self.select(x, y, selected);
+        if intra {
+            self.select(y, x, selected);
+        }
+        // A broad query is cheaper in wire order than sorting a large list
+        // of selected ordinals; this also bounds work for mirrored overlap.
+        if selected.len() > self.records.len() / 2 {
+            for record in &self.records {
+                emit_record(record);
+            }
+            return self.records.len();
+        }
+        if !selected.is_sorted() {
+            selected.sort_unstable();
+        }
+        selected.dedup();
+        for &i in selected.iter() {
+            emit_record(&self.records[i]);
         }
         selected.len()
     }
