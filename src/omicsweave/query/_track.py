@@ -11,7 +11,7 @@ import numpy as np
 from .. import _native
 from ..cache import BlockCache, BlockKey
 from ..cache import native as native_cache
-from ..errors import InvalidError
+from ..errors import InvalidError, UnknownChromError
 from ..formats import BigWig, BigWigSummary, PathLike
 from ..types import LocusLike, RegionLike, Signal, SignalBins, SignalIntervals, Stat
 from ..types._genome import Locus, as_locus, as_region, native_key
@@ -91,6 +91,10 @@ class TrackReader(CachedReader):
         """
         key = as_locus(locus)
         if out is None:
+            if self.closed:
+                raise ValueError("I/O operation on closed file")
+            if key.chrom not in self._chroms:
+                raise UnknownChromError(f"unknown chromosome {key.chrom!r}", chrom=key.chrom)
             out = np.empty(len(key), dtype=np.float32)
         self._native.values(native_key(key), out)
         return Signal(key, out)
@@ -123,6 +127,10 @@ class TrackReader(CachedReader):
         stats = _stats(stats)
         n = _bin_count(len(key), resolution, phase)
         if out is None:
+            if self.closed:
+                raise ValueError("I/O operation on closed file")
+            if key.chrom not in self._chroms:
+                raise UnknownChromError(f"unknown chromosome {key.chrom!r}", chrom=key.chrom)
             out = np.empty((len(stats), n), dtype=np.float32)
         self._native.bins(native_key(key), resolution, phase, [str(s) for s in stats], exact, out)
         return SignalBins(key, int(resolution), int(phase), stats, out)

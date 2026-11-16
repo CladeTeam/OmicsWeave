@@ -84,9 +84,9 @@ class AlignmentReader(CachedReader):
     names and qualities need no reference, and CRAMs with embedded or no
     reference need none at all. BAM takes no reference.
 
-    ``cache`` optionally supplies caller-owned decoded BGZF blocks (BAM
-    only). The file and its index must remain unchanged throughout the
-    reader session.
+    ``cache`` optionally supplies caller-owned decoded BGZF blocks (BAM)
+    or prepared containers and decoded slices (CRAM). The file, index and
+    reference must remain unchanged throughout the reader session.
     """
 
     def __init__(
@@ -112,22 +112,26 @@ class AlignmentReader(CachedReader):
         self.index = detect(native.index_path)
 
     def set_cache(self, cache: BlockCache | None) -> None:
-        """Attach externally owned BGZF blocks, or detach them with None
-        (a CRAM takes none)."""
+        """Attach externally owned query blocks, or detach them with None."""
         self._native.set_cache(native_cache(cache))
 
-    def describe_cache(self, region: RegionLike) -> tuple[BlockKey, ...]:
-        """The physical BGZF dependencies of the indexed chunks."""
+    def describe_cache(
+        self, region: RegionLike, fields: Fields = NO_FIELDS
+    ) -> tuple[BlockKey, ...]:
+        """Dependencies for the region and fields; BAM uses physical BGZF
+        blocks, CRAM also distinguishes the selected data series."""
         r = as_region(region)
-        return tuple(self._native.describe_cache(r.chrom, r.start, r.end))
+        return tuple(self._native.describe_cache(r.chrom, r.start, r.end, int(_fields(fields))))
 
-    def prefetch_cache(self, region: RegionLike) -> None:
-        """Load reusable BGZF blocks without constructing alignment output."""
+    def prefetch_cache(self, region: RegionLike, fields: Fields = NO_FIELDS) -> None:
+        """Load dependencies without constructing alignment output. For
+        CRAM, use the same fields as the subsequent fetch."""
         r = as_region(region)
-        self._native.prefetch_cache(r.chrom, r.start, r.end)
+        self._native.prefetch_cache(r.chrom, r.start, r.end, int(_fields(fields)))
 
     def stream_stats(self) -> dict[str, int]:
-        """Physical reads, inflations and buffer movement in this context."""
+        """Physical work in this context: BAM block inflations and buffer
+        movement, or CRAM container/slice decoding and candidate records."""
         return self._native.stream_stats()
 
     def reset_stream_stats(self) -> None:

@@ -11,6 +11,7 @@ import numpy as np
 from .. import _native
 from ..cache import BlockCache, BlockKey
 from ..cache import native as native_cache
+from ..errors import UnknownChromError
 from ..formats import Hic, PathLike
 from ..types import BinUnit, ContactMatrix, ContactPixels, ContactWindow
 from ._base import CachedReader, resolve
@@ -93,6 +94,13 @@ class ContactReader(CachedReader):
         the returned matrix references that same array.
         """
         if out is None:
+            if self.closed:
+                raise ValueError("I/O operation on closed file")
+            for region in (window.rows, window.cols):
+                if region.chrom not in self._chroms:
+                    raise UnknownChromError(
+                        f"unknown chromosome {region.chrom!r}", chrom=region.chrom
+                    )
             out = np.empty(window.shape, dtype=np.float32)
         self._native.matrix(_tile(window), out, window.rows.is_reverse, window.cols.is_reverse)
         return ContactMatrix(window, out)

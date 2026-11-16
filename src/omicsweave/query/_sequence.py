@@ -91,12 +91,15 @@ class SequenceReader(CachedReader):
         key = as_locus(locus)
         native = native_key(key)
         if out is None:
+            if self.closed:
+                raise ValueError("I/O operation on closed file")
             length = len(key)
             if length <= 4096:
                 out = self._native.fetch(native)
             else:
                 # Long reads amortize the call boundary; empty storage avoids
                 # a separate zero-fill before the decoder overwrites it.
+                length = self._native.sequence_length(native)
                 out = np.empty(length, dtype=np.uint8)
                 self._native.sequence(native, out)
         else:
