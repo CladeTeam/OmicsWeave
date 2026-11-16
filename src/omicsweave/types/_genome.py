@@ -216,11 +216,11 @@ def as_locus(key: LocusLike) -> Locus:
     return as_region(key)
 
 
-def native_key(locus: Locus) -> tuple[str, list[tuple[int, int]], str]:
+def native_key(locus: Locus) -> tuple[str, tuple[tuple[int, int], ...], str]:
     """The ``(chrom, spans, strand)`` the native readers take."""
     if isinstance(locus, Region):
-        return (locus.chrom, [(locus.start, locus.end)], locus.strand)
-    return (locus.chrom, list(locus.spans), locus.strand)
+        return (locus.chrom, ((locus.start, locus.end),), locus.strand)
+    return (locus.chrom, locus.spans, locus.strand)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
