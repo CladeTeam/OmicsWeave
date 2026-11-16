@@ -7,7 +7,7 @@
 **From genomic files to model inputs — one region query away.**
 
 [![CI](https://github.com/CladeTeam/OmicsWeave/actions/workflows/ci.yml/badge.svg)](https://github.com/CladeTeam/OmicsWeave/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/omicsweave.svg)](https://pypi.org/project/omicsweave/)
+[![PyPI](https://img.shields.io/pypi/v/omicsweave)](https://pypi.org/project/omicsweave/)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://pypi.org/project/omicsweave/)
 [![Platform](https://img.shields.io/badge/platform-linux%20x86__64%20%7C%20aarch64-lightgrey.svg)](#installation)
 [![Engine](https://img.shields.io/badge/engine-Rust-orange.svg)](https://github.com/CladeTeam/OmicsWeave/tree/main/crates)
