@@ -40,7 +40,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from omicsweave.cache import BlockCache
 from omicsweave.formats import BgzipFasta, BigBed, BigWig
 from omicsweave.query import IntervalReader, SequenceReader, TrackReader
-from omicsweave.types import Region
+from omicsweave.types import Intervals, Region
 
 # Chromosome splits: whole chromosomes, so neighbouring windows never leak.
 SPLITS = {
@@ -61,12 +61,14 @@ def one_hot(bases: np.ndarray) -> np.ndarray:
     return _ONE_HOT[_CODE[bases]]
 
 
-def bin_coverage(start: np.ndarray, end: np.ndarray, region: Region, resolution: int) -> np.ndarray:
-    """0/1 per ``resolution``-base bin of ``region``: covered by any interval."""
+def bin_coverage(peaks: Intervals, resolution: int) -> np.ndarray:
+    """0/1 per ``resolution``-base bin of the queried region: covered by any
+    of ``peaks``, fetched with ``clip=True`` so they lie inside it."""
+    region = peaks.region
     nbins = -(-len(region) // resolution)
     # Columns are uint32: widen before subtracting.
-    start = np.clip(start.astype(np.int64), region.start, region.end) - region.start
-    end = np.clip(end.astype(np.int64), region.start, region.end) - region.start
+    start = peaks.start.astype(np.int64) - region.start
+    end = peaks.end.astype(np.int64) - region.start
     nonempty = start < end
     first, last = start[nonempty] // resolution, -(-end[nonempty] // resolution)
     edges = np.zeros(nbins + 1, np.int32)
@@ -196,7 +198,7 @@ class PeakWindows(Sampler[tuple[Region, int]]):
         items = []
         with IntervalReader(self.union) as peaks:
             for chrom, size in self.chroms.items():
-                hits = peaks.fetch((chrom, 0, size))
+                hits = peaks.fetch((chrom, 0, size))  # whole peaks: centres as stored
                 for centre in (hits.start.astype(np.int64) + hits.end) // 2:
                     s = int(np.clip(centre - half, 0, size - self.length))
                     items.append((Region(chrom, s, s + self.length), 1))
@@ -232,10 +234,7 @@ class PeakDataset(Dataset):
     def __getitem__(self, item: tuple[Region, int]) -> dict[str, np.ndarray]:
         region, label = item
         sequence, peak_sets = self._open()
-        rows = [
-            bin_coverage(h.start, h.end, region, self.resolution)
-            for h in (p.fetch(region) for p in peak_sets)
-        ]
+        rows = [bin_coverage(p.fetch(region, clip=True), self.resolution) for p in peak_sets]
         coverage = (
             np.stack(rows)
             if rows
