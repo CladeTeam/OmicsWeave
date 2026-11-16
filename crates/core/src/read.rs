@@ -45,10 +45,12 @@ pub trait TrackRead {
     /// are decoded once for all bins and statistics.
     fn bins(&mut self, locus: &Locus<'_>, spec: &BinSpec<'_>, out: &mut [f32]) -> Result<()>;
 
-    /// Decodes the intervals with data in `region` once, clipped to it, in
-    /// position order, and holds them in the reader until the next query.
-    /// Returns how many there are, for the caller to allocate.
-    fn query_entries(&mut self, region: Region<'_>) -> Result<usize>;
+    /// Decodes the intervals with data in `region` once, in position order,
+    /// and holds them in the reader until the next query. With `clip` each
+    /// interval is cut to `region`, so the values cover exactly the queried
+    /// bases; without it the intervals keep their stored bounds. Returns how
+    /// many there are, for the caller to allocate.
+    fn query_entries(&mut self, region: Region<'_>, clip: bool) -> Result<usize>;
 
     /// Copies the intervals of the last [`TrackRead::query_entries`] into
     /// `out`, whose length must equal that count. Only copies: nothing is
@@ -57,13 +59,14 @@ pub trait TrackRead {
 }
 
 /// Interval features (bigBed). Entries are the features overlapping
-/// the region, unclipped, ordered by start; an empty region, or a chromosome
-/// without features (including one the source never names), yields none.
+/// the region, ordered by start; an empty region, or a chromosome without
+/// features (including one the source never names), yields none.
 pub trait IntervalRead {
     /// Decodes the features of `region` once and holds them in the reader
-    /// until the next query. Returns the output sizes, for the caller to
+    /// until the next query. Features keep their stored bounds unless `clip`
+    /// cuts them to `region`. Returns the output sizes, for the caller to
     /// allocate.
-    fn query(&mut self, region: Region<'_>) -> Result<IntervalSize>;
+    fn query(&mut self, region: Region<'_>, clip: bool) -> Result<IntervalSize>;
 
     /// Copies the features of the last [`IntervalRead::query`] into `out`,
     /// sized exactly by it. Annotations are each feature's fields after the

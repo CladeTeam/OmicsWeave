@@ -39,6 +39,15 @@ fn grow(buf: &mut Vec<u8>, need: usize) -> Result<()> {
     Ok(())
 }
 
+/// `[start, end)` cut to `region` when `clip` is set, else unchanged.
+fn clip_to(start: u32, end: u32, region: &Region<'_>, clip: bool) -> (u32, u32) {
+    if clip {
+        (start.max(region.start), end.min(region.end))
+    } else {
+        (start, end)
+    }
+}
+
 fn selected_pieces<'p, 'l>(
     pieces: &'p [(u32, Region<'l>)],
     offsets: &[usize],
@@ -345,6 +354,29 @@ impl<S: ReadAt> BbiReader<S> {
         &self.header
     }
 
+    /// Visits the last interval query in stored order, borrowing annotations
+    /// directly from retained decoded blocks instead of copying their text.
+    pub fn visit_intervals(
+        &self,
+        mut visit: impl FnMut(u32, u32, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.interval_size.ok_or(Error::NotQueried)?;
+        if self.cached_intervals {
+            for row in &self.cached_rows {
+                let entry = &row.entry;
+                let CachedData::Bed(block) = &self.cached_blocks[row.block].data else {
+                    return Err(Error::invalid("BBI cache", "expected a bigBed block"));
+                };
+                visit(entry.start, entry.end, &block.bytes()[entry.note.clone()])?;
+            }
+        } else {
+            for entry in &self.intervals {
+                visit(entry.start, entry.end, &self.arena[entry.note.clone()])?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn zooms(&self) -> &[ZoomLevel] {
         &self.zooms
     }
@@ -614,12 +646,15 @@ impl<S: ReadAt> BbiReader<S> {
             .ok_or_else(|| Error::UnknownChrom(region.chrom.to_owned()))
     }
 
-    /// Visits each track interval overlapping `region`, clipped to it.
+    /// Visits each track interval overlapping `region`, cut to it when
+    /// `clip` is set.
     fn each_track_entry(
         &mut self,
         region: Region<'_>,
+        clip: bool,
         mut f: impl FnMut(TrackEntry),
     ) -> Result<()> {
+        let bounds = |s: u32, e: u32| clip_to(s, e, &region, clip);
         self.expect(Kind::BigWig)?;
         let chrom = self.track_chrom(&region)?;
         if region.is_empty() {
@@ -633,11 +668,8 @@ impl<S: ReadAt> BbiReader<S> {
                     return Err(Error::invalid("BBI cache", "expected a bigWig block"));
                 };
                 for (s, e, value) in block.view().overlapping(chrom, region.start, region.end) {
-                    f(TrackEntry {
-                        start: s.max(region.start),
-                        end: e.min(region.end),
-                        value,
-                    });
+                    let (start, end) = bounds(s, e);
+                    f(TrackEntry { start, end, value });
                 }
             }
             return Ok(());
@@ -645,11 +677,8 @@ impl<S: ReadAt> BbiReader<S> {
         for i in 0..self.blocks.len() {
             let block = WigBlock::parse(self.load(i)?)?;
             for (s, e, value) in block.overlapping(chrom, region.start, region.end) {
-                f(TrackEntry {
-                    start: s.max(region.start),
-                    end: e.min(region.end),
-                    value,
-                });
+                let (start, end) = bounds(s, e);
+                f(TrackEntry { start, end, value });
             }
         }
         Ok(())
@@ -699,7 +728,7 @@ impl<S: ReadAt> BbiReader<S> {
     }
 
     /// Decodes the features overlapping `region` into the staged state.
-    fn stage_intervals(&mut self, region: Region<'_>) -> Result<IntervalSize> {
+    fn stage_intervals(&mut self, region: Region<'_>, clip: bool) -> Result<IntervalSize> {
         self.expect(Kind::BigBed)?;
         region.check()?;
         let mut size = IntervalSize::default();
@@ -721,10 +750,11 @@ impl<S: ReadAt> BbiReader<S> {
                 let block_index = self.cached_blocks.len();
                 for entry in block.view().overlapping(chrom, region.start, region.end) {
                     let at = entry.rest.as_ptr() as usize - base;
+                    let (start, end) = clip_to(entry.start, entry.end, &region, clip);
                     self.cached_rows.push(CachedInterval {
                         entry: StagedInterval {
-                            start: entry.start,
-                            end: entry.end,
+                            start,
+                            end,
                             note: at..at + entry.rest.len(),
                         },
                         block: block_index,
@@ -748,9 +778,10 @@ impl<S: ReadAt> BbiReader<S> {
                     let entry = entry?;
                     if entry.overlaps(chrom, region.start, region.end) {
                         let at = entry.rest.as_ptr() as usize - base;
+                        let (start, end) = clip_to(entry.start, entry.end, &region, clip);
                         intervals.push(StagedInterval {
-                            start: entry.start,
-                            end: entry.end,
+                            start,
+                            end,
                             note: at..at + entry.rest.len(),
                         });
                         size.entries += 1;
@@ -982,11 +1013,11 @@ impl<S: ReadAt> TrackRead for BbiReader<S> {
         result
     }
 
-    fn query_entries(&mut self, region: Region<'_>) -> Result<usize> {
+    fn query_entries(&mut self, region: Region<'_>, clip: bool) -> Result<usize> {
         self.track_ready = false;
         let mut staged = std::mem::take(&mut self.track_entries);
         staged.clear();
-        let result = self.each_track_entry(region, |entry| staged.push(entry));
+        let result = self.each_track_entry(region, clip, |entry| staged.push(entry));
         let n = staged.len();
         self.track_entries = staged;
         result?;
@@ -1009,14 +1040,14 @@ impl<S: ReadAt> TrackRead for BbiReader<S> {
 }
 
 impl<S: ReadAt> IntervalRead for BbiReader<S> {
-    fn query(&mut self, region: Region<'_>) -> Result<IntervalSize> {
+    fn query(&mut self, region: Region<'_>, clip: bool) -> Result<IntervalSize> {
         self.interval_size = None;
         self.intervals.clear();
         self.cached_blocks.clear();
         self.cached_rows.clear();
         self.cached_intervals = false;
         self.used = 0;
-        let size = self.stage_intervals(region)?;
+        let size = self.stage_intervals(region, clip)?;
         self.interval_size = Some(size);
         Ok(size)
     }

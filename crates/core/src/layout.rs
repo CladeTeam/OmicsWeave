@@ -4,7 +4,8 @@
 
 use crate::error::{Error, Result, check_output};
 
-/// One track interval, clipped to the queried region.
+/// One track interval, with its stored bounds or clipped to the queried
+/// region according to [`crate::TrackRead::query_entries`]'s `clip` argument.
 ///
 /// numpy: `np.dtype([("start", "<u4"), ("end", "<u4"), ("value", "<f4")])`.
 #[repr(C)]
@@ -15,9 +16,10 @@ pub struct TrackEntry {
     pub value: f32,
 }
 
-/// One interval feature, as stored (not clipped: the feature and its
-/// annotation describe the whole interval). `annotation` is the row of its
-/// annotation in the accompanying [`StringColumn`].
+/// One interval feature, with its stored bounds or clipped to the queried
+/// region according to [`crate::IntervalRead::query`]'s `clip` argument.
+/// `annotation` indexes the feature's complete stored annotation in the
+/// accompanying [`StringColumn`]; clipping changes only `start` and `end`.
 ///
 /// numpy: `np.dtype([("start", "<u4"), ("end", "<u4"), ("annotation", "<u4")])`.
 #[repr(C)]
