@@ -1,4 +1,4 @@
-//! 4DN pairs and Juicer short text → `.hic` (+ sidecar).
+//! 4DN pairs, Juicer short and HiC-Pro text → `.hic` (+ sidecar).
 //!
 //! Each row is one contact, binned as [`omicsweave_hic::HicBuilder::add`]
 //! (and the Juicer tools' `pre`) bins it: the two ends ordered by
@@ -57,9 +57,12 @@ pub enum PairsDialect {
     /// Juicer short: `str1 chr1 pos1 frag1 str2 chr2 pos2 frag2`, with an
     /// optional ninth column, the score, which is then the row's count.
     Short,
+    /// HiC-Pro validPairs/allValidPairs: read name, two chromosome/position/
+    /// strand triples, fragment information and mapping qualities.
+    HicPro,
 }
 
-/// 4DN pairs or Juicer short text (plain, gzip or BGZF; a pairix index is
+/// 4DN pairs, Juicer short or HiC-Pro text (plain, gzip or BGZF; a pairix index is
 /// not read) to Juicer `.hic` (v9) at base-pair resolutions, with its
 /// sidecar.
 ///
@@ -68,7 +71,7 @@ pub enum PairsDialect {
 /// chromosome outside the chromosome list are skipped and reported as a
 /// warning with their count per chromosome. The chromosomes, in order, come
 /// from `chrom_sizes` or else the pairs header's `#chromsize:` lines; short
-/// text has no header and needs `chrom_sizes`. Coarser resolutions are sums
+/// and HiC-Pro text have no header and need `chrom_sizes`. Coarser resolutions are sums
 /// of the finest, so each must be a multiple of the finest. Fragment
 /// resolutions (which need restriction-site files) are not written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +206,10 @@ impl PairsToHic {
                     PairsDialect::Short => {
                         "Juicer short text names no chromosome lengths: give the chromosome \
                          sizes"
+                            .to_owned()
+                    }
+                    PairsDialect::HicPro => {
+                        "HiC-Pro text names no chromosome lengths: give the chromosome sizes"
                             .to_owned()
                     }
                 },
@@ -431,7 +438,7 @@ fn read_head(text: &mut dyn BufRead, dialect: PairsDialect, limit: usize) -> Res
             break;
         }
         head.lines += 1;
-        if !header || dialect == PairsDialect::Short {
+        if !header || dialect != PairsDialect::Pairs {
             continue;
         }
         let l = std::str::from_utf8(&line)
@@ -480,6 +487,17 @@ struct Columns {
 
 impl Columns {
     fn of(dialect: PairsDialect, head: &Head) -> Result<Columns> {
+        if dialect == PairsDialect::HicPro {
+            return Ok(Columns {
+                dialect,
+                chr1: 1,
+                pos1: 2,
+                chr2: 4,
+                pos2: 5,
+                score: None,
+                fields: 12,
+            });
+        }
         if dialect == PairsDialect::Short {
             return Ok(Columns {
                 dialect,
@@ -544,9 +562,19 @@ fn words(line: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 /// A non-negative integer of ASCII digits.
 fn digits(field: &[u8]) -> Option<u64> {
-    if field.is_empty() || field.len() > 19 {
+    if field.is_empty() {
         return None;
     }
+    if field.len() > 19 {
+        return field.iter().try_fold(0u64, |v, &c| {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v.checked_mul(10)?.checked_add(u64::from(c - b'0'))
+        });
+    }
+    // Every integer of at most 19 digits fits in u64, so ordinary coordinates need
+    // no overflow check per digit. Longer spellings use checked arithmetic.
     let mut v = 0u64;
     for &c in field {
         if !c.is_ascii_digit() {
@@ -585,6 +613,30 @@ pub(crate) fn is_short_line(line: &[u8]) -> bool {
                 .is_some_and(|s| s.parse::<f64>().is_ok()))
 }
 
+/// HiC-Pro allows an optional allele column and a trailing tab.
+pub(crate) fn is_hicpro_line(line: &[u8]) -> bool {
+    let mut fields: [&[u8]; 13] = [&[]; 13];
+    let mut n = 0;
+    for field in words(line) {
+        if n == fields.len() {
+            return false;
+        }
+        fields[n] = field;
+        n += 1;
+    }
+    hicpro_positions(&fields[..n]).is_some()
+}
+
+fn hicpro_positions(fields: &[&[u8]]) -> Option<(u64, u64)> {
+    if !matches!(fields.len(), 12 | 13)
+        || !matches!(fields[3], b"+" | b"-")
+        || !matches!(fields[6], b"+" | b"-")
+    {
+        return None;
+    }
+    Some((digits(fields[2])?, digits(fields[5])?))
+}
+
 /// The id of chromosome `name`, remembering the last one asked for.
 fn chrom_id<'a>(rows: &Rows, name: &'a [u8], last: &mut (&'a [u8], Option<u32>)) -> Option<u32> {
     if last.0 != name {
@@ -602,7 +654,13 @@ fn parse(rows: &Rows, batch: &LineBatch) -> Result<Parsed> {
         unknown: Vec::new(),
     };
     let mut unknown: HashMap<&[u8], u64> = HashMap::new();
-    let mut fields: Vec<&[u8]> = Vec::with_capacity(cols.fields + 1);
+    let field_limit = cols.fields
+        + if cols.dialect == PairsDialect::HicPro {
+            2
+        } else {
+            1
+        };
+    let mut fields: Vec<&[u8]> = Vec::with_capacity(field_limit);
     let mut last = [(&b""[..], None), (&b""[..], None)];
     let mut layout: Option<((u32, u32), MatrixLayout)> = None;
     for (no, line) in lines(batch) {
@@ -615,15 +673,21 @@ fn parse(rows: &Rows, batch: &LineBatch) -> Result<Parsed> {
         if tabs {
             fields.extend(line.split(|&c| c == b'\t').take(cols.fields));
         } else {
-            fields.extend(words(line).take(cols.fields + 1));
+            fields.extend(words(line).take(field_limit));
         }
+        let hicpro = if cols.dialect == PairsDialect::HicPro {
+            hicpro_positions(&fields)
+        } else {
+            None
+        };
         let ok = match cols.dialect {
             PairsDialect::Pairs => fields.len() >= cols.fields,
             PairsDialect::Short => fields.len() == cols.fields,
+            PairsDialect::HicPro => hicpro.is_some(),
         };
         if !ok {
             let n = match cols.dialect {
-                PairsDialect::Short => words(line).count(),
+                PairsDialect::Short | PairsDialect::HicPro => words(line).count(),
                 PairsDialect::Pairs => fields.len(),
             };
             return Err(bad(
@@ -639,6 +703,10 @@ fn parse(rows: &Rows, batch: &LineBatch) -> Result<Parsed> {
                         cols.fields,
                         if cols.fields == 9 { " score" } else { "" }
                     ),
+                    PairsDialect::HicPro => format!(
+                        "{n} fields; HiC-Pro rows require 12 or 13 fields, integer positions \
+                         in columns 3 and 6 and +/- strands in columns 4 and 7"
+                    ),
                 },
             ));
         }
@@ -653,7 +721,10 @@ fn parse(rows: &Rows, batch: &LineBatch) -> Result<Parsed> {
                 )
             })
         };
-        let (pa, pb) = (position(cols.pos1)?, position(cols.pos2)?);
+        let (pa, pb) = match hicpro {
+            Some(positions) => positions,
+            None => (position(cols.pos1)?, position(cols.pos2)?),
+        };
         let count = match cols.score {
             Some(i) => crate::wig::value(fields[i], no)? as f64,
             None => 1.0,
@@ -676,7 +747,12 @@ fn parse(rows: &Rows, batch: &LineBatch) -> Result<Parsed> {
         } else {
             (b, pb, a, pa)
         };
-        let clamp = |c: u32, p: u64| p.min(rows.lens[c as usize] as u64) as u32;
+        let clamp = |c: u32, p: u64| {
+            // SAFETY: c comes only from rows.ids; run builds ids and lens
+            // from the same chromosome list. Rows is immutable during parsing.
+            let len = unsafe { *rows.lens.get_unchecked(c as usize) };
+            p.min(u64::from(len)) as u32
+        };
         let (mut x, mut y) = (clamp(c1, p1) / rows.finest, clamp(c2, p2) / rows.finest);
         if c1 == c2 && x > y {
             std::mem::swap(&mut x, &mut y);
@@ -982,6 +1058,46 @@ impl Spill for Contact {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn coordinate_digits_cover_u64_without_wrapping() {
+        assert_eq!(digits(b"0"), Some(0));
+        assert_eq!(
+            digits(b"9999999999999999999"),
+            Some(9_999_999_999_999_999_999)
+        );
+        assert_eq!(digits(b"18446744073709551615"), Some(u64::MAX));
+        assert_eq!(digits(b"00018446744073709551615"), Some(u64::MAX));
+        for text in [
+            &b""[..],
+            b"18446744073709551616",
+            b"99999999999999999999",
+            b"-1",
+            b"1a",
+        ] {
+            assert_eq!(digits(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn hicpro_field_validation_reuses_coordinates_and_rejects_extra_fields() {
+        for ending in ["", "\t", "\t1", "\t1\t", "\t1\t\r\n"] {
+            let line =
+                format!("r\tchr1\t18446744073709551615\t+\tchr2\t0\t-\t0\tf1\tf2\t0\t0{ending}");
+            assert!(is_hicpro_line(line.as_bytes()));
+            let fields: Vec<_> = words(line.as_bytes()).collect();
+            assert_eq!(hicpro_positions(&fields), Some((u64::MAX, 0)));
+        }
+        for line in [
+            "r chr1 1 + chr2 2 - 0 f1 f2 0",
+            "r chr1 1 + chr2 2 - 0 f1 f2 0 0 1 extra",
+            "r chr1 18446744073709551616 + chr2 2 - 0 f1 f2 0 0",
+            "r chr1 -1 + chr2 2 - 0 f1 f2 0 0",
+            "r chr1 1 . chr2 2 - 0 f1 f2 0 0",
+        ] {
+            assert!(!is_hicpro_line(line.as_bytes()), "{line}");
+        }
+    }
 
     #[test]
     fn header_and_first_row_are_independent_of_reader_boundaries() {

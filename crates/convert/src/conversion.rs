@@ -16,6 +16,8 @@ use crate::cool::CoolToHic;
 use crate::cram::CramToBam;
 use crate::fasta::{FastaToBgzipFasta, FastaToTwoBit};
 use crate::format::Format;
+use crate::maf::MafToBigMaf;
+use crate::motif::{self, MotifToFfm};
 use crate::pairs::{PairsDialect, PairsToHic};
 use crate::sam::{BamIndex, SamToBam};
 use crate::vcf::VcfToBcf;
@@ -38,6 +40,8 @@ pub enum Conversion {
     PairsToHic(PairsToHic),
     BedMethylToBigBed(BedMethylToBigBed),
     BedMethylToBigWig(BedMethylToBigWig),
+    MafToBigMaf(MafToBigMaf),
+    MotifToFfm(MotifToFfm),
 }
 
 /// Which index to write beside a sorted BCF or BAM.
@@ -74,8 +78,9 @@ pub struct Options {
     /// BCF, BAM: also write an index (records must be sorted).
     pub index: Option<Index>,
     /// bigBed, bigWig: chromosome lengths (`chrom.sizes`, `.fai` or
-    /// `.2bit`) instead of each chromosome's largest interval end. pairs to
-    /// hic: the chromosomes, in order, instead of the `#chromsize` lines.
+    /// `.2bit`) instead of each chromosome's largest interval end (MAF:
+    /// checked against the reference's `srcSize`). pairs to hic: the
+    /// chromosomes, in order, instead of the `#chromsize` lines.
     pub chrom_sizes: Option<PathBuf>,
     /// `.mcool` to hic: the resolutions to convert instead of all. pairs to
     /// hic: the resolutions to bin at instead of the Juicer `pre` defaults.
@@ -86,6 +91,9 @@ pub struct Options {
     pub mod_code: Option<String>,
     /// bedMethyl to bigWig: the items of this strand (`+`, `-`, `.`).
     pub strand: Option<String>,
+    /// MAF to bigMaf: the reference species (the `src` prefix of the first
+    /// component of every block) instead of the first block's.
+    pub ref_species: Option<String>,
     /// bigBed, bigWig, hic: also write the `.sidecar`.
     pub sidecar: bool,
     /// VCF to BCF: declare contigs the header lacks (one more pass).
@@ -117,6 +125,7 @@ impl Default for Options {
             value: None,
             mod_code: None,
             strand: None,
+            ref_species: None,
             sidecar: false,
             add_contigs: false,
             sort: false,
@@ -175,12 +184,19 @@ impl Conversion {
             (JuicerShort | GzipJuicerShort, Hic) => {
                 Conversion::PairsToHic(PairsToHic::new(src, dst, PairsDialect::Short))
             }
+            (HicProPairs | GzipHicProPairs, Hic) => {
+                Conversion::PairsToHic(PairsToHic::new(src, dst, PairsDialect::HicPro))
+            }
             (BedMethyl | GzipBedMethyl, BigBed) => Conversion::BedMethylToBigBed(
                 BedMethylToBigBed::new(src, dst, ChromSizes::FromData),
             ),
             (BedMethyl | GzipBedMethyl, BigWig) => Conversion::BedMethylToBigWig(
                 BedMethylToBigWig::new(src, dst, ChromSizes::FromData),
             ),
+            (Maf | GzipMaf, BigBed) => Conversion::MafToBigMaf(MafToBigMaf::new(src, dst)),
+            (from, Ffm) if motif::SOURCES.contains(&from) => {
+                Conversion::MotifToFfm(MotifToFfm::new(src, dst, from))
+            }
             _ => {
                 return Err(Error::invalid(
                     "convert",
@@ -198,6 +214,25 @@ impl Conversion {
         Conversion::between(from, to, src, dst)
     }
 
+    /// Adds source files to a conversion that reads
+    /// several: the motif conversions, whose sources form one collection.
+    pub fn add_sources(&mut self, more: impl IntoIterator<Item = PathBuf>) -> Result<()> {
+        let more: Vec<PathBuf> = more.into_iter().collect();
+        if more.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Conversion::MotifToFfm(c) => {
+                c.sources.extend(more);
+                Ok(())
+            }
+            other => Err(Error::invalid(
+                "convert",
+                format!("{} reads one source", other.name()),
+            )),
+        }
+    }
+
     /// Applies `options`; an option this conversion does not have is an error.
     pub fn configure(&mut self, o: &Options) -> Result<()> {
         let takes = |option: bool, applies: bool, name: &str, c: &Conversion| {
@@ -209,7 +244,10 @@ impl Conversion {
         };
         takes(
             o.level.is_some(),
-            !matches!(self, Conversion::FastaToTwoBit(_)),
+            !matches!(
+                self,
+                Conversion::FastaToTwoBit(_) | Conversion::MotifToFfm(_)
+            ),
             "level",
             self,
         )?;
@@ -235,6 +273,7 @@ impl Conversion {
                     | Conversion::PairsToHic(_)
                     | Conversion::BedMethylToBigBed(_)
                     | Conversion::BedMethylToBigWig(_)
+                    | Conversion::MafToBigMaf(_)
             ),
             "chrom_sizes",
             self,
@@ -249,6 +288,12 @@ impl Conversion {
         takes(o.value.is_some(), methyl, "value", self)?;
         takes(o.mod_code.is_some(), methyl, "mod", self)?;
         takes(o.strand.is_some(), methyl, "strand", self)?;
+        takes(
+            o.ref_species.is_some(),
+            matches!(self, Conversion::MafToBigMaf(_)),
+            "ref_species",
+            self,
+        )?;
         takes(
             o.add_contigs,
             matches!(self, Conversion::VcfToBcf(_)),
@@ -287,6 +332,7 @@ impl Conversion {
                     | Conversion::WigToBigWig(_)
                     | Conversion::BedMethylToBigBed(_)
                     | Conversion::BedMethylToBigWig(_)
+                    | Conversion::MafToBigMaf(_)
             ),
             "bbi",
             self,
@@ -300,6 +346,7 @@ impl Conversion {
                     | Conversion::WigToBigWig(_)
                     | Conversion::BedMethylToBigBed(_)
                     | Conversion::BedMethylToBigWig(_)
+                    | Conversion::MafToBigMaf(_)
                     | Conversion::CoolToHic(_)
                     | Conversion::PairsToHic(_)
             ),
@@ -419,6 +466,15 @@ impl Conversion {
                 bbi(&mut c.options);
                 c.sidecar = o.sidecar;
             }
+            Conversion::MafToBigMaf(c) => {
+                if let Some(p) = &o.chrom_sizes {
+                    c.chrom_sizes = ChromSizes::File(p.clone());
+                }
+                c.ref_species = o.ref_species.clone();
+                bbi(&mut c.options);
+                c.sidecar = o.sidecar;
+            }
+            Conversion::MotifToFfm(_) => {}
         }
         Ok(())
     }
@@ -449,9 +505,15 @@ impl Conversion {
             Conversion::PairsToHic(c) => match c.dialect {
                 PairsDialect::Pairs => "pairs to hic",
                 PairsDialect::Short => "Juicer short to hic",
+                PairsDialect::HicPro => "HiC-Pro pairs to hic",
             },
             Conversion::BedMethylToBigBed(_) => "bedMethyl to bigBed",
             Conversion::BedMethylToBigWig(_) => "bedMethyl to bigWig",
+            Conversion::MafToBigMaf(_) => "MAF to bigMaf",
+            Conversion::MotifToFfm(c) => match c.from {
+                Format::Ffm => "FFM to FFM",
+                _ => "motifs to FFM",
+            },
         }
     }
 
@@ -464,11 +526,14 @@ impl Conversion {
             Conversion::SamToBam(_) | Conversion::BamSort(_) | Conversion::CramToBam(_) => {
                 Format::Bam
             }
-            Conversion::BedToBigBed(_) | Conversion::BedMethylToBigBed(_) => Format::BigBed,
+            Conversion::BedToBigBed(_)
+            | Conversion::BedMethylToBigBed(_)
+            | Conversion::MafToBigMaf(_) => Format::BigBed,
             Conversion::BedGraphToBigWig(_)
             | Conversion::WigToBigWig(_)
             | Conversion::BedMethylToBigWig(_) => Format::BigWig,
             Conversion::CoolToHic(_) | Conversion::PairsToHic(_) => Format::Hic,
+            Conversion::MotifToFfm(_) => Format::Ffm,
         }
     }
 
@@ -487,6 +552,8 @@ impl Conversion {
             Conversion::PairsToHic(c) => &c.src,
             Conversion::BedMethylToBigBed(c) => &c.src,
             Conversion::BedMethylToBigWig(c) => &c.src,
+            Conversion::MafToBigMaf(c) => &c.src,
+            Conversion::MotifToFfm(c) => c.sources.first().map_or(Path::new(""), PathBuf::as_path),
         }
     }
 
@@ -505,6 +572,8 @@ impl Conversion {
             Conversion::PairsToHic(c) => &c.dst,
             Conversion::BedMethylToBigBed(c) => &c.dst,
             Conversion::BedMethylToBigWig(c) => &c.dst,
+            Conversion::MafToBigMaf(c) => &c.dst,
+            Conversion::MotifToFfm(c) => &c.dst,
         }
     }
 }
@@ -603,7 +672,8 @@ pub fn plan(conversion: Conversion, budget: Budget) -> Result<Plan> {
     if budget.threads == 0 {
         return Err(Error::invalid("budget", "threads must be at least one"));
     }
-    if !conversion.src().exists() {
+    // Motif sources are several files, checked by their conversion.
+    if !matches!(conversion, Conversion::MotifToFfm(_)) && !conversion.src().exists() {
         return Err(Error::Io {
             kind: std::io::ErrorKind::NotFound,
             detail: format!("{} does not exist", conversion.src().display()),
@@ -629,6 +699,8 @@ pub fn plan(conversion: Conversion, budget: Budget) -> Result<Plan> {
         Conversion::PairsToHic(c) => c.plan(&budget)?,
         Conversion::BedMethylToBigBed(c) => c.plan(&budget)?,
         Conversion::BedMethylToBigWig(c) => c.plan(&budget)?,
+        Conversion::MafToBigMaf(c) => c.plan(&budget)?,
+        Conversion::MotifToFfm(c) => c.plan(&budget)?,
     };
     let required = memory.fixed.checked_add(memory.pipeline).ok_or_else(|| {
         Error::invalid("budget", "fixed and pipeline memory exceed the size limit")
@@ -666,6 +738,8 @@ pub fn run(plan: &Plan, progress: OnProgress<'_>) -> Result<Report> {
         Conversion::PairsToHic(c) => c.run(&ctx)?,
         Conversion::BedMethylToBigBed(c) => c.run(&ctx)?,
         Conversion::BedMethylToBigWig(c) => c.run(&ctx)?,
+        Conversion::MafToBigMaf(c) => c.run(&ctx)?,
+        Conversion::MotifToFfm(c) => c.run(&ctx)?,
     };
     report.elapsed = start.elapsed();
     report.warnings = ctx.warnings.take();

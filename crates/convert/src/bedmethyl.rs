@@ -302,7 +302,10 @@ impl BedMethylToBigBed {
                 chrom_sizes: &self.chrom_sizes,
                 options: &self.options,
                 sidecar: self.sidecar,
-                parse: parse_bed,
+                parse: Arc::new(parse_bed),
+                paragraphs: false,
+                disjoint: false,
+                what: "bed",
                 schema,
             },
             ctx,
@@ -612,6 +615,7 @@ fn schema(fields: u16) -> Result<BedSchema> {
 fn parse_bed(batch: &LineBatch) -> Result<Parsed> {
     let mut out = Parsed {
         chroms: Vec::new(),
+        lengths: Vec::new(),
         items: Vec::new(),
         rest: Vec::with_capacity(batch.text.len()),
     };

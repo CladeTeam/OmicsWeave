@@ -16,6 +16,8 @@
 //! | [`PairsToHic`] | 4DN pairs, Juicer short (plain, gzip or BGZF) | `.hic` + `.sidecar` |
 //! | [`BedMethylToBigBed`] | bedMethyl (plain, gzip or BGZF) | `.bigbed` + `.sidecar` |
 //! | [`BedMethylToBigWig`] | bedMethyl (plain, gzip or BGZF) | `.bigwig` + `.sidecar` |
+//! | [`MafToBigMaf`] | MAF (plain, gzip or BGZF) | bigMaf `.bigbed` + `.sidecar` |
+//! | [`MotifToFfm`] | motif collections (MEME, JASPAR, TRANSFAC, HOMER, CIS-BP, HOCOMOCO, Cluster-Buster, BaMM, ProBound, GLAM2, FFM; one or more files) | `.ffm` |
 //!
 //! [`Conversion::between`] chooses the conversion for a pair of formats
 //! ([`Format::detect`] tells a source's format by content,
@@ -44,6 +46,8 @@ mod cool;
 mod cram;
 mod fasta;
 mod format;
+mod maf;
+mod motif;
 mod pairs;
 mod pipeline;
 mod sam;
@@ -61,6 +65,8 @@ pub use cool::CoolToHic;
 pub use cram::CramToBam;
 pub use fasta::{FastaToBgzipFasta, FastaToTwoBit};
 pub use format::Format;
+pub use maf::{BIGMAF_AUTOSQL, MafToBigMaf};
+pub use motif::{MotifToFfm, detect_all as detect_sources};
 pub use pairs::{JUICER_RESOLUTIONS, PairsDialect, PairsToHic};
 pub use sam::{BamIndex, SamToBam};
 pub use vcf::VcfToBcf;

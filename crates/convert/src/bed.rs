@@ -86,7 +86,10 @@ impl BedToBigBed {
                 chrom_sizes: &self.chrom_sizes,
                 options: &self.options,
                 sidecar: self.sidecar,
-                parse,
+                parse: Arc::new(parse),
+                paragraphs: false,
+                disjoint: false,
+                what: "bed",
                 schema: |fields| {
                     Ok(BedSchema {
                         field_count: fields,
@@ -100,6 +103,9 @@ impl BedToBigBed {
     }
 }
 
+/// Parses one batch of a text of intervals; runs on the pool.
+pub(crate) type Parse = Arc<dyn Fn(&LineBatch) -> Result<Parsed> + Send + Sync>;
+
 /// A text of intervals to write as bigBed: where it is and goes, and how
 /// its lines parse and what schema their field count gives.
 pub(crate) struct BedJob<'a> {
@@ -108,7 +114,13 @@ pub(crate) struct BedJob<'a> {
     pub chrom_sizes: &'a ChromSizes,
     pub options: &'a WriteOptions,
     pub sidecar: bool,
-    pub parse: fn(&LineBatch) -> Result<Parsed>,
+    pub parse: Parse,
+    /// Batches end after blank lines (records span several lines).
+    pub paragraphs: bool,
+    /// Records may not overlap.
+    pub disjoint: bool,
+    /// The format read, as errors name it.
+    pub what: &'static str,
     pub schema: fn(u16) -> Result<BedSchema>,
 }
 
@@ -144,23 +156,29 @@ pub(crate) fn run(job: BedJob<'_>, ctx: &Context<'_>) -> Result<Report> {
     let s = BedToBigBed::parse_sizing(ctx.budget);
     let input = open_text(job.src, &ctx.pool, s.limit)?;
     let (read, file_len) = (Arc::clone(&input.read), input.file_len);
-    let mut batches = LineBatches::new(input.text, text_batch(ctx.budget), 1);
+    let mut batches = if job.paragraphs {
+        LineBatches::paragraphs(input.text, text_batch(ctx.budget), 1)
+    } else {
+        LineBatches::new(input.text, text_batch(ctx.budget), 1)
+    };
     let mut exec = ctx.pool.ordered::<Parsed>(s.limit);
     let tmp = ctx.tmp_parent(job.dst);
-    let parse = job.parse;
     let mut gather = Gather {
         sorter: Sorter::new(&ctx.pool, ctx.memory.buffer, &tmp),
         ids: HashMap::new(),
         names: Vec::new(),
         max_end: Vec::new(),
+        lengths: Vec::new(),
         fields: None,
         seq: 0,
         sizes: sizes.as_ref(),
+        what: job.what,
     };
     while let Some(batch) = batches.next_batch()? {
         while exec.full() {
             gather.take(exec.next(true)?.expect("pending"))?;
         }
+        let parse = Arc::clone(&job.parse);
         exec.submit(Box::new(move || parse(&batch)))?;
         while let Some(p) = exec.next(false)? {
             gather.take(p)?;
@@ -175,15 +193,15 @@ pub(crate) fn run(job: BedJob<'_>, ctx: &Context<'_>) -> Result<Report> {
     let chroms: Vec<Chrom> = gather
         .names
         .iter()
-        .zip(&gather.max_end)
-        .map(|(name, &end)| Chrom {
+        .zip(gather.max_end.iter().zip(&gather.lengths))
+        .map(|(name, (&end, &stated))| Chrom {
             name: name.clone(),
-            len: sizes.as_ref().map_or(end, |s| s[name]),
+            len: sizes.as_ref().map_or(stated.unwrap_or(end), |s| s[name]),
         })
         .collect();
     if chroms.is_empty() {
         return Err(Error::invalid(
-            "bed",
+            job.what,
             "no intervals; a bigBed needs at least one chromosome",
         ));
     }
@@ -204,7 +222,23 @@ pub(crate) fn run(job: BedJob<'_>, ctx: &Context<'_>) -> Result<Report> {
         },
     )?;
     let mut n = 0u64;
+    let mut last: Option<(u32, u32, u32)> = None;
     while let Some(r) = merged.next_record()? {
+        if job.disjoint {
+            if let Some((chrom, start, end)) = last
+                && chrom == r.chrom
+                && r.start < end
+            {
+                return Err(Error::invalid(
+                    job.what,
+                    format!(
+                        "records overlap on {}: {}-{} and {start}-{end}",
+                        gather.names[chrom as usize], r.start, r.end
+                    ),
+                ));
+            }
+            last = Some((r.chrom, r.start, r.end));
+        }
         writer.add(r.chrom, r.start, r.end, r.rest.bytes())?;
         n += 1;
         if n.is_multiple_of(1 << 16) {
@@ -298,6 +332,9 @@ pub(crate) struct Item {
 pub(crate) struct Parsed {
     /// Names of the local chromosome ids, in order of first item.
     pub chroms: Vec<String>,
+    /// The length the text states for each local chromosome, when it
+    /// states them (MAF `srcSize`); empty otherwise.
+    pub lengths: Vec<u32>,
     pub items: Vec<Item>,
     pub rest: Vec<u8>,
 }
@@ -318,6 +355,7 @@ fn parse_u32(field: &[u8], line: u64, what: &str) -> Result<u32> {
 fn parse(batch: &LineBatch) -> Result<Parsed> {
     let mut out = Parsed {
         chroms: Vec::new(),
+        lengths: Vec::new(),
         items: Vec::new(),
         rest: Vec::with_capacity(batch.text.len() / 2),
     };
@@ -454,33 +492,66 @@ struct Gather<'p, 's> {
     ids: HashMap<String, u32>,
     names: Vec<String>,
     max_end: Vec<u32>,
+    /// Declared lengths from chromosome sizes or the text, by global id.
+    lengths: Vec<Option<u32>>,
     fields: Option<u16>,
     seq: u64,
     sizes: Option<&'s HashMap<String, u32>>,
+    what: &'static str,
 }
 
 impl Gather<'_, '_> {
     fn take(&mut self, p: Parsed) -> Result<()> {
+        if p.rest.len() > u32::MAX as usize {
+            return Err(Error::invalid(
+                self.what,
+                "one batch's annotations exceed the 32-bit offset limit",
+            ));
+        }
         let mut map = Vec::with_capacity(p.chroms.len());
-        for name in p.chroms {
+        for (i, name) in p.chroms.into_iter().enumerate() {
+            let stated = p.lengths.get(i).copied();
             let id = match self.ids.get(&name) {
                 Some(&id) => id,
                 None => {
-                    if let Some(s) = self.sizes
-                        && !s.contains_key(&name)
-                    {
-                        return Err(Error::invalid(
-                            "bed",
-                            format!("chromosome {name:?} is not in the chromosome sizes"),
-                        ));
-                    }
+                    let limit = if let Some(s) = self.sizes {
+                        Some(*s.get(&name).ok_or_else(|| {
+                            Error::invalid(
+                                self.what,
+                                format!("chromosome {name:?} is not in the chromosome sizes"),
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
                     let id = self.names.len() as u32;
                     self.ids.insert(name.clone(), id);
                     self.names.push(name);
                     self.max_end.push(0);
+                    self.lengths.push(limit);
                     id
                 }
             };
+            if let Some(len) = stated {
+                let name = &self.names[id as usize];
+                let known = self.lengths[id as usize];
+                match known {
+                    Some(k) if k != len => {
+                        return Err(Error::invalid(
+                            self.what,
+                            format!(
+                                "chromosome {name:?} is {len} long here but {k} {}",
+                                if self.sizes.is_some() {
+                                    "in the chromosome sizes"
+                                } else {
+                                    "earlier"
+                                }
+                            ),
+                        ));
+                    }
+                    _ => self.lengths[id as usize] = Some(len),
+                }
+            }
             map.push(id);
         }
         let batch: Arc<[u8]> = p.rest.into();
@@ -497,19 +568,26 @@ impl Gather<'_, '_> {
                 }
                 Some(_) => {}
             }
-            if let Some(s) = self.sizes {
-                let len = s[&self.names[chrom as usize]];
-                if it.end > len {
-                    return Err(Error::Format {
-                        line: it.line,
-                        detail: format!(
-                            "end {} past the end of {} ({len})",
-                            it.end, self.names[chrom as usize]
-                        ),
-                    });
-                }
+            // SAFETY: every global id in `map` is obtained from `ids`,
+            // whose insertion appends one entry to both parallel vectors.
+            // Neither vector changes while this batch's items are consumed.
+            let (limit, m) = unsafe {
+                (
+                    *self.lengths.get_unchecked(chrom as usize),
+                    self.max_end.get_unchecked_mut(chrom as usize),
+                )
+            };
+            if let Some(len) = limit
+                && it.end > len
+            {
+                return Err(Error::Format {
+                    line: it.line,
+                    detail: format!(
+                        "end {} past the end of {} ({len})",
+                        it.end, self.names[chrom as usize]
+                    ),
+                });
             }
-            let m = &mut self.max_end[chrom as usize];
             *m = (*m).max(it.end);
             out.push(BedRec {
                 chrom,

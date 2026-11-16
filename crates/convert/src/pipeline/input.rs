@@ -185,13 +185,40 @@ pub struct LineBatch {
     pub first_line: u64,
 }
 
-/// Cuts a text stream into batches of whole lines of about `target` bytes.
+/// Where a batch may end: given the text read so far and the offset of
+/// the first byte not yet searched, the end of the last unit whose closing
+/// newline lies at or after that offset.
+type Cut = fn(&[u8], usize) -> Option<usize>;
+
+/// After the last newline.
+fn after_line(text: &[u8], from: usize) -> Option<usize> {
+    memchr::memrchr(b'\n', &text[from..]).map(|at| from + at + 1)
+}
+
+/// After the last blank (empty or whitespace-only) line: paragraphs, such
+/// as MAF blocks, stay whole.
+fn after_paragraph(text: &[u8], from: usize) -> Option<usize> {
+    let mut end = text.len();
+    while let Some(at) = memchr::memrchr(b'\n', &text[from..end]) {
+        let nl = from + at;
+        let start = memchr::memrchr(b'\n', &text[..nl]).map_or(0, |at| at + 1);
+        if text[start..nl].iter().all(u8::is_ascii_whitespace) {
+            return Some(nl + 1);
+        }
+        end = start.max(from);
+    }
+    None
+}
+
+/// Cuts a text stream into batches of whole lines (or whole paragraphs) of
+/// about `target` bytes.
 pub struct LineBatches<R> {
     input: R,
     target: usize,
     carry: Vec<u8>,
     next_line: u64,
     done: bool,
+    cut: Cut,
 }
 
 impl<R: BufRead> LineBatches<R> {
@@ -213,6 +240,17 @@ impl<R: BufRead> LineBatches<R> {
             carry: prefix,
             next_line: first_line,
             done: false,
+            cut: after_line,
+        }
+    }
+
+    /// Batches that end after a blank line, so that paragraphs separated
+    /// by blank lines are never split; a paragraph longer than the target
+    /// keeps growing its batch.
+    pub fn paragraphs(input: R, target: usize, first_line: u64) -> LineBatches<R> {
+        LineBatches {
+            cut: after_paragraph,
+            ..Self::new(input, target, first_line)
         }
     }
 
@@ -235,17 +273,19 @@ impl<R: BufRead> LineBatches<R> {
             self.input.consume(n);
         }
         if !self.done {
-            // Keep the incomplete last line for the next batch; a line
+            // Keep the incomplete last unit for the next batch; a unit
             // longer than the target keeps growing this one.
             let mut searched = 0;
             loop {
-                match memchr::memrchr(b'\n', &text[searched..]).map(|at| searched + at) {
+                match (self.cut)(&text, searched) {
                     Some(at) => {
-                        self.carry.extend_from_slice(&text[at + 1..]);
-                        text.truncate(at + 1);
+                        self.carry.extend_from_slice(&text[at..]);
+                        text.truncate(at);
                         break;
                     }
                     None => {
+                        // A newline at the end of what is added next may
+                        // close the line that is open now.
                         searched = text.len();
                         let buf = self.input.fill_buf()?;
                         if buf.is_empty() {
@@ -356,6 +396,49 @@ mod tests {
         }
         assert_eq!(actual, input);
         assert_eq!(numbers, [5, 6, 7]);
+    }
+
+    #[test]
+    fn paragraph_batches_end_after_blank_lines() {
+        let mut input = Vec::new();
+        for i in 0..500 {
+            input.extend_from_slice(format!("a {i}\ns x {}\n", "y".repeat(i % 50)).as_bytes());
+            input.extend_from_slice(if i % 3 == 0 { b"  \n" } else { b"\n" });
+        }
+        for target in [1, 7, 100, 4096, 1 << 20] {
+            let mut b =
+                LineBatches::paragraphs(BufReader::with_capacity(13, &input[..]), target, 1);
+            let mut all = Vec::new();
+            let mut numbers = Vec::new();
+            while let Some(batch) = b.next_batch().unwrap() {
+                let lines: Vec<&[u8]> = batch.text.split(|&c| c == b'\n').collect();
+                assert!(lines[0].starts_with(b"a "), "{target}");
+                assert!(batch.text.ends_with(b"\n\n") || batch.text.ends_with(b"  \n"));
+                numbers.extend(super::lines(&batch).map(|(no, _)| no));
+                all.extend_from_slice(&batch.text);
+            }
+            assert_eq!(all, input);
+            assert_eq!(numbers, (1..=1500).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn paragraph_batches_preserve_long_rows_across_small_reads() {
+        let input = [
+            b"a\ns x ".to_vec(),
+            vec![b'A'; 100_003],
+            b"\n \t\r\na\ns y A\n\nlast".to_vec(),
+        ]
+        .concat();
+        let reader = BufReader::with_capacity(31, input.as_slice());
+        let mut batches = LineBatches::paragraphs(reader, 37, 5);
+        let first = batches.next_batch().unwrap().unwrap();
+        assert_eq!(first.first_line, 5);
+        assert!(first.text.ends_with(b"\n \t\r\n"));
+        let second = batches.next_batch().unwrap().unwrap();
+        assert_eq!(second.first_line, 8);
+        assert!(batches.next_batch().unwrap().is_none());
+        assert_eq!([first.text, second.text].concat(), input);
     }
 
     #[test]

@@ -52,8 +52,40 @@ pub enum Format {
     GzipPairs,
     JuicerShort,
     GzipJuicerShort,
+    HicProPairs,
+    GzipHicProPairs,
     BedMethyl,
     GzipBedMethyl,
+    Maf,
+    GzipMaf,
+    /// MEME motif text (plain or gzip, as every motif text).
+    Meme,
+    /// JASPAR `.jaspar` count matrices (`A [ ... ]` rows).
+    Jaspar,
+    /// JASPAR raw PFM: `>ID name` and four rows A, C, G, T.
+    JasparPfm,
+    Transfac,
+    /// HOMER `.motif`.
+    Homer,
+    /// CIS-BP PWM (`Pos A C G T`).
+    CisBp,
+    /// One row of counts or frequencies per position under a `>` header
+    /// (HOCOMOCO `.pcm` / `.pfm`, Cluster-Buster).
+    Pcm,
+    /// One row of log weights per position (HOCOMOCO `.pwm`).
+    Pwm,
+    /// Dinucleotide counts, sixteen per adjacent pair (HOCOMOCO `.dpcm`).
+    Dpcm,
+    /// Dinucleotide log weights (HOCOMOCO `.dpwm`).
+    Dpwm,
+    /// BaMM inhomogeneous Markov model (`.ihbcp`).
+    Bamm,
+    /// ProBound / MotifCentral JSON model.
+    ProBound,
+    /// GLAM2 text output (`glam2.txt`): gapped alignment profiles.
+    Glam2,
+    /// Factor Frequency Model motif collection.
+    Ffm,
 }
 
 /// Leading bytes enough to tell every format apart (a BGZF header is the
@@ -72,7 +104,7 @@ const PAIRS_MAGIC: &[u8] = b"## pairs format";
 const SAM_HEADER_LINES: [&[u8]; 5] = [b"@HD\t", b"@SQ\t", b"@RG\t", b"@PG\t", b"@CO\t"];
 
 impl Format {
-    pub const ALL: [Format; 34] = [
+    pub const ALL: [Format; 52] = [
         Format::Fasta,
         Format::GzipFasta,
         Format::BgzipFasta,
@@ -105,8 +137,26 @@ impl Format {
         Format::GzipPairs,
         Format::JuicerShort,
         Format::GzipJuicerShort,
+        Format::HicProPairs,
+        Format::GzipHicProPairs,
         Format::BedMethyl,
         Format::GzipBedMethyl,
+        Format::Maf,
+        Format::GzipMaf,
+        Format::Meme,
+        Format::Jaspar,
+        Format::JasparPfm,
+        Format::Transfac,
+        Format::Homer,
+        Format::CisBp,
+        Format::Pcm,
+        Format::Pwm,
+        Format::Dpcm,
+        Format::Dpwm,
+        Format::Bamm,
+        Format::ProBound,
+        Format::Glam2,
+        Format::Ffm,
     ];
 
     /// The format's name, as the Python layer names it.
@@ -144,13 +194,34 @@ impl Format {
             Format::GzipPairs => "gzip-pairs",
             Format::JuicerShort => "juicer-short",
             Format::GzipJuicerShort => "gzip-juicer-short",
+            Format::HicProPairs => "hicpro-pairs",
+            Format::GzipHicProPairs => "gzip-hicpro-pairs",
             Format::BedMethyl => "bedmethyl",
             Format::GzipBedMethyl => "gzip-bedmethyl",
+            Format::Maf => "maf",
+            Format::GzipMaf => "gzip-maf",
+            Format::Meme => "meme",
+            Format::Jaspar => "jaspar",
+            Format::JasparPfm => "jaspar-pfm",
+            Format::Transfac => "transfac",
+            Format::Homer => "homer",
+            Format::CisBp => "cisbp",
+            Format::Pcm => "pcm",
+            Format::Pwm => "pwm",
+            Format::Dpcm => "dpcm",
+            Format::Dpwm => "dpwm",
+            Format::Bamm => "bamm",
+            Format::ProBound => "probound",
+            Format::Glam2 => "glam2",
+            Format::Ffm => "ffm",
         }
     }
 
-    /// The format called `name`.
+    /// The format called `name`; `cluster-buster` is another name of `pcm`.
     pub fn from_name(name: &str) -> Result<Format> {
+        if name == "cluster-buster" {
+            return Ok(Format::Pcm);
+        }
         Format::ALL
             .into_iter()
             .find(|f| f.name() == name)
@@ -161,9 +232,14 @@ impl Format {
     /// `.fna`, `.fas`, `.2bit`, `.fai`, `.gzi`, `.vcf`, `.bcf`, `.sam`,
     /// `.bam`, `.cram`, `.crai`, `.csi`, `.bai`, `.bed`, `.bedgraph`, `.bdg`, `.bg`, `.wig`,
     /// `.bw`, `.bigwig`, `.bb`, `.bigbed`, `.cool`, `.mcool`, `.hic`,
-    /// `.sidecar`, `.pairs`, `.bedmethyl`; text formats may end in `.gz` or
-    /// `.bgz` (compressed FASTA is taken to be bgzip FASTA, the storage that
-    /// is written). Juicer short text has no extension of its own.
+    /// `.sidecar`, `.pairs`, `.allValidPairs`, `.validPairs`, `.bedmethyl`, `.maf`; text formats may end in
+    /// `.gz` or `.bgz` (compressed FASTA is taken to be bgzip FASTA, the
+    /// storage that is written). `.bigmaf` names a bigBed (a bigMaf is one).
+    /// Juicer short text has no extension of its own. Motif texts: `.meme`,
+    /// `.jaspar`, `.transfac`, `.motif` (HOMER), `.pcm`, `.cb`
+    /// (Cluster-Buster), `.pwm`, `.dpcm`, `.dpwm`, `.ihbcp` (BaMM), plain or
+    /// compressed; `.ffm`. A `.pfm` is JASPAR's or HOCOMOCO's layout, told
+    /// only by content.
     pub fn from_extension(path: &Path) -> Result<Format> {
         let name = path
             .file_name()
@@ -192,8 +268,22 @@ impl Format {
             ("wig", true) => Format::GzipWig,
             ("pairs", false) => Format::Pairs,
             ("pairs", true) => Format::GzipPairs,
+            ("allvalidpairs" | "validpairs", false) => Format::HicProPairs,
+            ("allvalidpairs" | "validpairs", true) => Format::GzipHicProPairs,
             ("bedmethyl", false) => Format::BedMethyl,
             ("bedmethyl", true) => Format::GzipBedMethyl,
+            ("maf", false) => Format::Maf,
+            ("maf", true) => Format::GzipMaf,
+            ("meme", _) => Format::Meme,
+            ("jaspar", _) => Format::Jaspar,
+            ("transfac", _) => Format::Transfac,
+            ("motif", _) => Format::Homer,
+            ("pcm" | "cb", _) => Format::Pcm,
+            ("pwm", _) => Format::Pwm,
+            ("dpcm", _) => Format::Dpcm,
+            ("dpwm", _) => Format::Dpwm,
+            ("ihbcp", _) => Format::Bamm,
+            ("ffm", false) => Format::Ffm,
             ("2bit", false) => Format::TwoBit,
             ("fai", false) => Format::Fai,
             ("gzi", false) => Format::Gzi,
@@ -204,7 +294,7 @@ impl Format {
             ("csi", false) => Format::Csi,
             ("bai", false) => Format::Bai,
             ("bw" | "bigwig", false) => Format::BigWig,
-            ("bb" | "bigbed", false) => Format::BigBed,
+            ("bb" | "bigbed" | "bigmaf", false) => Format::BigBed,
             ("cool", false) => Format::Cool,
             ("mcool", false) => Format::Mcool,
             ("hic", false) => Format::Hic,
@@ -228,16 +318,28 @@ impl Format {
     /// inflated). Text, inflated first when gzip compressed, is VCF when it
     /// starts with `##fileformat=VCF`, SAM with a header line (`@HD`,
     /// `@SQ`, `@RG`, `@PG`, `@CO`), FASTA with `>` (bgzip FASTA when the
-    /// gzip stream is BGZF), 4DN pairs with `## pairs format`. Other text is
-    /// wig, bedGraph, Juicer short, bedMethyl or BED, told from its first
+    /// gzip stream is BGZF), 4DN pairs with `## pairs format`, MAF with
+    /// `##maf`. Other text is
+    /// wig, bedGraph, Juicer short, HiC-Pro, bedMethyl or BED, told from its first
     /// 64 KiB: wig when a `track` line says `type=wiggle_0` or a line
     /// declares a `fixedStep` / `variableStep` section; bedGraph when a
     /// `track` line says `type=bedGraph`, or when every data line has four
-    /// fields, the last a number; Juicer short when every data line is
+    /// fields, the last a number; HiC-Pro when every data line has 12 or 13
+    /// fields, +/- strands in columns 4 and 7, integer positions in columns
+    /// 3 and 6; Juicer short when every data line is
     /// `str1 chr1 pos1 frag1 str2 chr2 pos2 frag2 [score]`; bedMethyl when
     /// every data line is BED9 followed by modkit's nine counts or ENCODE's
     /// coverage and percentage; BED otherwise. `.fai` and `.gzi` files have
     /// no signature and are not told apart.
+    ///
+    /// Motif texts are told from the same 64 KiB: MEME by `MEME version`,
+    /// CIS-BP by a `Pos A C G T` header, TRANSFAC by line codes and a `P0`
+    /// header, ProBound by a JSON object with `coefficients`, GLAM2 by its
+    /// `GLAM2: Gapped Local Alignment of Motifs` banner, BaMM by blocks
+    /// of `A^(k+1)`-value lines; `>`-headed numeric matrices are JASPAR,
+    /// HOMER, raw PFM, PCM / PWM or their dinucleotide forms (`>`-headed
+    /// letters stay FASTA). Square 4 x 4 matrices cannot be told apart and
+    /// are an error asking for the format. An FFM is told by its magic.
     pub fn detect(path: &Path) -> Result<Format> {
         let mut file = File::open(path).map_err(|e| with_path(e, path))?;
         let head = read_head(&mut file)?;
@@ -261,6 +363,9 @@ impl Format {
         if head.starts_with(&SIDECAR_MAGIC) {
             return Ok(Format::Sidecar);
         }
+        if head.starts_with(&omicsweave_ffm::MAGIC) {
+            return Ok(Format::Ffm);
+        }
         if head.starts_with(HDF5_MAGIC) {
             return Ok(if omicsweave_cool::is_mcool(path)? {
                 Format::Mcool
@@ -272,14 +377,23 @@ impl Format {
             return Ok(match Content::of(&head) {
                 Content::Vcf => Format::Vcf,
                 Content::Sam => Format::Sam,
-                Content::Fasta => Format::Fasta,
                 Content::Pairs => Format::Pairs,
+                Content::Maf => Format::Maf,
+                Content::Fasta => {
+                    let text = fill(head, &mut file)?;
+                    crate::motif::sniff(&text, text.len() < TEXT_SNIFF)?.unwrap_or(Format::Fasta)
+                }
                 Content::Bcf | Content::Bam | Content::Csi | Content::Bed => {
-                    match Text::of(head, &mut file) {
+                    let text = fill(head, &mut file)?;
+                    if let Some(motif) = crate::motif::sniff(&text, text.len() < TEXT_SNIFF)? {
+                        return Ok(motif);
+                    }
+                    match Text::of(text, &mut file) {
                         Text::Bed => Format::Bed,
                         Text::BedGraph => Format::BedGraph,
                         Text::Wig => Format::Wig,
                         Text::JuicerShort => Format::JuicerShort,
+                        Text::HicPro => Format::HicProPairs,
                         Text::BedMethyl => Format::BedMethyl,
                     }
                 }
@@ -293,11 +407,22 @@ impl Format {
             Content::Csi => Format::Csi,
             Content::Vcf => Format::GzipVcf,
             Content::Sam => Format::GzipSam,
-            Content::Fasta if omicsweave_bgzf::is_bgzf(&head) => Format::BgzipFasta,
-            Content::Fasta => Format::GzipFasta,
+            Content::Fasta => {
+                let bgzf = omicsweave_bgzf::is_bgzf(&head);
+                let text = fill(text, &mut inflated)?;
+                match crate::motif::sniff(&text, text.len() < TEXT_SNIFF)? {
+                    Some(motif) => motif,
+                    None if bgzf => Format::BgzipFasta,
+                    None => Format::GzipFasta,
+                }
+            }
             Content::Pairs => Format::GzipPairs,
+            Content::Maf => Format::GzipMaf,
             Content::Bed => {
-                let text = first_line(text, &mut inflated);
+                let text = fill(text, &mut inflated)?;
+                if let Some(motif) = crate::motif::sniff(&text, text.len() < TEXT_SNIFF)? {
+                    return Ok(motif);
+                }
                 if is_crai(&text) {
                     Format::Crai
                 } else {
@@ -306,6 +431,7 @@ impl Format {
                         Text::BedGraph => Format::GzipBedGraph,
                         Text::Wig => Format::GzipWig,
                         Text::JuicerShort => Format::GzipJuicerShort,
+                        Text::HicPro => Format::GzipHicProPairs,
                         Text::BedMethyl => Format::GzipBedMethyl,
                     }
                 }
@@ -329,6 +455,7 @@ enum Content {
     Sam,
     Fasta,
     Pairs,
+    Maf,
     Bed,
 }
 
@@ -348,6 +475,8 @@ impl Content {
             Content::Fasta
         } else if head.starts_with(PAIRS_MAGIC) {
             Content::Pairs
+        } else if crate::maf::is_maf(head) {
+            Content::Maf
         } else {
             Content::Bed
         }
@@ -360,6 +489,7 @@ enum Text {
     BedGraph,
     Wig,
     JuicerShort,
+    HicPro,
     BedMethyl,
 }
 
@@ -387,7 +517,8 @@ impl Text {
             let end = memchr::memrchr(b'\n', &head).map_or(0, |i| i + 1);
             head.truncate(end);
         }
-        let (mut data, mut bedgraph, mut short, mut methyl) = (0usize, true, true, true);
+        let (mut data, mut bedgraph, mut short, mut methyl, mut hicpro) =
+            (0usize, true, true, true, true);
         for line in head.split(|&c| c == b'\n') {
             let line = trim(line);
             if starts_with_word(line, b"track") {
@@ -404,15 +535,17 @@ impl Text {
                 return Text::Wig;
             }
             data += 1;
-            bedgraph &= is_bedgraph_line(line);
-            short &= crate::pairs::is_short_line(line);
-            methyl &= crate::bedmethyl::is_bedmethyl_line(line);
+            bedgraph = bedgraph && is_bedgraph_line(line);
+            short = short && crate::pairs::is_short_line(line);
+            methyl = methyl && crate::bedmethyl::is_bedmethyl_line(line);
+            hicpro = hicpro && crate::pairs::is_hicpro_line(line);
         }
-        match (data > 0, bedgraph, short, methyl) {
+        match (data > 0, bedgraph, short, methyl, hicpro) {
             (false, ..) => Text::Bed,
-            (true, true, _, _) => Text::BedGraph,
-            (true, _, true, _) => Text::JuicerShort,
-            (true, _, _, true) => Text::BedMethyl,
+            (true, true, _, _, _) => Text::BedGraph,
+            (true, _, true, _, _) => Text::JuicerShort,
+            (true, _, _, true, _) => Text::BedMethyl,
+            (true, _, _, _, true) => Text::HicPro,
             _ => Text::Bed,
         }
     }
@@ -442,19 +575,21 @@ fn is_bedgraph_line(line: &[u8]) -> bool {
         && w.next().is_none()
 }
 
-/// `head` read further from `input` until it holds its first line (at
-/// most 4 KiB); a read error ends it early.
-fn first_line(mut head: Vec<u8>, input: &mut impl Read) -> Vec<u8> {
-    let mut byte = [0u8];
-    while !head.contains(&b'\n') && head.len() < 4096 {
-        match input.read(&mut byte) {
-            Ok(1) => head.push(byte[0]),
-            Ok(_) => break,
+/// `head` read further from `input` up to [`TEXT_SNIFF`] bytes; a read
+/// error is propagated.
+fn fill(mut head: Vec<u8>, input: &mut impl Read) -> Result<Vec<u8>> {
+    let mut filled = head.len();
+    head.resize(TEXT_SNIFF.max(filled), 0);
+    while filled < head.len() {
+        match input.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(_) => break,
+            Err(e) => return Err(e.into()),
         }
     }
-    head
+    head.truncate(filled);
+    Ok(head)
 }
 
 /// A `.crai` line: six tab-separated integers (the first may be -1).

@@ -16,6 +16,8 @@ omicsweave-vcf = { path = "../vcf" }
 omicsweave-sam = { path = "../sam" }
 omicsweave-cool = { path = "../cool" }
 omicsweave-cram = { path = "../cram" }
+omicsweave-ffm = { path = "../ffm" }
+serde_json.workspace = true
 flate2.workspace = true
 memchr.workspace = true
 
