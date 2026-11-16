@@ -1,3 +1,5 @@
+mod support;
+
 use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -7,9 +9,17 @@ use omicsweave_core::exec::{Ordered, Pool};
 // Lifecycle failures can block a destructor. A separate process lets the
 // parent report that failure without retaining a blocked test thread.
 fn scenario(name: &str) {
+    let directory = support::TempDirectory::new();
+    let completed = directory.path().join("completed");
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "exec_lifecycle_child", "--nocapture"])
+        .args([
+            "--ignored",
+            "--exact",
+            "exec_lifecycle_child",
+            "--nocapture",
+        ])
         .env("OMICSWEAVE_CORE_EXEC_SCENARIO", name)
+        .env("OMICSWEAVE_CORE_EXEC_COMPLETED", &completed)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -18,6 +28,11 @@ fn scenario(name: &str) {
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             assert!(status.success(), "exec lifecycle {name}: {status}");
+            assert_eq!(
+                std::fs::read_to_string(&completed).unwrap_or_default(),
+                name,
+                "exec lifecycle {name}: child did not complete its selected scenario"
+            );
             return;
         }
         if Instant::now() >= deadline {
@@ -60,10 +75,10 @@ fn worker_releasing_pool_does_not_join_dependent_worker() {
 }
 
 #[test]
+#[ignore = "invoked by a bounded parent with an explicit scenario"]
 fn exec_lifecycle_child() {
-    let Ok(name) = std::env::var("OMICSWEAVE_CORE_EXEC_SCENARIO") else {
-        return;
-    };
+    let name = std::env::var("OMICSWEAVE_CORE_EXEC_SCENARIO")
+        .expect("parent supplies the executor scenario");
     match name.as_str() {
         "closed_pool" => {
             let pool = Pool::new(1);
@@ -205,6 +220,9 @@ fn exec_lifecycle_child() {
         "ordered_stream" => ordered_stream_case(),
         other => panic!("unknown exec lifecycle scenario: {other}"),
     }
+    let completed = std::env::var_os("OMICSWEAVE_CORE_EXEC_COMPLETED")
+        .expect("parent supplies the completion path");
+    std::fs::write(completed, &name).unwrap();
 }
 
 #[test]

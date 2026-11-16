@@ -38,18 +38,21 @@ fn interval_columns_are_checked_before_building_features() {
     let mut malformed = Vec::new();
     let mut set = intervals();
     set.end.pop();
-    malformed.push(set);
+    malformed.push(("end column length", set));
     let mut set = intervals();
     set.seqid[0] = 2;
-    malformed.push(set);
+    malformed.push(("unknown sequence id", set));
     let mut set = intervals();
     set.start[0] = set.end[0] + 1;
-    malformed.push(set);
+    malformed.push(("inverted interval", set));
     let mut set = intervals();
     set.name[0] = set.pool().len() as u32;
-    malformed.push(set);
-    for set in malformed {
-        assert!(FeatureSpace::of_intervals(set, "Regions").is_err());
+    malformed.push(("name outside pool", set));
+    for (case, set) in malformed {
+        assert!(
+            FeatureSpace::of_intervals(set, "Regions").is_err(),
+            "{case}"
+        );
     }
 }
 

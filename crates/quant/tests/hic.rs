@@ -7,15 +7,16 @@
 //! thread count and with spilled buffers.
 
 mod common;
+mod support;
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
 
-use common::{Read, Rng, files, gunzip, write_bam};
+use common::{Read, Rng, gunzip, write_bam};
 use omicsweave_core::{ContactQuery, ContactRead, FileSource, Region};
 use omicsweave_hic::{BuildOptions, Chrom, HicBuilder, HicHeader, HicReader};
-use omicsweave_quant::{Budget, Contacts, Product, Task, plan, quantify, run};
+use omicsweave_quant::{Budget, Contacts, Product, Task, quantify};
 
 const REFS: [(&str, u32); 3] = [("chr1", 900_000), ("chr2", 600_000), ("chr3", 250_000)];
 const RESOLUTIONS: [u32; 3] = [100_000, 25_000, 5_000];
@@ -523,23 +524,10 @@ fn contacts_any_mq(f: &Fixture, c: &Contacts) -> (Vec<Want>, Vec<String>, u64) {
 #[test]
 fn contacts_do_not_depend_on_threads_or_spilling() {
     let f = fixture(83);
-    let a = f.dir.path().join("a");
-    quantify(task(&f, &a, sc_contacts()), Budget::new(1, 1 << 30), None).unwrap();
-    let b = f.dir.path().join("b");
-    let mut p = plan(task(&f, &b, sc_contacts()), Budget::new(7, 256 << 20)).unwrap();
-    for s in &mut p.stages {
-        s.1 = 16 << 10;
-    }
-    run(&p, None).unwrap();
-    let summary = std::fs::read_to_string(b.join("summary.json")).unwrap();
-    assert!(
-        summary
-            .lines()
-            .any(|l| l.contains("spilled_bytes") && !l.contains(": 0,")),
-        "the small buffers spill"
+    support::assert_execution_invariant(
+        f.dir.path(),
+        |out| task(&f, out, sc_contacts()),
+        16 << 10,
+        1,
     );
-    let strip = |v: Vec<(String, Vec<u8>)>| -> Vec<(String, Vec<u8>)> {
-        v.into_iter().filter(|(n, _)| n != "summary.json").collect()
-    };
-    assert_eq!(strip(files(&a)), strip(files(&b)));
 }

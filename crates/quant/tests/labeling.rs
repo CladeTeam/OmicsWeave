@@ -5,6 +5,7 @@
 //! a 2bit genome and `MD` tags, at any thread count.
 
 mod common;
+mod support;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -491,12 +492,28 @@ fn conversions_and_mismatches_match_the_reads() {
         assert!(!sc.is_empty() && !bulk.is_empty());
         assert_eq!(read_10x_layer(&out.join("genes"), "labeled"), sc);
         assert_eq!(read_10x_layer(&out.join("bulk"), "labeled"), bulk);
+        support::assert_storage_invariant(
+            &out,
+            |target| task(&f, &f.bam, target, Some(&f.fasta), masked),
+            &[
+                ("genes", "matrix"),
+                ("genes", "labeled"),
+                ("bulk", "matrix"),
+                ("bulk", "labeled"),
+            ],
+        );
     }
 }
 
 #[test]
 fn twobit_md_tags_and_threads_give_the_same_files() {
     let f = fixture(52);
+    support::assert_execution_invariant(
+        f.dir.path(),
+        |out| task(&f, &f.bam, out, Some(&f.fasta), true),
+        4 << 10,
+        1,
+    );
     let reference = f.dir.path().join("ref");
     quantify(
         task(&f, &f.bam, &reference, Some(&f.fasta), true),

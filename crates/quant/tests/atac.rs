@@ -4,6 +4,7 @@
 //! tabix index htslib builds for the same file.
 
 mod common;
+mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -79,7 +80,7 @@ fn fragments_matrices_and_metrics_match_definitions() {
     let mut task = Task::new(vec![bam.clone()], &out);
     task.annotation = Some(ann);
     task.products.push(Product::Atac(atac.clone()));
-    quantify(task, Budget::new(4, 512 << 20), None).unwrap();
+    quantify(task.clone(), Budget::new(4, 512 << 20), None).unwrap();
 
     // Fragments: every line, in order.
     let want = naive_fragments(&reads, &spec.refs, &atac.filter);
@@ -194,6 +195,31 @@ fn fragments_matrices_and_metrics_match_definitions() {
         assert_eq!(f[2].parse::<usize>().unwrap(), mine.len(), "{}", f[0]);
         assert_eq!(f[3].parse::<usize>().unwrap(), in_peak, "{}", f[0]);
     }
+
+    support::assert_execution_invariant(
+        dir.path(),
+        |target| {
+            let mut t = task.clone();
+            t.out_dir = target.to_owned();
+            t
+        },
+        8 << 10,
+        1,
+    );
+
+    support::assert_storage_invariant(
+        &out,
+        |target| {
+            let mut t = task.clone();
+            t.out_dir = target.to_owned();
+            t
+        },
+        &[
+            ("atac/peaks", "matrix"),
+            ("atac/tiles", "matrix"),
+            ("atac/gene_activity", "matrix"),
+        ],
+    );
 
     // The tabix index is the one htslib builds from the same file.
     common::assert_tabix_as_htslib(&out.join("atac/fragments.tsv.gz"), dir.path());

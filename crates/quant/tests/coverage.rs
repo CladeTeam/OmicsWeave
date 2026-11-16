@@ -3,6 +3,7 @@
 //! counts for the other units and strand splits.
 
 mod common;
+mod support;
 
 use std::path::Path;
 
@@ -71,7 +72,9 @@ fn naive(
 }
 
 fn assert_same(ours: &[Vec<f32>], want: &[Vec<u32>], what: &str) {
+    assert_eq!(ours.len(), want.len(), "{what}: reference count");
     for (t, (a, b)) in ours.iter().zip(want).enumerate() {
+        assert_eq!(a.len(), b.len(), "{what}: reference {t} length");
         for (p, (x, y)) in a.iter().zip(b).enumerate() {
             assert_eq!(*x, *y as f32, "{what}: reference {t} base {p}");
         }
@@ -194,26 +197,18 @@ fn scaling_and_spilling_do_not_change_runs() {
         sidecar: true,
         ..Coverage::default()
     };
-    // One thread and a roomy budget, against many threads and a spool so
-    // small the runs spill.
-    run(&bam, &dir.path().join("a"), base.clone(), 1, 1 << 30);
-    let mut task = Task::new(vec![bam.clone()], dir.path().join("b"));
-    task.products.push(Product::Coverage(base.clone()));
-    let mut p = omicsweave_quant::plan(task, Budget::new(8, 256 << 20)).unwrap();
-    p.stages[0].1 = 16 << 10;
-    omicsweave_quant::run(&p, None).unwrap();
-    let summary = std::fs::read_to_string(dir.path().join("b/summary.json")).unwrap();
-    assert!(
-        summary
-            .lines()
-            .any(|l| l.contains("spilled_bytes") && !l.contains(": 0,")),
-        "the small spool should spill"
+    let baseline = support::assert_execution_invariant(
+        dir.path(),
+        |out| {
+            let mut task = Task::new(vec![bam.clone()], out);
+            task.products.push(Product::Coverage(base.clone()));
+            task
+        },
+        16 << 10,
+        1,
     );
-    let a = std::fs::read(dir.path().join("a/coverage.bw")).unwrap();
-    let b = std::fs::read(dir.path().join("b/coverage.bw")).unwrap();
-    assert_eq!(a, b);
-    assert!(dir.path().join("a/coverage.bw.sidecar").exists());
-    let summary = std::fs::read_to_string(dir.path().join("a/summary.json")).unwrap();
+    assert!(baseline.join("coverage.bw.sidecar").exists());
+    let summary = std::fs::read_to_string(baseline.join("summary.json")).unwrap();
     assert!(summary.contains("\"counted\""));
     let counted = reads
         .iter()
@@ -229,10 +224,95 @@ fn scaling_and_spilling_do_not_change_runs() {
         2,
         1 << 30,
     );
-    let raw = bigwig_values(&dir.path().join("a/coverage.bw"), &spec.refs);
+    let raw = bigwig_values(&baseline.join("coverage.bw"), &spec.refs);
     let cpm = bigwig_values(&dir.path().join("c/coverage.bw"), &spec.refs);
     for (x, y) in raw.iter().flatten().zip(cpm.iter().flatten()) {
         let want = (*x as f64 * 1e6 / counted) as f32;
         assert!((y - want).abs() <= want.abs() * 1e-6, "{y} vs {want}");
+    }
+}
+
+#[test]
+fn filter_require_exclude_mapq_and_missing_nh_follow_explicit_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let sam = dir.path().join("filters.sam");
+    let rows = [
+        (0u16, 20u8, Some(1)),
+        (0, 20, None),
+        (0, 20, Some(2)),
+        (0, 19, Some(1)),
+        (0x400, 20, Some(1)),
+        (0x100, 20, Some(1)),
+        (0x200, 20, Some(1)),
+        (0x10, 20, Some(1)),
+        (0x810, 20, Some(1)),
+        (0x50, 20, Some(1)),
+    ];
+    let mut text = "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:128\n".to_owned();
+    for (i, (flag, mapq, nh)) in rows.iter().enumerate() {
+        text.push_str(&format!(
+            "r{i}\t{flag}\tchr1\t{}\t{mapq}\t1M\t*\t0\t0\tA\tI",
+            i * 10 + 1
+        ));
+        if let Some(nh) = nh {
+            text.push_str(&format!("\tNH:i:{nh}"));
+        }
+        text.push('\n');
+    }
+    std::fs::write(&sam, text).unwrap();
+    let bam = dir.path().join("filters.bam");
+    common::bam_of(&sam, &bam);
+    let cases = [
+        ("default", Filter::new(), vec![0, 1, 2, 3, 7, 8, 9]),
+        (
+            "reverse-unique",
+            Filter {
+                require: 0x10,
+                min_mapq: 20,
+                unique: true,
+                ..Filter::new()
+            },
+            vec![7, 8, 9],
+        ),
+        (
+            "all-flags-unique",
+            Filter {
+                exclude: 0,
+                min_mapq: 20,
+                unique: true,
+                ..Filter::new()
+            },
+            vec![0, 1, 4, 5, 6, 7, 8, 9],
+        ),
+        (
+            "require-all-bits",
+            Filter {
+                require: 0x50,
+                ..Filter::new()
+            },
+            vec![9],
+        ),
+    ];
+    for (name, filter, kept) in cases {
+        let out = dir.path().join(name);
+        run(
+            &bam,
+            &out,
+            Coverage {
+                filter,
+                ..Coverage::default()
+            },
+            2,
+            128 << 20,
+        );
+        let mut want = vec![0.0; 128];
+        for index in &kept {
+            want[index * 10] = 1.0;
+        }
+        assert_eq!(
+            bigwig_values(&out.join("coverage.bw"), &[("chr1".into(), 128)]),
+            vec![want],
+            "{name}: filter={filter:?}, retained input rows={kept:?}"
+        );
     }
 }

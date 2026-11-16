@@ -7,18 +7,19 @@
 //! any thread count and with spilled buffers.
 
 mod common;
+mod support;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::{
-    Gene, Read, Rng, bcf_of_vcf, files, gene_hits, genes, genome, gtf, gunzip, read_10x_layer,
+    Gene, Read, Rng, bcf_of_vcf, gene_hits, genes, genome, gtf, gunzip, read_10x_layer,
     reverse_for, write_bam,
 };
 use omicsweave_gtf::{Annotation, ReadOptions};
 use omicsweave_quant::{
-    AlleleGenes, Alleles, Budget, MatrixFormat, Product, Strandedness, Task, plan, quantify, run,
+    AlleleGenes, Alleles, Budget, MatrixFormat, Product, Strandedness, Task, plan, quantify,
 };
 
 const REFS: [(&str, u32); 2] = [("chr1", 40_000), ("chr2", 25_000)];
@@ -404,6 +405,21 @@ fn allele_matrices_and_table_match_the_reads() {
             "{layer}"
         );
     }
+    support::assert_storage_invariant(
+        &out,
+        |target| task(&f, target, products(&f)),
+        &[
+            ("alleles", "ref"),
+            ("alleles", "alt"),
+            ("alleles", "other"),
+            ("alleles/genes", "hap1"),
+            ("alleles/genes", "hap2"),
+            ("alleles/genes", "both"),
+            ("bulk", "ref"),
+            ("bulk", "alt"),
+            ("bulk", "other"),
+        ],
+    );
     // Every panel SNV is a column, in file order, the others skipped.
     let ids: Vec<String> = gunzip(&dir.join("features.tsv.gz"))
         .lines()
@@ -419,6 +435,11 @@ fn allele_matrices_and_table_match_the_reads() {
     assert_eq!(
         lines.next().unwrap(),
         "chrom\tpos\tref\talt\tref_count\talt_count\tother_count\talt_fraction"
+    );
+    assert_eq!(
+        lines.clone().count(),
+        f.snvs.len(),
+        "one output table row per SNV"
     );
     for (line, s) in lines.zip(&f.snvs) {
         let id = site_id(&f, s);
@@ -463,25 +484,17 @@ fn allele_matrices_and_table_match_the_reads() {
 #[test]
 fn allele_outputs_do_not_depend_on_threads_or_spilling() {
     let f = fixture(92);
-    let a = f.dir.path().join("a");
-    quantify(task(&f, &a, products(&f)), Budget::new(1, 1 << 30), None).unwrap();
-    let b = f.dir.path().join("b");
-    let mut p = plan(task(&f, &b, products(&f)), Budget::new(6, 256 << 20)).unwrap();
-    for s in &mut p.stages {
-        s.1 = 8 << 10;
-    }
-    run(&p, None).unwrap();
-    let summary = std::fs::read_to_string(b.join("summary.json")).unwrap();
-    assert!(
-        summary
-            .lines()
-            .any(|l| l.contains("spilled_bytes") && !l.contains(": 0,")),
-        "the small buffers spill"
+    support::assert_execution_invariant(
+        f.dir.path(),
+        |out| task(&f, out, products(&f)),
+        8 << 10,
+        1,
     );
-    let strip = |v: Vec<(String, Vec<u8>)>| -> Vec<(String, Vec<u8>)> {
-        v.into_iter().filter(|(n, _)| n != "summary.json").collect()
-    };
-    assert_eq!(strip(files(&a)), strip(files(&b)));
+}
+
+#[test]
+fn unknown_phased_sample_is_rejected_before_output() {
+    let f = fixture(92);
     // A sample that is not in the panel is an error before any output.
     let mut sc = Alleles::single_cell(f.bcf.clone());
     sc.genes = Some(AlleleGenes {

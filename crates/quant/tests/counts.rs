@@ -3,6 +3,7 @@
 //! UMIs, read groups, whitelists, genome bins, matrix formats).
 
 mod common;
+mod support;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -278,11 +279,7 @@ fn naive_sc(f: &Fixture) -> (Vec<String>, BTreeMap<(String, String), u32>) {
 fn single_cell_umis_match_reference_in_every_format() {
     let f = fixture(5, Spec::default());
     let (rows, want) = naive_sc(&f);
-    let mut results = Vec::new();
-    for (i, fmt) in [MatrixFormat::Cpk, MatrixFormat::Mtx, MatrixFormat::Csv]
-        .into_iter()
-        .enumerate()
-    {
+    for (i, fmt) in support::STORAGE_FORMATS.into_iter().enumerate() {
         let out = run(
             &f,
             &format!("sc{i}"),
@@ -301,7 +298,6 @@ fn single_cell_umis_match_reference_in_every_format() {
         let first = features.lines().next().unwrap();
         assert_eq!(first.split('\t').count(), 6);
         assert!(first.contains("\tGene Expression\t"));
-        results.push(got);
     }
 }
 
@@ -390,35 +386,15 @@ fn spilled_sorts_give_the_same_files() {
     tiles.features = FeatureSource::Bins(200);
     tiles.dedup = omicsweave_quant::Dedup::None;
     let products = [Counts::rna_single_cell(), tiles];
-    let a = f.dir.path().join("big");
-    let mut task = Task::new(vec![f.bam.clone()], &a);
-    task.annotation = Some(Arc::clone(&f.ann));
-    task.products = products.iter().cloned().map(Product::Counts).collect();
-    quantify(task.clone(), Budget::new(1, 2 << 30), None).unwrap();
-    let b = f.dir.path().join("small");
-    task.out_dir = b.clone();
-    // Sort buffers far smaller than the data, so that both sorts spill.
-    let mut p = omicsweave_quant::plan(task, Budget::new(6, 512 << 20)).unwrap();
-    for s in &mut p.stages {
-        s.1 = 64 << 10;
-    }
-    omicsweave_quant::run(&p, None).unwrap();
-    let summary = std::fs::read_to_string(b.join("summary.json")).unwrap();
-    assert_eq!(
-        summary
-            .lines()
-            .filter(|l| l.contains("spilled_bytes") && !l.contains(": 0,"))
-            .count(),
+    support::assert_execution_invariant(
+        f.dir.path(),
+        |out| {
+            let mut task = Task::new(vec![f.bam.clone()], out);
+            task.annotation = Some(Arc::clone(&f.ann));
+            task.products = products.iter().cloned().map(Product::Counts).collect();
+            task
+        },
+        64 << 10,
         2,
-        "both sorts should spill"
     );
-    for name in ["genes", "tiles"] {
-        for file in ["barcodes.tsv.gz", "features.tsv.gz", "matrix.cpk"] {
-            assert_eq!(
-                std::fs::read(a.join(name).join(file)).unwrap(),
-                std::fs::read(b.join(name).join(file)).unwrap(),
-                "{name}/{file}"
-            );
-        }
-    }
 }

@@ -13,7 +13,6 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
 
 use omicsweave_cool::{Cool, PixelBatch, PixelScratch, mcool_resolutions};
 
@@ -26,23 +25,25 @@ fn env_u64(name: &str) -> Option<u64> {
 fn real_mcool() {
     let path = PathBuf::from(std::env::var("OW_COOL_SMOKE").expect("set OW_COOL_SMOKE"));
     let resolutions = mcool_resolutions(&path).unwrap();
+    assert!(
+        !resolutions.is_empty(),
+        "{} has no resolutions",
+        path.display()
+    );
     println!("{}: resolutions {resolutions:?}", path.display());
 
     let mut scratch = PixelScratch::new();
     let (mut fast, mut library) = (PixelBatch::new(), PixelBatch::new());
     for &res in &resolutions {
-        let t = Instant::now();
         let cool = Cool::open(&path, &format!("/resolutions/{res}")).unwrap();
-        let open = t.elapsed();
         let spans = cool.pixel_spans(1 << 20);
         println!(
-            "res {res:>8}: {} chroms, {} bins, {} pixels, paths {:?}, {} spans, open {:.2?}",
+            "res {res:>8}: {} chroms, {} bins, {} pixels, paths {:?}, {} spans",
             cool.chroms().len(),
             cool.n_bins(),
             cool.n_pixels(),
             cool.read_paths(),
             spans.len(),
-            open,
         );
         let picks = [
             0,
@@ -61,33 +62,17 @@ fn real_mcool() {
     }
 
     let res = env_u64("OW_COOL_SMOKE_RES")
-        .map(|r| r as u32)
+        .map(|r| u32::try_from(r).expect("OW_COOL_SMOKE_RES must fit u32"))
         .unwrap_or(resolutions[0]);
-    let threads = env_u64("OW_COOL_SMOKE_THREADS").unwrap_or(16) as usize;
+    let threads = usize::try_from(env_u64("OW_COOL_SMOKE_THREADS").unwrap_or(16))
+        .expect("OW_COOL_SMOKE_THREADS must fit usize");
+    assert!(threads > 0, "OW_COOL_SMOKE_THREADS must be positive");
     let group = format!("/resolutions/{res}");
     let cool = Cool::open(&path, &group).unwrap();
     let spans = cool.pixel_spans(1 << 20);
 
-    // libhdf5's reader on one span, for scale.
-    let span = spans[spans.len() / 2].clone();
-    let t = Instant::now();
-    cool.read_pixels_library(span.clone(), &mut library)
-        .unwrap();
-    let lib_rate = (span.end - span.start) as f64 / t.elapsed().as_secs_f64();
-    let t = Instant::now();
-    cool.read_pixels(span.clone(), &mut scratch, &mut fast)
-        .unwrap();
-    let fast_rate = (span.end - span.start) as f64 / t.elapsed().as_secs_f64();
-    println!(
-        "res {res}: one span of {} rows, libhdf5 {:.1} M rows/s, parallel path (1 thread) {:.1} M rows/s",
-        span.end - span.start,
-        lib_rate / 1e6,
-        fast_rate / 1e6
-    );
-
     let next = AtomicUsize::new(0);
     let totals = Mutex::new((0u64, 0f64));
-    let t = Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
@@ -112,12 +97,8 @@ fn real_mcool() {
             });
         }
     });
-    let elapsed = t.elapsed();
     let (rows, sum) = totals.into_inner().unwrap();
-    println!(
-        "res {res}: streamed {rows} pixels on {threads} threads in {elapsed:.2?}: {:.1} M rows/s, count sum {sum}",
-        rows as f64 / elapsed.as_secs_f64() / 1e6
-    );
+    println!("res {res}: streamed {rows} pixels on {threads} threads, count sum {sum}");
     assert_eq!(rows, cool.n_pixels());
 
     let file = hdf5_metno::File::open(&path).unwrap();
