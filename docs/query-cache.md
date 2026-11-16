@@ -2,7 +2,7 @@
 
 缓存由调用方显式创建和管理，用于让重叠窗口、重复访问及多个查询执行上下文共享底层块。reader 默认不启用缓存，也不自动启动预取线程。
 
-已接入查询格式：BGZF FASTA、2bit、HIC、bigWig、bigBed、BAM 与 BCF indexed 查询。普通 FA 直接范围读取。BED、COOL/mcool 及其他 convert-only 格式不提供查询路径，也不提供这套缓存接口。
+已接入查询格式：BGZF FASTA、2bit、HIC、bigWig、bigBed、BAM、CRAM 与 BCF indexed 查询。普通 FA 直接范围读取。BED、COOL/mcool 及其他 convert-only 格式不提供查询路径，也不提供这套缓存接口。
 
 GTF/GFF3 的 `Annotation` 一次完整加载为只读列式表，外部通过 `Arc<Annotation>` 共享表、索引和派生视图，各自创建 sweep cursor；查询不会重新解压源文件，因此不附加块缓存接口。Rust `IntervalSet` 允许直接编辑公开列，编辑后需调用 `clear_index()`，下次查询再构建索引；它不会自动检测任意列修改。quant 保留自身参考窗口与任务内存预算，不套用格式 reader 的缓存控制面。
 
@@ -35,7 +35,11 @@ cache.clear()
 
 `TrackReader`、bigBed `IntervalReader`、`ContactReader`、`AlignmentReader` 和 `VariantReader` 使用同样的 `cache=`、`set_cache`、`cache_namespace`、`describe_cache`、`prefetch_cache` 和 `clone` 控制面；Contact 的描述/预取参数为其查询使用的 ContactWindow。BAM/BCF 还可通过 `stream_stats()`、`reset_stream_stats()`核对真实读取/解压计数。
 
+CRAM 的依赖还取决于所需字段。`AlignmentReader.describe_cache(region, fields)` 和 `prefetch_cache(region, fields)` 接受与 `fetch` 相同的字段选择，默认仅固定字段；预取完整记录时使用 `fields="all"`。其缓存保留不可变的容器元数据、压缩数据及解码 slice，执行上下文不私下复用上次查询的解码结果。CRAM 的 `stream_stats()` 提供 `read_calls`、`bytes_read`、`containers`、`slices_decoded`、`records_decoded`、`records_considered`；slice 解码计数不冒充物理 block 的 inflate 次数。reference 与文件、索引一起属于不可变源会话；clone 共享会话，换文件或 reference 则重新打开。
+
 ConsensusReader 使用已打开的 SequenceReader 作为 reference 即可共享它的块缓存；Consensus 按区间经 BCF + CSI 读取记录，克隆共享 BCF 的 header、索引与选项，并使用独立的 BCF 与 reference 执行上下文，不缓存各个样本的最终 consensus。
+
+每个公开的 consensus `fetch` / `fetch_batch` 调用重新加载区域；只有同一次 `fetch_batch` 的多个 allele selector 共享一次 reference 和记录解码。不会因重复请求同一区域而私下命中上次的完整解压窗口。
 
 ## 驻留与预算
 
@@ -68,6 +72,8 @@ clear/evict 不使正在查询的只读 lease 失效；旧加载完成后不会�
 源文件和索引在会话期间必须保持不变。更新文件后重新打开 reader，重新加载索引；仅清空数据块不能更新陈旧索引。namespace 是会话身份，不是内容 hash，缓存不自动检测任意原地改写。
 
 缓存和打开的 reader 是进程内对象。DataLoader spawn/pickle 只传递 reader 的重新打开配置，子进程显式创建自己的 cache；缓存内容和 namespace 不跨进程序列化。正常 CPython fork 后，继承的 reader/cache 在碰锁前拒绝查询，需在子进程重新创建。直接使用外部 libc fork 绕过 CPython fork hooks 不在此保证内。
+
+POSIX 的原生 child hook 会在用户 Python child callback 之前更新进程标识，包括用户在导入包之前注册的回调。GTF Annotation 与 IntervalSet 的 native 懒索引查询也属于进程内状态；fork 后分别重新读取/反序列化 Annotation，或重新构建 IntervalSet。已经导出的普通列数组仍可作为数组读取。
 
 ## 与未来统一 loader 的边界
 
