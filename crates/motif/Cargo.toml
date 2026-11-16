@@ -1,0 +1,20 @@
+[package]
+name = "omicsweave-motif"
+description = "Motif matching: FFM models compiled with a background and a scoring policy into one scan that updates every motif's reducers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+omicsweave-ffm = { path = "../ffm" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "glam2_throughput"
+harness = false
