@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::BufRead;
+use std::sync::Arc;
 
 use omicsweave_core::{Error, Result};
 
@@ -75,7 +76,7 @@ pub struct SamHeader {
     text: Vec<u8>,
     lines: u64,
     refs: Vec<Reference>,
-    names: NameMap,
+    names: Arc<NameMap>,
 }
 
 impl SamHeader {
@@ -84,8 +85,10 @@ impl SamHeader {
     /// left in `input` for the caller.
     pub fn read<R: BufRead + ?Sized>(input: &mut R) -> Result<SamHeader> {
         let mut h = SamHeader::default();
-        let mut lines: Vec<Vec<u8>> = Vec::new();
-        let mut first_hd: Option<usize> = None;
+        // Build under one exclusive borrow; readers and encoders share the
+        // immutable dictionary after the header is complete.
+        let names = Arc::get_mut(&mut h.names).expect("new header dictionary is exclusive");
+        let mut first_hd = None;
         let mut line = Vec::new();
         loop {
             let buf = input.fill_buf()?;
@@ -134,27 +137,26 @@ impl SamHeader {
             } else {
                 let tags = tags(&line[3..]).ok_or_else(|| fail("malformed key:value pair"))?;
                 match &ty {
-                    b"SQ" => h.add_reference(&tags).map_err(fail)?,
+                    b"SQ" => Self::add_reference(&mut h.refs, names, &tags).map_err(fail)?,
                     b"RG" | b"PG" if !tags.iter().any(|t| t.starts_with(b"ID")) => {
                         return Err(fail("header line has no ID tag"));
                     }
                     _ => {}
                 }
             }
+            let start = h.text.len();
+            h.text.extend_from_slice(&line);
+            h.text.push(b'\n');
             if &ty == b"HD" && first_hd.is_none() {
-                first_hd = Some(lines.len());
+                first_hd = Some(start..h.text.len());
             }
-            lines.push(std::mem::take(&mut line));
         }
         // htslib rebuilds the text from its parsed lines, with the first
         // @HD moved to the top.
-        if let Some(i) = first_hd {
-            let hd = lines.remove(i);
-            lines.insert(0, hd);
-        }
-        for l in &lines {
-            h.text.extend_from_slice(l);
-            h.text.push(b'\n');
+        // Keep one reusable input line and one contiguous text buffer;
+        // moving a late @HD needs no separately retained line buffers.
+        if let Some(hd) = first_hd {
+            h.text[..hd.end].rotate_right(hd.len());
         }
         if h.text.len() > u32::MAX as usize {
             return Err(Error::invalid("SAM header", "header text too long for BAM"));
@@ -164,7 +166,11 @@ impl SamHeader {
 
     /// `@SQ` bookkeeping as `sam_hrecs_update_hashes` does it, including
     /// `AN` alternative names, which resolve RNAME and RNEXT as well.
-    fn add_reference(&mut self, tags: &[&[u8]]) -> std::result::Result<(), &'static str> {
+    fn add_reference(
+        refs: &mut Vec<Reference>,
+        names: &mut NameMap,
+        tags: &[&[u8]],
+    ) -> std::result::Result<(), &'static str> {
         let mut name: Option<&[u8]> = None;
         let mut alt: Option<&[u8]> = None;
         let mut len: i64 = -1;
@@ -188,22 +194,22 @@ impl SamHeader {
         if conflicting {
             return Err("@SQ line with multiple LN tags of different values");
         }
-        if let Some(&tid) = self.names.get(name) {
+        if let Some(&tid) = names.get(name) {
             // An SN equal to an earlier SN is a duplicate; one equal to an
             // earlier AN takes the name over.
-            if self.refs[tid as usize].name == name {
+            if refs[tid as usize].name == name {
                 return Err("duplicate @SQ SN");
             }
         }
-        let tid = self.refs.len() as i32;
-        self.refs.push(Reference {
+        let tid = refs.len() as i32;
+        refs.push(Reference {
             name: name.to_vec(),
             len: len as u64,
         });
-        self.names.insert(name.into(), tid);
+        names.insert(name.into(), tid);
         for a in alt.into_iter().flat_map(|a| a.split(|&c| c == b',')) {
             if !a.is_empty() {
-                self.names.entry(a.into()).or_insert(tid);
+                names.entry(a.into()).or_insert(tid);
             }
         }
         Ok(())
@@ -235,7 +241,7 @@ impl SamHeader {
         self.names.get(name).copied()
     }
 
-    pub(crate) fn names(&self) -> &NameMap {
+    pub(crate) fn names(&self) -> &Arc<NameMap> {
         &self.names
     }
 }

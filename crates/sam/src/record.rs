@@ -2,6 +2,7 @@
 //! `bam_write1` writes it (`sam.c`).
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use memchr::memchr;
 use omicsweave_core::{Error, Result};
@@ -95,7 +96,7 @@ impl BamScratch {
 /// treated as negative, as on x86-64.
 #[derive(Debug, Clone)]
 pub struct BamEncoder {
-    names: NameMap,
+    names: Arc<NameMap>,
     n_targets: usize,
 }
 
@@ -176,6 +177,8 @@ fn parse_flag(s: &[u8], overflow: &mut bool) -> (u16, usize) {
 }
 
 impl BamEncoder {
+    /// Shares the header's immutable reference-name dictionary. The encoder
+    /// owns its share, so the header can be dropped independently.
     pub fn new(header: &SamHeader) -> BamEncoder {
         BamEncoder {
             names: header.names().clone(),
