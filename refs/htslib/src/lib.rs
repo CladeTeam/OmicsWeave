@@ -216,6 +216,58 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+// Base modifications (`htslib/sam.h`, `sam_mods.c`).
+
+#[repr(C)]
+pub struct hts_base_mod_state {
+    _opaque: [u8; 0],
+}
+
+/// One modification at a position: `modified_base` is the code (ASCII,
+/// or a ChEBI number negated), `qual` the ML value or a negative
+/// `HTS_MOD_*`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct hts_base_mod {
+    pub modified_base: c_int,
+    pub canonical_base: c_int,
+    pub strand: c_int,
+    pub qual: c_int,
+}
+
+/// In MM but not ML.
+pub const HTS_MOD_UNKNOWN: c_int = -1;
+
+unsafe extern "C" {
+    pub fn hts_base_mod_state_alloc() -> *mut hts_base_mod_state;
+    pub fn hts_base_mod_state_free(state: *mut hts_base_mod_state);
+    /// 0 on success, -1 on malformed tags.
+    pub fn bam_parse_basemod2(
+        b: *const bam1_t,
+        state: *mut hts_base_mod_state,
+        flags: u32,
+    ) -> c_int;
+    /// Modifications at the next modified position (`*pos`): their number,
+    /// 0 at the end, < 0 on error.
+    pub fn bam_next_basemod(
+        b: *const bam1_t,
+        state: *mut hts_base_mod_state,
+        mods: *mut hts_base_mod,
+        n_mods: c_int,
+        pos: *mut c_int,
+    ) -> c_int;
+    /// Strand, implicit flag and canonical base of type `i`; 0 on success.
+    pub fn bam_mods_queryi(
+        state: *mut hts_base_mod_state,
+        i: c_int,
+        strand: *mut c_int,
+        implicit: *mut c_int,
+        canonical: *mut c_char,
+    ) -> c_int;
+    /// The codes of the types parsed; `*ntype` set to their number.
+    pub fn bam_mods_recorded(state: *mut hts_base_mod_state, ntype: *mut c_int) -> *mut c_int;
+}
+
 #[repr(C)]
 pub struct hts_idx_t {
     _opaque: [u8; 0],
@@ -224,6 +276,33 @@ pub struct hts_idx_t {
 #[repr(C)]
 pub struct hts_itr_t {
     _opaque: [u8; 0],
+}
+
+// Tabix text indices (`htslib/tbx.h`).
+#[repr(C)]
+pub struct tbx_t {
+    _opaque: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct kstring_t {
+    pub l: usize,
+    pub m: usize,
+    pub s: *mut c_char,
+}
+
+unsafe extern "C" {
+    pub fn tbx_index_load(fn_: *const c_char) -> *mut tbx_t;
+    pub fn tbx_destroy(tbx: *mut tbx_t);
+    pub fn tbx_itr_querys1(tbx: *mut tbx_t, region: *const c_char) -> *mut hts_itr_t;
+    /// >= 0 on success, -1 at the end, < -1 on error; `line.s` is malloc'd.
+    pub fn tbx_itr_next1(
+        fp: *mut htsFile,
+        tbx: *mut tbx_t,
+        itr: *mut hts_itr_t,
+        line: *mut kstring_t,
+    ) -> c_int;
 }
 
 // BAM record fields, index loading and region iteration (`src/bam.c`).
