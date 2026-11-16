@@ -82,15 +82,20 @@ impl SequenceKind {
 }
 
 /// The index at `given`, or else beside the FASTA file at `beside`; it
-/// must exist (indexes are built explicitly, never on open).
-fn index<T>(given: Option<&Path>, beside: PathBuf, parse: fn(&[u8]) -> Result<T>) -> Result<T> {
+/// must exist (indexes are built explicitly, never on open, by `builder`).
+fn index<T>(
+    given: Option<&Path>,
+    beside: PathBuf,
+    builder: &str,
+    parse: fn(&[u8]) -> Result<T>,
+) -> Result<T> {
     let path = given.map_or(beside, Path::to_path_buf);
     match std::fs::read(&path) {
         Ok(bytes) => parse(&bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::Io {
             kind: e.kind(),
             detail: format!(
-                "index {} not found; build it with omicsweave.build_index",
+                "index {} not found; build it with {builder}.build_index()",
                 path.display()
             ),
         }),
@@ -106,9 +111,10 @@ fn open_fasta(
     fai: Option<&Path>,
     gzi: Option<&Path>,
 ) -> Result<FastaReader<FileSource>> {
-    let found_fai = index(fai, fai_path(path), Fai::parse)?;
+    let builder = if bgzf { "BgzipFasta" } else { "Fasta" };
+    let found_fai = index(fai, fai_path(path), builder, Fai::parse)?;
     let found_gzi = if bgzf {
-        Some(index(gzi, gzi_path(path), Gzi::parse)?)
+        Some(index(gzi, gzi_path(path), builder, Gzi::parse)?)
     } else {
         None
     };
