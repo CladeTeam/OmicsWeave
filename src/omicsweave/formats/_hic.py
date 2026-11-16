@@ -5,15 +5,17 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 
 from .. import _native
+from .._budget import threads as _threads
 from ..types import BinUnit
 from ._base import ChromIndex, File, PathLike, Writer
 from ._sidecar import Sidecar, build_sidecar, written_sidecar
 
-__all__ = ["Hic", "HicBuilder", "HicHeader", "HicWriter"]
+__all__ = ["Hic", "HicBlocks", "HicBuilder", "HicHeader", "HicWriter"]
 
 
 class Hic(File):
@@ -62,14 +64,53 @@ def _u32(a: object) -> np.ndarray:
     return np.ascontiguousarray(np.asarray(a, dtype=np.uint32).ravel())
 
 
+@dataclass(frozen=True, slots=True)
+class HicBlocks:
+    """How a ``.hic`` writer cuts maps into blocks: ``intra`` (within a
+    chromosome) and ``inter`` (between chromosomes) bins per block side, or
+    ``"juicer"`` for the grid the Juicer tools choose (about 1000 bins). The
+    writers' default is 128-bin blocks within chromosomes, where loaders
+    read windows along the diagonal, and the Juicer grid between them. Any
+    reader of the format takes a map's block size from the file."""
+
+    intra: int | Literal["juicer"]
+    inter: int | Literal["juicer"] = "juicer"
+
+
+def _blocks(blocks: HicBlocks | None) -> tuple[int | None, int | None] | None:
+    if blocks is None:
+        return None
+    return (_bins(blocks.intra), _bins(blocks.inter))
+
+
+def _bins(bins: int | Literal["juicer"]) -> int | None:
+    return None if bins == "juicer" else int(bins)
+
+
 class HicWriter(Writer[Hic]):
-    """Writes a ``.hic`` file from binned maps. ``sidecar`` also saves its
-    sidecar on :meth:`close`, built as the file is written."""
+    """Writes a ``.hic`` file from binned maps: blocks of ``level`` zlib
+    (0-9; the Juicer tools use 6), laid out as ``blocks`` says; ``threads``
+    above 1 encode and compress blocks on that many workers instead of the
+    calling thread. ``sidecar`` also saves its sidecar on :meth:`close`,
+    built as the file is written."""
 
     def __init__(
-        self, path: PathLike, header: HicHeader, *, level: int = 6, sidecar: bool = False
+        self,
+        path: PathLike,
+        header: HicHeader,
+        *,
+        level: int = 6,
+        blocks: HicBlocks | None = None,
+        sidecar: bool = False,
+        threads: int = 1,
     ) -> None:
-        native = _native.HicWriter(os.fspath(path), *_native_header(header), level)
+        native = _native.HicWriter(
+            os.fspath(path),
+            *_native_header(header),
+            level,
+            blocks=_blocks(blocks),
+            threads=_threads(threads),
+        )
         super().__init__(Hic(path), native)
         self._chroms = ChromIndex(header.chroms)
         self._sidecar = sidecar
@@ -107,9 +148,22 @@ class HicBuilder(Writer[Hic]):
     also saves its sidecar on :meth:`close`, built as the file is written."""
 
     def __init__(
-        self, path: PathLike, header: HicHeader, *, level: int = 6, sidecar: bool = False
+        self,
+        path: PathLike,
+        header: HicHeader,
+        *,
+        level: int = 6,
+        blocks: HicBlocks | None = None,
+        sidecar: bool = False,
+        threads: int = 1,
     ) -> None:
-        native = _native.HicBuilder(os.fspath(path), *_native_header(header), level)
+        native = _native.HicBuilder(
+            os.fspath(path),
+            *_native_header(header),
+            level,
+            blocks=_blocks(blocks),
+            threads=_threads(threads),
+        )
         super().__init__(Hic(path), native)
         self._chroms = ChromIndex(header.chroms)
         self._sidecar = sidecar

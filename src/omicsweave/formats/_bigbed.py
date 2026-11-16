@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .. import _native
+from .._budget import threads as _threads
 from ..types import StringVector
 from ._base import ChromIndex, File, PathLike, Writer
 from ._bbi import BbiOptions, native_options
@@ -53,16 +54,18 @@ def _strings(annotation: StringVector | Iterable[str] | str | None, n: int) -> S
 class BigBedWriter(Writer[BigBed]):
     """Writes a bigBed file over ``chroms`` (lengths by name, in file order).
     Features come sorted by chromosome and start. ``sidecar`` also saves its
-    sidecar on :meth:`close`, built as the file is written."""
+    sidecar on :meth:`close`, built as the file is written. Blocks are
+    compressed on ``threads`` workers, as :class:`BigWigWriter` does."""
 
     def __init__(
         self,
         path: PathLike,
         chroms: Mapping[str, int],
         schema: BigBedSchema | None = None,
-        options: BbiOptions | None = None,
         *,
+        options: BbiOptions | None = None,
         sidecar: bool = False,
+        threads: int = 1,
     ) -> None:
         schema = schema or BigBedSchema()
         defined = schema.defined_field_count
@@ -73,6 +76,7 @@ class BigBedWriter(Writer[BigBed]):
             schema.field_count if defined is None else defined,
             schema.auto_sql,
             *native_options(options or BbiOptions()),
+            threads=_threads(threads),
         )
         super().__init__(BigBed(path), native)
         self._chroms = ChromIndex(chroms)

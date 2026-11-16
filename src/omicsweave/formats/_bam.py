@@ -6,6 +6,7 @@ import os
 from typing import Literal
 
 from .. import _native
+from .._budget import threads as _threads
 from ._bai import Bai
 from ._base import File, ensure_format
 from ._csi import Csi
@@ -31,8 +32,7 @@ class Bam(File):
         ``samtools index`` does: ``<bam>.bai``, or ``<bam>.csi`` with bins
         of ``2**min_shift`` bases. ``auto`` builds a BAI when every
         reference fits one (at most 2**29 bases), else a CSI. ``threads``
-        (default: every core) inflate the file."""
+        (default: every core the process may run on) inflate the file."""
         ensure_format(self)
-        threads = threads or os.cpu_count() or 1
-        made, path = _native.build_bam_index(os.fspath(self), kind, min_shift, threads)
+        made, path = _native.build_bam_index(os.fspath(self), kind, min_shift, _threads(threads))
         return Bai(path) if made == "bai" else Csi(path)

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .. import _native
+from .._budget import threads as _threads
 from ._base import ChromIndex, File, PathLike, Writer
 from ._bbi import BbiOptions, native_options
 from ._sidecar import Sidecar, build_sidecar, written_sidecar
@@ -42,18 +43,24 @@ class BigWigWriter(Writer[BigWig]):
     """Writes a bigWig file over ``chroms`` (lengths by name; their order is
     the file's chromosome order). Items come sorted by chromosome and start
     and do not overlap. ``sidecar`` also saves its sidecar on :meth:`close`,
-    built as the file is written."""
+    built as the file is written. ``threads`` above 1 compress blocks on that
+    many workers instead of the calling thread; the file does not depend on
+    the count."""
 
     def __init__(
         self,
         path: PathLike,
         chroms: Mapping[str, int],
-        options: BbiOptions | None = None,
         *,
+        options: BbiOptions | None = None,
         sidecar: bool = False,
+        threads: int = 1,
     ) -> None:
         native = _native.BigWigWriter(
-            os.fspath(path), list(chroms.items()), *native_options(options or BbiOptions())
+            os.fspath(path),
+            list(chroms.items()),
+            *native_options(options or BbiOptions()),
+            threads=_threads(threads),
         )
         super().__init__(BigWig(path), native)
         self._chroms = ChromIndex(chroms)

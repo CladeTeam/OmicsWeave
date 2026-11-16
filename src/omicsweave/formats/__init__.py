@@ -27,8 +27,9 @@ companion files are formats in their own right:
 - Loader metadata: :class:`Sidecar` (``.sidecar``)
 
 Writers produce files of a format with their companions:
-:class:`FastaWriter`, :class:`BigWigWriter`, :class:`BigBedWriter`,
-:class:`HicWriter`, :class:`HicBuilder`. :func:`detect` tells a file's
+:class:`FastaWriter`, :class:`TwoBitWriter`, :class:`BigWigWriter`,
+:class:`BigBedWriter`, :class:`HicWriter`, :class:`HicBuilder`;
+:func:`read_sidecar` reads what a sidecar says of a file. :func:`detect` tells a file's
 format from its content; :data:`FORMATS` maps every format name to its class.
 """
 
@@ -50,11 +51,18 @@ from ._detect import FORMATS, detect
 from ._fai import Fai
 from ._fasta import BgzipFasta, Fasta, FastaWriter, GzipFasta
 from ._gzi import Gzi
-from ._hic import Hic, HicBuilder, HicHeader, HicWriter
+from ._hic import Hic, HicBlocks, HicBuilder, HicHeader, HicWriter
 from ._pairs import GzipJuicerShort, GzipPairs, JuicerShort, Pairs
 from ._sam import GzipSam, Sam
-from ._sidecar import Sidecar
-from ._twobit import TwoBit
+from ._sidecar import (
+    BbiLevelBlocks,
+    BbiSidecar,
+    HicMapBlocks,
+    HicSidecar,
+    Sidecar,
+    read_sidecar,
+)
+from ._twobit import TwoBit, TwoBitWriter
 from ._vcf import GzipVcf, Vcf
 from ._wig import GzipWig, Wig
 
@@ -62,7 +70,9 @@ __all__ = [
     "FORMATS",
     "Bai",
     "Bam",
+    "BbiLevelBlocks",
     "BbiOptions",
+    "BbiSidecar",
     "Bcf",
     "Bed",
     "BedGraph",
@@ -93,8 +103,11 @@ __all__ = [
     "GzipVcf",
     "GzipWig",
     "Hic",
+    "HicBlocks",
     "HicBuilder",
     "HicHeader",
+    "HicMapBlocks",
+    "HicSidecar",
     "HicWriter",
     "JuicerShort",
     "Mcool",
@@ -103,8 +116,10 @@ __all__ = [
     "Sam",
     "Sidecar",
     "TwoBit",
+    "TwoBitWriter",
     "Vcf",
     "Wig",
     "Writer",
     "detect",
+    "read_sidecar",
 ]
