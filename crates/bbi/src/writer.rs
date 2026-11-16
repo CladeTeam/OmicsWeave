@@ -68,7 +68,7 @@ pub struct WriteOptions {
     pub block_size: u32,
     /// zlib-compress blocks.
     pub compress: bool,
-    /// libdeflate level, 1 to 12.
+    /// libdeflate level, 0 to 12.
     pub level: i32,
     /// Most zoom levels derived.
     pub zoom_levels: usize,
@@ -226,7 +226,7 @@ fn compress(level: i32, raw: &[u8], packed: &mut Vec<u8>) -> Result<usize> {
             Some(i) => i,
             None => {
                 let lvl = libdeflater::CompressionLvl::new(level)
-                    .map_err(|_| invalid("BBI writer", "compression level must be 1 to 12"))?;
+                    .map_err(|_| invalid("BBI writer", "compression level must be 0 to 12"))?;
                 compressors.push((level, libdeflater::Compressor::new(lvl)));
                 compressors.len() - 1
             }
@@ -474,7 +474,7 @@ impl<W: Write + Seek> Core<W> {
         }
         let level = if options.compress {
             libdeflater::CompressionLvl::new(options.level)
-                .map_err(|_| invalid("BBI writer", "compression level must be 1 to 12"))?;
+                .map_err(|_| invalid("BBI writer", "compression level must be 0 to 12"))?;
             Some(options.level)
         } else {
             None
