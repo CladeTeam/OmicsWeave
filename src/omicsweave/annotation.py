@@ -401,7 +401,12 @@ def _reopen(path: str, kwargs: dict[str, Any]) -> Annotation:
 
 class Annotation:
     """A gene annotation read whole; immutable, shared safely by threads,
-    pickled as its path and read options."""
+    pickled as its path and read options.
+
+    Native queries are process-local. After fork, reopen the annotation
+    (or unpickle it) in the child; existing exported numpy columns can
+    still be read as ordinary arrays.
+    """
 
     def __init__(self, native: Any, path: str, kwargs: dict[str, Any]) -> None:
         self._native = native
