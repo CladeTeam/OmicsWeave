@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "omicsweave"
-version = "0.1.0"
+version = "0.2.0"
 description = "A unified framework for loading multi-omics data into model training"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -25,7 +25,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bcftools-sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "htslib-sys",
@@ -294,7 +294,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "htscodecs-sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bzip2-sys",
  "cc",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "htslib-sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bzip2-sys",
  "cc",
@@ -349,14 +349,14 @@ dependencies = [
 
 [[package]]
 name = "lib2bit-sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "libbigwig-sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "libz-sys",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-bam"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "htslib-sys",
  "omicsweave-bgzf",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-bbi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libbigwig-sys",
  "libdeflater",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-bgzf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "htslib-sys",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-consensus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bcftools-sys",
  "htslib-sys",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-convert"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "hdf5-metno",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-cool"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hdf5-metno",
  "hdf5-metno-sys",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "thiserror",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-cram"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bzip2-sys",
  "flate2",
@@ -630,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-fasta"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "htslib-sys",
  "lib2bit-sys",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-ffm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "omicsweave-core",
  "pco",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-gtf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "memchr",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-hic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "libdeflater",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-motif"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "omicsweave-core",
  "omicsweave-ffm",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-msa"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "memchr",
  "omicsweave-bbi",
@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-python"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "numpy",
  "omicsweave-bam",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-quant"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cellpack",
  "flate2",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-sam"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "htslib-sys",
  "memchr",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "omicsweave-vcf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bcftools-sys",
  "flate2",
@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "samtools-sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "htslib-sys",
@@ -1186,7 +1186,7 @@ checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 
 [[package]]
 name = "straw-sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "libz-sys",
@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "subread-sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "libz-sys",

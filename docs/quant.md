@@ -144,7 +144,7 @@ results/
 
 ```json
 {
-  "omicsweave": "0.1.0",
+  "omicsweave": "0.2.0",
   "inputs": [{"path": "sample.bam", "placed_records": 2}],
   "products": [
     {
