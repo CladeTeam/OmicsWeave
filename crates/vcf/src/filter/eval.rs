@@ -1672,7 +1672,8 @@ fn calc_ac_info(h: &Header, rec: &Record, ac: &mut [i32]) -> Result<bool> {
             "htslib exits on INFO/AN smaller than the AC sum",
         ));
     }
-    ac[0] = an - nac;
+    // C int arithmetic, as htslib computes it: AC values are not range-checked.
+    ac[0] = an.wrapping_sub(nac);
     Ok(true)
 }
 
