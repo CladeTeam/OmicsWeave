@@ -18,6 +18,12 @@ const fn nt16_table() -> [u8; 256] {
         t[codes[i].to_ascii_lowercase() as usize] = i as u8;
         i += 1;
     }
+    t[b'U' as usize] = 8;
+    t[b'u' as usize] = 8;
+    t[b'0' as usize] = 1;
+    t[b'1' as usize] = 2;
+    t[b'2' as usize] = 4;
+    t[b'3' as usize] = 8;
     t
 }
 
@@ -253,6 +259,19 @@ impl Decoded {
                 .iter()
                 .map(|&c| NT16[NT16_CODE[c as usize] as usize]),
         );
+    }
+
+    /// Bases of record `i` as decoded (ASCII, before BAM's 4-bit coding).
+    pub(crate) fn seq(&self, i: usize, l_seq: usize) -> &[u8] {
+        let at = self.recs[i].seq as usize;
+        &self.seqs[at..at + l_seq]
+    }
+
+    /// Optional fields in their decoded BAM encoding, without copying.
+    pub(crate) fn aux(&self, i: usize) -> &[u8] {
+        let cr = &self.recs[i];
+        let at = cr.aux as usize;
+        &self.aux[at..at + cr.aux_size as usize]
     }
 
     /// Qualities of record `i`, appended to `out`.

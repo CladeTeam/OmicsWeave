@@ -125,7 +125,7 @@ fn memchr(c: u8, b: &[u8]) -> Option<usize> {
 
 /// `bam_aux_get`: the position of `tag`'s type byte in `aux`. A malformed
 /// field before it, or in it, is an error.
-fn aux_get(aux: &[u8], tag: [u8; 2]) -> std::result::Result<Option<usize>, ()> {
+pub(crate) fn aux_get(aux: &[u8], tag: [u8; 2]) -> std::result::Result<Option<usize>, ()> {
     if aux.len() <= 2 {
         return Ok(None);
     }

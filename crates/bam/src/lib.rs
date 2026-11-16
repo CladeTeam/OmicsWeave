@@ -14,10 +14,15 @@
 //! - [`Record`]: one record read in place, checked as `bam_read1` checks
 //!   it; a long CIGAR held in a `CG` tag replaces its placeholder.
 //!
+//! - [`mods`]: base modifications of a record from its `MM` / `ML` tags,
+//!   decoded as htslib decodes them; region queries return them as
+//!   [`omicsweave_core::ModificationEntry`] rows on request.
+//!
 //! Records are returned as stored: nothing is filtered, counted or
 //! realigned.
 
 mod header;
+pub mod mods;
 mod reader;
 mod record;
 mod scan;

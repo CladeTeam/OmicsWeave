@@ -6,11 +6,12 @@ use std::sync::Arc;
 use omicsweave_bgzf::{BinIndex, ChunkWalk, SeekReader};
 use omicsweave_core::cache::{BlockCache, BlockKey, SourceToken};
 use omicsweave_core::{
-    AlignmentEntry, AlignmentFields, AlignmentRead, AlignmentSize, AlignmentsOut, Error, ReadAt,
-    Region, Result, StringColumn,
+    AlignmentEntry, AlignmentFields, AlignmentRead, AlignmentSize, AlignmentsOut, Error,
+    ModificationEntry, ReadAt, Region, Result, StringColumn,
 };
 
 use crate::header::BamHeader;
+use crate::mods::{ModDecoder, ModSeq, decode_record};
 use crate::record::{Record, unpack_seq};
 use crate::stream::{Reading, next_record};
 
@@ -34,6 +35,9 @@ struct Staged {
     entries: Vec<AlignmentEntry>,
     bytes: Vec<u8>,
     records: Vec<Kept>,
+    decoder: ModDecoder,
+    mods: Vec<ModificationEntry>,
+    mod_ends: Vec<i64>,
 }
 
 /// Where a kept record's fields lie in [`Staged::bytes`].
@@ -212,18 +216,48 @@ impl<S: ReadAt> AlignmentRead for BamReader<S> {
         self.header.chrom_len(chrom)
     }
 
-    fn query(&mut self, region: Region<'_>, fields: AlignmentFields) -> Result<AlignmentSize> {
+    fn query_filtered(
+        &mut self,
+        region: Region<'_>,
+        fields: AlignmentFields,
+        modification_codes: &[i32],
+    ) -> Result<AlignmentSize> {
         let mut staged = std::mem::take(&mut self.staged);
         staged.queried = false;
         staged.fields = fields;
         staged.entries.clear();
         staged.bytes.clear();
         staged.records.clear();
+        staged.mods.clear();
+        staged.mod_ends.clear();
+        let want_mods = fields.contains(AlignmentFields::MODIFICATIONS);
+        let want_record_fields = fields.bits() & !AlignmentFields::MODIFICATIONS.bits() != 0;
         let mut size = AlignmentSize::default();
         let result = self.visit(region, |rec| {
             staged.entries.push(rec.entry());
             size.records += 1;
             if fields.is_empty() {
+                return Ok(());
+            }
+            if want_mods {
+                let (a, b) = rec.aux();
+                decode_record(
+                    &mut staged.decoder,
+                    &[a, b],
+                    ModSeq::Packed {
+                        bytes: rec.packed_seq(),
+                        len: rec.l_seq(),
+                    },
+                    rec.flag,
+                    rec.pos as i64,
+                    rec.cigar(),
+                    rec.name(),
+                    modification_codes,
+                    &mut staged.mods,
+                )?;
+                staged.mod_ends.push(staged.mods.len() as i64);
+            }
+            if !want_record_fields {
                 return Ok(());
             }
             let bytes = &mut staged.bytes;
@@ -274,6 +308,7 @@ impl<S: ReadAt> AlignmentRead for BamReader<S> {
             });
             Ok(())
         });
+        size.modifications = staged.mods.len();
         staged.size = size;
         staged.queried = result.is_ok();
         self.staged = staged;
@@ -309,6 +344,11 @@ impl<S: ReadAt> AlignmentRead for BamReader<S> {
                 at += k.l_seq;
                 c.offsets[i + 1] = at as i64;
             }
+        }
+        if let Some(m) = &mut out.modifications {
+            m.offsets[0] = 0;
+            m.offsets[1..].copy_from_slice(&s.mod_ends);
+            m.entries.copy_from_slice(&s.mods);
         }
         if let Some(c) = &mut out.cigars {
             c.offsets[0] = 0;

@@ -10,10 +10,10 @@
 //!   | Family | Reader | Output |
 //!   |---|---|---|
 //!   | Sequence (`.fa`, `.fa.gz`, `.2bit`) | [`SequenceRead`] | `[u8]` ASCII bases |
-//!   | Track (bigWig) | [`TrackRead`] | `[f32]` values, `[f32]` bin statistics ([`BinSpec`]), or `[`[`TrackEntry`]`]` clipped intervals |
-//!   | Interval (bigBed) | [`IntervalRead`] | `[`[`IntervalEntry`]`]` + annotation [`StringColumn`] |
+//!   | Track (bigWig) | [`TrackRead`] | `[f32]` values, `[f32]` bin statistics ([`BinSpec`]), or `[`[`TrackEntry`]`]` intervals (caller selects clipping) |
+//!   | Interval (bigBed) | [`IntervalRead`] | `[`[`IntervalEntry`]`]` (caller selects clipping) + stored annotation [`StringColumn`] |
 //!   | Contact (`.hic`) | [`ContactRead`] | `[f32]` row-major tile, or `[`[`ContactEntry`]`]` nonzero cells |
-//!   | Alignment (BAM) | [`AlignmentRead`] | `[`[`AlignmentEntry`]`]` + the [`AlignmentFields`] asked for, as string columns |
+//!   | Alignment (BAM, CRAM) | [`AlignmentRead`] | `[`[`AlignmentEntry`]`]` + the [`AlignmentFields`] asked for, as string columns and `[`[`ModificationEntry`]`]` |
 //!
 //!   Entries are `#[repr(C)]` rows matching numpy structured dtypes; string
 //!   columns use Arrow's `LargeString` layout. Variable-size outputs are
@@ -47,6 +47,7 @@ mod source;
 
 pub use alignment::{
     AlignmentEntry, AlignmentFields, AlignmentRead, AlignmentSize, AlignmentsOut, CigarColumn,
+    ModificationColumn, ModificationEntry,
 };
 pub use bins::{BinAccumulator, BinLayout, BinSource, BinSpec, Stat, ZoomPiece};
 pub use contact::{ContactEntry, ContactQuery, ContactRead, ContactUnit};

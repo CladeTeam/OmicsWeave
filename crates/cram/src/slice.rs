@@ -152,7 +152,6 @@ pub(crate) struct Decoded {
     /// Whether bases and qualities were decoded.
     pub has_seq: bool,
     pub has_qual: bool,
-    pub has_aux: bool,
 }
 
 /// `fd->L1`: A, C, G, T to 0-3, anything else to 4.
@@ -246,7 +245,6 @@ impl Decode<'_> {
         let d = comp.closure(self.wanted, &present);
         out.has_seq = self.bases;
         out.has_qual = d & ds::QS != 0;
-        out.has_aux = d & ds::AUX != 0;
         let Some(core_block) = slice.blocks.first() else {
             return Err(Error::invalid("CRAM slice", "no blocks"));
         };

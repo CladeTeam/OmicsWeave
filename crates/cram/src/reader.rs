@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use omicsweave_core::cache::{BlockCache, BlockKey, SourceToken};
 
+use omicsweave_bam::mods::{ModDecoder, ModSeq, decode_record};
 use omicsweave_core::{
-    AlignmentEntry, AlignmentFields, AlignmentRead, AlignmentSize, AlignmentsOut, Error, ReadAt,
-    Region, Result, SequenceRead,
+    AlignmentEntry, AlignmentFields, AlignmentRead, AlignmentSize, AlignmentsOut, Error,
+    ModificationEntry, ReadAt, Region, Result, SequenceRead,
 };
 
 use crate::cache::{self, ContainerUse, Meta, PreparedContainer, PreparedSlice, SliceUse};
@@ -81,7 +82,13 @@ pub(crate) fn series(
             wanted |= ds::SEQ;
         }
     }
+    // Modifications are counted along the bases, from the MM / ML tags.
+    let mods = fields.contains(AlignmentFields::MODIFICATIONS);
+    if mods {
+        wanted |= ds::SEQ | ds::TL | ds::AUX;
+    }
     let bases = fields.contains(AlignmentFields::SEQ)
+        || mods
         || (fields.contains(AlignmentFields::AUX) && decode_md);
     (wanted, bases)
 }
@@ -102,6 +109,9 @@ struct Staged {
     cigar_ends: Vec<i64>,
     aux: Vec<u8>,
     aux_ends: Vec<i64>,
+    decoder: ModDecoder,
+    mods: Vec<ModificationEntry>,
+    mod_ends: Vec<i64>,
 }
 
 impl Staged {
@@ -119,11 +129,13 @@ impl Staged {
             v.clear();
         }
         self.cigars.clear();
+        self.mods.clear();
         for v in [
             &mut self.name_ends,
             &mut self.seq_ends,
             &mut self.cigar_ends,
             &mut self.aux_ends,
+            &mut self.mod_ends,
         ] {
             v.clear();
         }
@@ -452,7 +464,10 @@ impl<S: ReadAt, R: SequenceRead> CramReader<S, R> {
                             unknown_rg: header.unknown_rg,
                             wanted,
                             bases,
-                            decode_md: options.decode_md,
+                            // MM/ML access needs stored AUX fields, but only
+                            // requested AUX output needs absent MD/NM tags
+                            // synthesized. Stored placeholders still rebuild.
+                            decode_md: options.decode_md && fields.contains(AlignmentFields::AUX),
                             mates: true,
                             holds_refs: true,
                             range_ref: range.refid,
@@ -512,7 +527,12 @@ impl<S: ReadAt, R: SequenceRead> AlignmentRead for CramReader<S, R> {
         self.header.chrom_len(chrom)
     }
 
-    fn query(&mut self, region: Region<'_>, fields: AlignmentFields) -> Result<AlignmentSize> {
+    fn query_filtered(
+        &mut self,
+        region: Region<'_>,
+        fields: AlignmentFields,
+        modification_codes: &[i32],
+    ) -> Result<AlignmentSize> {
         let mut staged = std::mem::take(&mut self.staged);
         staged.clear(fields);
         let mut f = std::mem::take(&mut self.work.fields);
@@ -527,9 +547,38 @@ impl<S: ReadAt, R: SequenceRead> AlignmentRead for CramReader<S, R> {
         let want_seq = fields.contains(AlignmentFields::SEQ);
         let want_qual = fields.contains(AlignmentFields::QUAL);
         let want_cigar = fields.contains(AlignmentFields::CIGAR);
+        let want_mods = fields.contains(AlignmentFields::MODIFICATIONS);
         let result = self.visit(region, fields, None, true, |dec, i| {
-            dec.bam_fields(i, &naming, want_name, want_aux || dec.has_aux, &mut f)?;
+            // Only CG conversion and requested AUX output need an owned copy;
+            // modification tags can borrow the immutable decoded slice.
+            dec.bam_fields(
+                i,
+                &naming,
+                want_name,
+                want_aux || dec.recs[i].has_cg,
+                &mut f,
+            )?;
             staged.entries.push(f.entry);
+            if want_mods {
+                let e = &f.entry;
+                decode_record(
+                    &mut staged.decoder,
+                    &[dec.aux(i)],
+                    ModSeq::Ascii(dec.seq(i, f.l_seq)),
+                    e.flag,
+                    e.start,
+                    f.cigar.iter().map(|&c| ((c & 0xf) as u8, c >> 4)),
+                    // Names are decoded only when asked for.
+                    if f.name.is_empty() {
+                        b"a record"
+                    } else {
+                        &f.name
+                    },
+                    modification_codes,
+                    &mut staged.mods,
+                )?;
+                staged.mod_ends.push(staged.mods.len() as i64);
+            }
             if want_name {
                 staged.names.extend_from_slice(&f.name);
                 staged.name_ends.push(staged.names.len() as i64);
@@ -561,6 +610,7 @@ impl<S: ReadAt, R: SequenceRead> AlignmentRead for CramReader<S, R> {
             seq_bytes: staged.seq_ends.last().copied().unwrap_or(0) as usize,
             cigar_ops: staged.cigars.len(),
             aux_bytes: staged.aux.len(),
+            modifications: staged.mods.len(),
         };
         staged.queried = result.is_ok();
         let size = staged.size;
@@ -598,6 +648,10 @@ impl<S: ReadAt, R: SequenceRead> AlignmentRead for CramReader<S, R> {
         if let Some(c) = &mut out.aux {
             fill(c.offsets, &s.aux_ends);
             c.data.copy_from_slice(&s.aux);
+        }
+        if let Some(m) = &mut out.modifications {
+            fill(m.offsets, &s.mod_ends);
+            m.entries.copy_from_slice(&s.mods);
         }
         Ok(())
     }
