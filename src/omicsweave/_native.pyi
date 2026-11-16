@@ -1,6 +1,9 @@
-"""The native extension (``crates/python``). Its API is internal: it takes and
-returns only primitives and numpy arrays, and the ``omicsweave`` packages
-build the public types on it.
+"""The native extension (``crates/python``). Its API is internal: it takes
+primitives, numpy arrays and, for options, the package's frozen dataclasses
+(read attribute by attribute: a missing or mistyped attribute is an error),
+returns primitives and numpy arrays, and the ``omicsweave`` packages build
+the public types on it. Presets and defaults that belong to the Rust crates
+come from here (:func:`quant_defaults`).
 
 Every reader and writer keeps its state behind a lock taken only with the GIL
 released; decoding and encoding run without the GIL. Failures raise the
@@ -48,24 +51,10 @@ Strings = tuple[I64, U8] | None
 """A string column (offsets, data), or ``None`` when not asked for."""
 
 @final
-class CacheNamespace:
-    """Opaque process-local identity of one immutable source session."""
-    def __hash__(self) -> int: ...
-
-@final
-class BlockKey:
-    """Opaque source-bound block identity produced by a reader."""
-    @property
-    def source(self) -> CacheNamespace: ...
-    def __hash__(self) -> int: ...
-
-@final
 class BlockCache:
     def __new__(cls, max_bytes: int, max_entries: int) -> BlockCache: ...
     def stats(self) -> dict[str, int]: ...
-    def keys(self) -> list[BlockKey]: ...
-    def evict(self, key: BlockKey) -> bool: ...
-    def clear(self, source: CacheNamespace | None = None) -> None: ...
+    def clear(self) -> None: ...
     def resize(self, max_bytes: int, max_entries: int) -> None: ...
 
 # Formats and companion files
@@ -87,8 +76,13 @@ def build_sidecar(path: str) -> str:
     """Builds the sidecar of a bigWig, bigBed or ``.hic`` file beside it,
     reading the whole file; returns its path."""
 
+def build_bcf_index(path: str, min_shift: int = 14, threads: int | None = None) -> str:
+    """Builds the ``.csi`` of the sorted BGZF BCF at ``path`` beside it as
+    ``bcftools index`` builds it, inflating on ``threads`` (``None``: every
+    core the process may use); returns its path."""
+
 def build_bam_index(
-    path: str, kind: Literal["auto", "bai", "csi"], min_shift: int, threads: int
+    path: str, kind: Literal["auto", "bai", "csi"], min_shift: int, threads: int | None = None
 ) -> tuple[Literal["bai", "csi"], str]:
     """Builds the index of the sorted BAM at ``path`` beside it (``.bai`` or
     ``.csi``) as ``samtools index`` builds it, inflating on ``threads``;
@@ -98,60 +92,76 @@ def build_cram_index(path: str) -> str:
     """Builds the ``.crai`` of the sorted CRAM at ``path`` beside it as
     ``samtools index`` builds it; returns its path."""
 
+SidecarBlocks = dict[str, npt.NDArray[np.uint64]]
+
+def read_sidecar(
+    path: str,
+) -> (
+    tuple[Literal["bbi"], int, list[tuple[int, SidecarBlocks]]]
+    | tuple[Literal["hic"], int, list[tuple[int, int, Unit, int, int, int, SidecarBlocks]]]
+):
+    """The sidecar beside the bigWig, bigBed or ``.hic`` file at ``path``,
+    checked against it: ``("bbi", uncompress buffer size, [(reduction,
+    blocks)])`` (blocks: ``start_chrom``, ``start``, ``end_chrom``, ``end``,
+    ``offset``, ``size``, ``inflated``, ``items``) or ``("hic", version,
+    [(chr1, chr2, unit, bin size, block bins, block columns, blocks)])``
+    (blocks: ``number``, ``position``, ``size``, ``inflated``, ``records``)."""
+
 # Conversion
 
-def convert(
-    src: str,
-    dst: str,
-    *,
-    src_format: str | None = None,
-    dst_format: str | None = None,
-    threads: int | None = None,
-    memory: str = "4G",
-    tmp_dir: str | None = None,
-    level: int | None = None,
-    index: Literal["auto", "bai", "csi"] | None = None,
-    chrom_sizes: str | None = None,
-    resolutions: list[int] | None = None,
-    value: str | None = None,
-    mod: str | None = None,
-    strand: Literal["+", "-", "."] | None = None,
-    sidecar: bool = True,
-    add_contigs: bool = False,
-    sort: bool = False,
-    reference: str | None = None,
-    progress: Progress | None = None,
-) -> tuple[str, list[tuple[str, str]], int, int, int, float, list[str]]:
-    """Converts ``src`` into ``dst``. A format not named is told by content
-    for the source and by name for the destination; ``threads`` defaults to
-    every available core, ``memory`` is a size such as ``"8G"``. An option
-    the conversion does not have is an error.
+BbiTuple = tuple[int | None, int, bool, int, int, list[int] | None]
+"""(items per slot, block size, compress, level, zoom levels, zoom reductions)."""
 
-    Returns (source format, (format, path) of every file written with the
-    destination first, records, bytes read, bytes spilled, seconds,
-    warnings).
-    """
+@final
+class ConvertPlan:
+    """A conversion configured (an option it does not have is an error) and
+    checked against its budget without reading any data. A format not named
+    is told by content for the source and by name for the destination;
+    ``threads`` ``None`` is every core the process may use, ``memory``
+    ``None`` the default budget (4 GiB)."""
 
-def plan_convert(
-    src: str,
-    dst: str,
-    *,
-    src_format: str | None = None,
-    dst_format: str | None = None,
-    threads: int | None = None,
-    memory: str = "4G",
-    chrom_sizes: str | None = None,
-    resolutions: list[int] | None = None,
-    value: str | None = None,
-    mod: str | None = None,
-    strand: Literal["+", "-", "."] | None = None,
-    sort: bool = False,
-) -> tuple[str, str, int, int, int, int, int]:
-    """Checks the conversion of ``src`` into ``dst`` (sorting, given
-    ``sort``; with the options that shape its plan) against its budget
-    without reading any data; returns (source
-    format, destination format, threads, memory budget, fixed, pipeline,
-    buffer bytes)."""
+    def __new__(
+        cls,
+        src: str,
+        dst: str,
+        *,
+        src_format: str | None = None,
+        dst_format: str | None = None,
+        threads: int | None = None,
+        memory: int | None = None,
+        tmp_dir: str | None = None,
+        level: int | None = None,
+        index: Literal["auto", "bai", "csi"] | None = None,
+        min_shift: int | None = None,
+        chrom_sizes: str | None = None,
+        resolutions: list[int] | None = None,
+        value: str | None = None,
+        mod: str | None = None,
+        strand: Literal["+", "-", "."] | None = None,
+        sidecar: bool = False,
+        add_contigs: bool = False,
+        sort: bool = False,
+        reference: str | None = None,
+        verify_checksums: bool = True,
+        bbi: BbiTuple | None = None,
+    ) -> ConvertPlan: ...
+    @property
+    def formats(self) -> tuple[str, str]:
+        """(source format, target format)."""
+    @property
+    def paths(self) -> tuple[str, str]: ...
+    @property
+    def budget(self) -> tuple[int, int, str | None]:
+        """(threads, memory bytes, spill directory)."""
+    @property
+    def memory(self) -> tuple[int, int, int]:
+        """(fixed, pipeline, buffer) bytes."""
+    def run(
+        self, progress: Progress | None = None
+    ) -> tuple[list[tuple[str, str]], int, int, int, float, list[str]]:
+        """Converts; returns ((format, path) of every file written, the
+        target first, records, bytes read, bytes spilled, seconds,
+        warnings)."""
 
 def conversions() -> list[tuple[str, str]]:
     """Every (source, destination) pair of format names there is a
@@ -182,9 +192,6 @@ class SequenceReader:
     ) -> SequenceReader: ...
     def fetch(self, key: LocusKey) -> U8: ...
     def set_cache(self, cache: BlockCache | None) -> None: ...
-    def cache_namespace(self) -> CacheNamespace: ...
-    def describe_cache(self, key: LocusKey) -> list[BlockKey]: ...
-    def prefetch_cache(self, key: LocusKey) -> None: ...
     def sequence_length(self, key: LocusKey) -> int: ...
     def clone_context(self) -> SequenceReader: ...
     def chroms(self) -> list[tuple[str, int]]:
@@ -209,6 +216,19 @@ class FastaWriter:
         """Ends the file and saves its indexes beside it; returns their
         paths, ``.fai`` first (``[]`` once closed)."""
 
+@final
+class TwoBitWriter:
+    """A 2bit file being written: the names first (the directory precedes
+    the records), the sequences in their order. ``wide_offsets`` stores
+    64-bit offsets (version 1)."""
+
+    def __new__(cls, path: str, names: list[str], wide_offsets: bool = False) -> TwoBitWriter: ...
+    def next_name(self) -> str | None: ...
+    def add(self, name: str, seq: bytes) -> None:
+        """Adds the next sequence; N and lowercase runs become blocks."""
+    def close(self) -> None:
+        """Writes the directory; every named sequence must have been added."""
+
 # Signal: bigWig
 
 @final
@@ -217,9 +237,6 @@ class TrackReader:
 
     def __new__(cls, path: str, cache: BlockCache | None = None) -> TrackReader: ...
     def set_cache(self, cache: BlockCache | None) -> None: ...
-    def cache_namespace(self) -> CacheNamespace: ...
-    def describe_cache(self, key: LocusKey) -> list[BlockKey]: ...
-    def prefetch_cache(self, key: LocusKey) -> None: ...
     def clone_context(self) -> TrackReader: ...
     def chroms(self) -> list[tuple[str, int]]:
         """(name, length) of every chromosome."""
@@ -265,6 +282,7 @@ class BigWigWriter:
         level: int,
         zoom_levels: int,
         zoom_reductions: list[int] | None,
+        threads: int = 1,
     ) -> BigWigWriter: ...
     def add(self, chrom: int, start: U32, end: U32, value: F32) -> None:
         """Adds items of chromosome ``chrom`` (its index in ``chroms``),
@@ -286,9 +304,6 @@ class IntervalReader:
 
     def __new__(cls, path: str, cache: BlockCache | None = None) -> IntervalReader: ...
     def set_cache(self, cache: BlockCache | None) -> None: ...
-    def cache_namespace(self) -> CacheNamespace: ...
-    def describe_cache(self, chrom: str, start: int, end: int) -> list[BlockKey]: ...
-    def prefetch_cache(self, chrom: str, start: int, end: int) -> None: ...
     def clone_context(self) -> IntervalReader: ...
     def chroms(self) -> list[tuple[str, int]]:
         """(name, length) of every chromosome."""
@@ -319,6 +334,7 @@ class BigBedWriter:
         level: int,
         zoom_levels: int,
         zoom_reductions: list[int] | None,
+        threads: int = 1,
     ) -> BigBedWriter: ...
     def add(self, chrom: int, start: U32, end: U32, offsets: I64, data: U8) -> None:
         """Adds features of chromosome ``chrom`` (its index in ``chroms``),
@@ -341,9 +357,8 @@ class ContactReader:
 
     def __new__(cls, path: str, cache: BlockCache | None = None) -> ContactReader: ...
     def set_cache(self, cache: BlockCache | None) -> None: ...
-    def cache_namespace(self) -> CacheNamespace: ...
-    def describe_cache(self, tile: Tile) -> list[BlockKey]: ...
-    def prefetch_cache(self, tile: Tile) -> None: ...
+    def maps(self) -> list[tuple[str, str]]:
+        """The chromosome pairs that have a contact map, in order."""
     def clone_context(self) -> ContactReader: ...
     def attributes(self) -> list[tuple[str, str]]:
         """The header's (key, value) attributes."""
@@ -377,7 +392,10 @@ class ContactReader:
 class HicWriter:
     """A ``.hic`` file being written from binned maps. ``sites`` holds the
     sorted restriction sites of each chromosome of ``chroms`` (empty without
-    fragment resolutions); ``level`` is the zlib level (1-9)."""
+    fragment resolutions); ``level`` is the zlib level (0-9); ``blocks``
+    the bins per block side within and between chromosomes (``None``: the
+    Juicer grid), or ``None`` for the default layout; ``threads`` above 1
+    encode blocks on a pool."""
 
     def __new__(
         cls,
@@ -390,6 +408,8 @@ class HicWriter:
         frag_resolutions: list[int],
         sites: list[list[int]],
         level: int,
+        blocks: tuple[int | None, int | None] | None = None,
+        threads: int = 1,
     ) -> HicWriter: ...
     def write_matrix(
         self,
@@ -425,6 +445,8 @@ class HicBuilder:
         frag_resolutions: list[int],
         sites: list[list[int]],
         level: int,
+        blocks: tuple[int | None, int | None] | None = None,
+        threads: int = 1,
     ) -> HicBuilder: ...
     def add(self, chr1: U32, pos1: U32, chr2: U32, pos2: U32, count: F32) -> None:
         """Adds ``count[i]`` contacts between base ``pos1[i]`` of ``chr1[i]``
@@ -442,27 +464,19 @@ class ConsensusBuilder:
     ``reference``, as ``bcftools consensus`` 1.23 builds them. The options
     are ``bcftools consensus``'s: ``-I``, ``-M``, ``-a``, ``--mark-del``,
     ``--mark-ins``, ``--mark-snv``, ``-m``, ``--mask-with``,
-    ``--regions-overlap``, ``-c``, ``-i`` and ``-e`` (``include`` and
-    ``exclude`` are filter expressions; at most one is given)."""
+    ``--regions-overlap``, ``-c``, ``-i`` and ``-e``, read from the
+    attributes of ``options`` (a ``query.ConsensusOptions``); ``cache``
+    holds the BCF's decoded blocks."""
 
     def __new__(
         cls,
         bcf: str,
         index: str | None,
         reference: SequenceReader,
-        iupac_codes: bool,
-        missing: str | None,
-        absent: str | None,
-        mark_del: str | None,
-        mark_ins: str | None,
-        mark_snv: str | None,
-        mask: str | None,
-        mask_with: str,
-        regions_overlap: Literal["start", "record", "variant"],
-        chain: bool,
-        include: str | None,
-        exclude: str | None,
+        options: object,
+        cache: BlockCache | None = None,
     ) -> ConsensusBuilder: ...
+    def set_cache(self, cache: BlockCache | None) -> None: ...
     def clone_context(self, reference: SequenceReader) -> ConsensusBuilder: ...
     def samples(self) -> list[str]:
         """The samples of the BCF, in header order."""
@@ -489,25 +503,24 @@ class ConsensusBuilder:
 class AlignmentReader:
     """A BAM file with its BAI or CSI index, or a CRAM file with its
     ``.crai`` (``index``, or the one htslib finds beside the file, which
-    must exist) and the reference its slices need (a ``SequenceReader`` or
-    the path of a FASTA / bgzip FASTA / 2bit file; CRAM only)."""
+    must exist) and the reference its slices need (a ``SequenceReader``,
+    whose file and cache are shared; CRAM only). ``verify_checksums``,
+    ``decode_md`` and ``name_prefix`` shape CRAM decoding (htslib's
+    defaults)."""
 
     def __new__(
         cls,
         path: str,
         index: str | None = None,
         cache: BlockCache | None = None,
-        reference: SequenceReader | str | None = None,
+        reference: SequenceReader | None = None,
+        *,
+        verify_checksums: bool = True,
+        decode_md: bool = True,
+        name_prefix: str | None = None,
     ) -> AlignmentReader: ...
     def set_cache(self, cache: BlockCache | None) -> None: ...
-    def cache_namespace(self) -> CacheNamespace: ...
-    def describe_cache(
-        self, chrom: str, start: int, end: int, fields: int = 0
-    ) -> list[BlockKey]: ...
-    def prefetch_cache(self, chrom: str, start: int, end: int, fields: int = 0) -> None: ...
     def clone_context(self) -> AlignmentReader: ...
-    def stream_stats(self) -> dict[str, int]: ...
-    def reset_stream_stats(self) -> None: ...
     def chroms(self) -> list[tuple[str, int]]:
         """(name, length) of every reference, in reference-id order."""
     def header_text(self) -> bytes:
@@ -538,12 +551,7 @@ class VariantReader:
         cls, path: str, index: str | None = None, cache: BlockCache | None = None
     ) -> VariantReader: ...
     def set_cache(self, cache: BlockCache | None) -> None: ...
-    def cache_namespace(self) -> CacheNamespace: ...
-    def describe_cache(self, chrom: str, start: int, end: int) -> list[BlockKey]: ...
-    def prefetch_cache(self, chrom: str, start: int, end: int) -> None: ...
     def clone_context(self) -> VariantReader: ...
-    def stream_stats(self) -> dict[str, int]: ...
-    def reset_stream_stats(self) -> None: ...
     def chroms(self) -> list[tuple[str, int | None]]:
         """(name, length or None) of every contig the header declares."""
     def samples(self) -> list[str]:
@@ -557,6 +565,25 @@ class VariantReader:
         """The records overlapping ``chrom:[start, end)``: (start, end, ids,
         REF, ALT, ploidy, gt, phased); ``gt`` is ``[records, samples,
         ploidy]`` and ``phased`` ``[records, samples]``, flattened."""
+    def records(
+        self,
+        chrom: str,
+        start: int,
+        end: int,
+        samples: list[int] | None = None,
+        info: list[str] = ...,
+        format: list[str] = ...,
+        include: str | None = None,
+        exclude: str | None = None,
+    ) -> dict[str, object]:
+        """The records overlapping ``chrom:[start, end)`` that ``include``
+        keeps (or ``exclude`` leaves out; bcftools expressions), in one pass:
+        the columns of :meth:`genotypes` (``start``, ``end``, ``id``,
+        ``ref``, ``alt``, ``ploidy``, ``gt``, ``phased``), ``qual``,
+        ``filters`` and ``info`` / ``format`` lists of ``(name, kind,
+        width, values)``: kind ``flag`` (bool), ``int`` (int32), ``float``
+        (float32) or ``str`` ((offsets, data)), numbers laid out at
+        ``width`` per record (and sample) with htslib's sentinels."""
     def close(self) -> None:
         """Releases the file; further calls raise ``ValueError``."""
 
@@ -586,7 +613,13 @@ class IntervalSet:
     def owner_level(self) -> Literal["gene", "transcript", "exon"] | None: ...
     def columns(self) -> Columns:
         """seqid, start, end, strand (int8), owner, name (or ``None``)."""
-    def overlaps(self, chrom: str, start: int, end: int) -> U32: ...
+    def overlaps(
+        self,
+        chrom: str,
+        start: int,
+        end: int,
+        mode: Literal["overlaps", "within", "containing"] = "overlaps",
+    ) -> U32: ...
     def overlaps_batch(
         self, chroms: list[str], starts: U32, ends: U32
     ) -> tuple[npt.NDArray[np.uint64], U32]: ...
@@ -603,8 +636,9 @@ class Annotation:
         keys: list[str] | None = None,
         aliases: list[tuple[str, str]] | None = None,
         strict: bool = False,
-        threads: int = 0,
+        threads: int | None = None,
         dialect: Literal["gtf", "gff3"] | None = None,
+        batch_bytes: int | None = None,
     ) -> Annotation: ...
     @property
     def dialect(self) -> Literal["gtf", "gff3"]: ...
@@ -616,6 +650,8 @@ class Annotation:
     def exons(self) -> U32:
         """Feature rows of exons."""
     def report(self) -> dict[str, object]: ...
+    def others(self) -> Columns:
+        """Records that are not genes, transcripts or their features."""
     def gene_rows(self, key: str, by: Literal["id", "name"]) -> U32: ...
     def transcript_rows(self, key: str, by: Literal["id", "name"]) -> U32: ...
     def transcript_parts(
@@ -672,41 +708,51 @@ class Annotation:
     def write_gtf(self, path: str, layout: Literal["auto", "original", "model"]) -> None: ...
     def write_bed12(self, path: str, transcripts: U32 | None = None) -> None: ...
 
-# Quantification (omicsweave.quant). Products are dicts of primitives with a
-# "kind" of "coverage", "counts", "atac", "junctions", "labeling",
-# "methylation", "hic" or "alleles".
+# Quantification (omicsweave.quant). Products are the package's dataclasses,
+# told apart by their ``kind`` ("coverage", "counts", "atac", "junctions",
+# "labeling", "methylation", "contacts", "alleles").
 
-def plan_quant(
-    inputs: list[str],
-    out_dir: str,
-    products: list[dict[str, object]],
-    *,
-    annotation: Annotation | None = None,
-    aliases: list[tuple[str, str]] | None = None,
-    matrix: Literal["cpk", "mtx", "csv"] = "cpk",
-    reference: str | None = None,
-    variants: str | None = None,
-    threads: int | None = None,
-    memory: str = "16G",
-) -> tuple[int, int, int, int, int, list[str], list[tuple[str, int]]]:
-    """Checks a quantification against its budget, reading only the BAM
-    headers; returns (threads, memory budget, fixed, pipeline, buffer bytes,
-    needs, [(product stage, buffer bytes)])."""
+def quant_defaults() -> dict[str, dict[str, object]]:
+    """The defaults and presets of every product as dataclass keyword
+    arguments (nested values as dicts, features as dicts with a ``kind``):
+    ``filter``, ``coverage``, ``counts``, ``counts.single_cell``,
+    ``counts.bulk``, ``counts.atac``, ``counts.chip``, ``labeled``, ``atac``,
+    ``junction_matrix.single_cell``, ``junction_matrix.bulk``,
+    ``junctions``, ``labeling``, ``methyl_matrix``, ``methylation``,
+    ``contacts``, ``alleles.single_cell``, ``alleles.bulk``."""
 
-def quantify(
-    inputs: list[str],
-    out_dir: str,
-    products: list[dict[str, object]],
-    *,
-    annotation: Annotation | None = None,
-    aliases: list[tuple[str, str]] | None = None,
-    matrix: Literal["cpk", "mtx", "csv"] = "cpk",
-    reference: str | None = None,
-    variants: str | None = None,
-    threads: int | None = None,
-    memory: str = "16G",
-    tmp_dir: str | None = None,
-    progress: Progress | None = None,
-) -> tuple[list[tuple[str, str]], int, int, float, str]:
-    """Runs a quantification; returns ((kind, path) of every file written,
-    records, bytes read, seconds, summary JSON)."""
+@final
+class QuantPlan:
+    """A ``quant.Task`` (read attribute by attribute) checked against its
+    budget: the BAM headers read and the feature spaces built."""
+
+    def __new__(
+        cls,
+        task: object,
+        *,
+        threads: int | None = None,
+        memory: int | None = None,
+        tmp_dir: str | None = None,
+    ) -> QuantPlan: ...
+    @property
+    def budget(self) -> tuple[int, int, str | None]: ...
+    @property
+    def memory(self) -> tuple[int, int, int]: ...
+    @property
+    def needs(self) -> list[str]: ...
+    @property
+    def stages(self) -> list[tuple[str, int]]: ...
+    @property
+    def inputs(self) -> list[tuple[str, list[tuple[str, int]], list[str], int]]:
+        """(path, references, read groups, compressed bytes) per input."""
+    def run(
+        self, progress: Progress | None = None
+    ) -> tuple[list[tuple[str, str]], int, int, float, float, str]:
+        """((kind, path) of every file written, records, bytes read,
+        seconds, seconds of the pass, summary JSON)."""
+
+def read_aliases(path: str) -> list[tuple[str, str]]:
+    """The ``(from, to)`` pairs of a two-column alias file."""
+
+def is_haplotype(text: str) -> bool:
+    """Whether ``text`` is a haplotype ``bcftools consensus -H`` takes."""

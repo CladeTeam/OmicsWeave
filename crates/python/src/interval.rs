@@ -14,9 +14,9 @@ use omicsweave_core::{
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use crate::cache::{self, CacheKey, CacheNamespace, PyBlockCache};
+use crate::cache::{self, PyBlockCache};
 use crate::error::{Done, OrRaise};
-use crate::shared::{Shared, path_str, save_sidecar, slice};
+use crate::shared::{Shared, Workers, path_str, save_sidecar, slice};
 use crate::track::{bbi_chrom_list, bbi_chroms, open_bbi, write_options};
 
 struct Intervals {
@@ -89,33 +89,6 @@ impl IntervalReader {
         self.inner.run(py, |t| Ok(t.reader.set_cache(cache)?))
     }
 
-    fn cache_namespace(&self, py: Python<'_>) -> PyResult<CacheNamespace> {
-        self.inner
-            .run(py, |t| Ok(CacheNamespace::new(t.reader.cache_namespace())))
-    }
-
-    fn describe_cache(
-        &self,
-        py: Python<'_>,
-        chrom: &str,
-        start: u32,
-        end: u32,
-    ) -> PyResult<Vec<CacheKey>> {
-        self.inner.run(py, |t| {
-            let mut keys = Vec::new();
-            t.reader
-                .describe_cache(&Region::new(chrom, start, end).into(), &mut keys)?;
-            Ok(keys.into_iter().map(CacheKey::new).collect())
-        })
-    }
-
-    fn prefetch_cache(&self, py: Python<'_>, chrom: &str, start: u32, end: u32) -> PyResult<()> {
-        self.inner.run(py, |t| {
-            Ok(t.reader
-                .prefetch_cache(&Region::new(chrom, start, end).into())?)
-        })
-    }
-
     fn clone_context(&self, py: Python<'_>) -> PyResult<Self> {
         let reader = self
             .inner
@@ -177,13 +150,15 @@ impl IntervalReader {
 pub struct BigBedWriter {
     inner: Shared<omicsweave_bbi::BigBedWriter<BufWriter<File>>>,
     path: PathBuf,
+    /// The pool the writer's jobs run on, alive as long as it is.
+    _workers: Workers,
 }
 
 #[pymethods]
 impl BigBedWriter {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (path, chroms, field_count, defined_field_count, auto_sql, items_per_slot, block_size, compress, level, zoom_levels, zoom_reductions))]
+    #[pyo3(signature = (path, chroms, field_count, defined_field_count, auto_sql, items_per_slot, block_size, compress, level, zoom_levels, zoom_reductions, threads=1))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
@@ -197,7 +172,9 @@ impl BigBedWriter {
         level: i32,
         zoom_levels: usize,
         zoom_reductions: Option<Vec<u32>>,
+        threads: usize,
     ) -> PyResult<BigBedWriter> {
+        let workers = Workers::new(threads)?;
         let options = write_options(
             items_per_slot,
             block_size,
@@ -213,11 +190,17 @@ impl BigBedWriter {
         };
         py.detach(|| -> Result<BigBedWriter> {
             let out = BufWriter::new(File::create(&path)?);
-            let writer =
-                omicsweave_bbi::BigBedWriter::create(out, bbi_chrom_list(chroms), schema, options)?;
+            let writer = omicsweave_bbi::BigBedWriter::create_with(
+                out,
+                bbi_chrom_list(chroms),
+                schema,
+                options,
+                workers.exec(),
+            )?;
             Ok(BigBedWriter {
                 inner: Shared::new_writer(writer),
                 path,
+                _workers: workers,
             })
         })
         .or_raise()

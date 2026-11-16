@@ -13,12 +13,11 @@ use omicsweave_core::{
 use omicsweave_cram::{CRAM_MAGIC, CramHeader, CramIndex, CramOptions, CramReader};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use pyo3::types::PyDict;
 
-use crate::cache::{self, CacheKey, CacheNamespace, PyBlockCache};
+use crate::cache::{self, PyBlockCache};
 use crate::error::{Done, OrRaise};
-use crate::sequence::{SequenceReader, Sequences, open_sequences};
-use crate::shared::{Shared, head, path_str, seek_stats};
+use crate::sequence::{SequenceReader, Sequences};
+use crate::shared::{Shared, head, path_str, threads_or_available};
 
 /// The index at `given`, or else the one htslib finds beside `bam`; it
 /// must exist (indexes are built explicitly, never on open).
@@ -57,6 +56,7 @@ fn open_cram(
     path: &Path,
     index: Option<&Path>,
     reference: Option<Sequences>,
+    decode: &Decode,
 ) -> Result<(Cram, PathBuf)> {
     let source = FileSource::open(path)?;
     let header = CramHeader::read(&source)?;
@@ -72,14 +72,25 @@ fn open_cram(
     };
     let index = CramIndex::read_file(&at, header.references().len())?;
     let options = CramOptions {
+        verify_checksums: decode.verify_checksums,
+        decode_md: decode.decode_md,
         // htslib names reads stored without a name after the file.
-        name_prefix: path
-            .file_name()
-            .map(|n| n.to_string_lossy().as_bytes().to_vec())
-            .unwrap_or_default(),
-        ..CramOptions::default()
+        name_prefix: match &decode.name_prefix {
+            Some(p) => p.as_bytes().to_vec(),
+            None => path
+                .file_name()
+                .map(|n| n.to_string_lossy().as_bytes().to_vec())
+                .unwrap_or_default(),
+        },
     };
     Ok((CramReader::open(source, index, reference, options)?, at))
+}
+
+/// How CRAM records are decoded.
+struct Decode {
+    verify_checksums: bool,
+    decode_md: bool,
+    name_prefix: Option<String>,
 }
 
 /// A BAM or a CRAM reader.
@@ -196,30 +207,36 @@ pub struct AlignmentReader {
 
 #[pymethods]
 impl AlignmentReader {
-    /// A BAM, or a CRAM with `reference` (a native `SequenceReader`, or
-    /// the path of a FASTA / bgzip FASTA / 2bit file) for its slices that
-    /// need one.
+    /// A BAM, or a CRAM with `reference` (a native `SequenceReader`, whose
+    /// open file and cache the reader shares) for its slices that need one.
+    /// `verify_checksums`, `decode_md` and `name_prefix` shape CRAM
+    /// decoding (htslib's defaults: checks on, MD / NM generated, unnamed
+    /// reads named after the file).
     #[new]
-    #[pyo3(signature = (path, index=None, cache=None, reference=None))]
+    #[pyo3(signature = (path, index=None, cache=None, reference=None, *,
+                        verify_checksums=true, decode_md=true, name_prefix=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         path: PathBuf,
         index: Option<PathBuf>,
         cache: Option<PyRef<'_, PyBlockCache>>,
-        reference: Option<Bound<'_, PyAny>>,
+        reference: Option<PyRef<'_, SequenceReader>>,
+        verify_checksums: bool,
+        decode_md: bool,
+        name_prefix: Option<String>,
     ) -> PyResult<AlignmentReader> {
         let cache = cache::handle(cache)?;
-        enum Given {
-            Reader(Sequences),
-            Path(PathBuf),
-        }
         let given = match reference {
             None => None,
-            Some(r) => match r.extract::<PyRef<'_, SequenceReader>>() {
-                Ok(seq) => Some(Given::Reader(seq.inner.run(py, |s| Ok(s.try_clone()?))?)),
-                Err(_) => Some(Given::Path(r.extract::<PathBuf>()?)),
-            },
+            Some(seq) => Some(seq.inner.run(py, |s| Ok(s.try_clone()?))?),
         };
+        let decode = Decode {
+            verify_checksums,
+            decode_md,
+            name_prefix,
+        };
+        let cram_options = !verify_checksums || !decode_md || decode.name_prefix.is_some();
         py.detach(|| -> Result<AlignmentReader> {
             let is_cram = head(&FileSource::open(&path)?, 4)? == CRAM_MAGIC;
             if !is_cram {
@@ -227,6 +244,12 @@ impl AlignmentReader {
                     return Err(Error::invalid(
                         "AlignmentReader",
                         "a reference is given for a BAM; only CRAM files take one",
+                    ));
+                }
+                if cram_options {
+                    return Err(Error::invalid(
+                        "AlignmentReader",
+                        "verify_checksums, decode_md and name_prefix are CRAM decoding options",
                     ));
                 }
                 let (mut reader, index) = open_bam(&path, index.as_deref())?;
@@ -241,12 +264,7 @@ impl AlignmentReader {
                     }),
                 });
             }
-            let reference = match given {
-                None => None,
-                Some(Given::Reader(s)) => Some(s),
-                Some(Given::Path(p)) => Some(open_sequences(&p)?),
-            };
-            let (mut reader, index) = open_cram(&path, index.as_deref(), reference)?;
+            let (mut reader, index) = open_cram(&path, index.as_deref(), given, &decode)?;
             reader.set_cache(cache);
             let chroms: Vec<(String, u32)> = reader
                 .header()
@@ -297,53 +315,6 @@ impl AlignmentReader {
         })
     }
 
-    fn cache_namespace(&self, py: Python<'_>) -> PyResult<CacheNamespace> {
-        self.inner.run(py, |a| match &a.reader {
-            Reads::Bam(r) => Ok(CacheNamespace::new(r.cache_namespace())),
-            Reads::Cram(r) => Ok(CacheNamespace::new(r.cache_namespace())),
-        })
-    }
-
-    #[pyo3(signature = (chrom, start, end, fields=0))]
-    fn describe_cache(
-        &self,
-        py: Python<'_>,
-        chrom: &str,
-        start: u32,
-        end: u32,
-        fields: u8,
-    ) -> PyResult<Vec<CacheKey>> {
-        self.inner.run(py, |a| {
-            let mut keys = Vec::new();
-            let fields = AlignmentFields::from_bits(fields)?;
-            let region = Region::new(chrom, start, end);
-            match &mut a.reader {
-                Reads::Bam(r) => r.describe_cache(region, &mut keys)?,
-                Reads::Cram(r) => r.describe_cache(region, fields, &mut keys)?,
-            }
-            Ok(keys.into_iter().map(CacheKey::new).collect())
-        })
-    }
-
-    #[pyo3(signature = (chrom, start, end, fields=0))]
-    fn prefetch_cache(
-        &self,
-        py: Python<'_>,
-        chrom: &str,
-        start: u32,
-        end: u32,
-        fields: u8,
-    ) -> PyResult<()> {
-        self.inner.run(py, |a| {
-            let fields = AlignmentFields::from_bits(fields)?;
-            let region = Region::new(chrom, start, end);
-            match &mut a.reader {
-                Reads::Bam(r) => Ok(r.prefetch_cache(region)?),
-                Reads::Cram(r) => Ok(r.prefetch_cache(region, fields)?),
-            }
-        })
-    }
-
     fn clone_context(&self, py: Python<'_>) -> PyResult<Self> {
         let reader = self.inner.run(py, |a| Ok(a.reader.try_clone()?))?;
         Ok(Self {
@@ -354,42 +325,6 @@ impl AlignmentReader {
             chroms: self.chroms.clone(),
             text: self.text.clone(),
             index: self.index.clone(),
-        })
-    }
-
-    fn stream_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        enum Stats {
-            Bam(omicsweave_bgzf::SeekStats),
-            Cram(omicsweave_cram::CramStats),
-        }
-        let stats = self.inner.run(py, |a| {
-            Ok(match &a.reader {
-                Reads::Bam(r) => Stats::Bam(r.stats()),
-                Reads::Cram(r) => Stats::Cram(r.stats()),
-            })
-        })?;
-        match stats {
-            Stats::Bam(s) => seek_stats(py, s),
-            Stats::Cram(s) => {
-                let d = PyDict::new(py);
-                d.set_item("containers", s.containers)?;
-                d.set_item("slices_decoded", s.slices_decoded)?;
-                d.set_item("records_decoded", s.records_decoded)?;
-                d.set_item("bytes_read", s.bytes_read)?;
-                d.set_item("read_calls", s.read_calls)?;
-                d.set_item("records_considered", s.records_considered)?;
-                Ok(d)
-            }
-        }
-    }
-
-    fn reset_stream_stats(&self, py: Python<'_>) -> PyResult<()> {
-        self.inner.run(py, |a| {
-            match &mut a.reader {
-                Reads::Bam(r) => r.reset_stats(),
-                Reads::Cram(r) => r.reset_stats(),
-            }
-            Ok(())
         })
     }
 
@@ -447,14 +382,15 @@ impl AlignmentReader {
 /// Builds the BAI or CSI index of a sorted BAM beside it; returns its
 /// kind (`bai` or `csi`) and path.
 #[pyfunction]
-#[pyo3(signature = (path, kind, min_shift, threads))]
+#[pyo3(signature = (path, kind, min_shift, threads=None))]
 pub fn build_bam_index(
     py: Python<'_>,
     path: PathBuf,
     kind: &str,
     min_shift: u32,
-    threads: usize,
+    threads: Option<usize>,
 ) -> PyResult<(&'static str, String)> {
+    let threads = threads_or_available(threads)?;
     py.detach(|| -> Result<(&'static str, String)> {
         let choice = IndexChoice::from_name(kind, min_shift)?;
         let (kind, at) = build_index_file(&path, choice, threads)?;

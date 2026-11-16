@@ -14,6 +14,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedStr;
 
+use crate::cache::{self, PyBlockCache};
 use crate::error::{Done, Fail, OrRaise};
 use crate::sequence::SequenceReader;
 use crate::shared::{Shared, path_str};
@@ -115,28 +116,37 @@ pub struct ConsensusBuilder {
 
 #[pymethods]
 impl ConsensusBuilder {
+    /// The consensus of the BCF at `bcf` (through its CSI) over
+    /// `reference`, shaped by `options` (a `query.ConsensusOptions`, read
+    /// attribute by attribute); `cache` holds the BCF's decoded blocks.
     #[new]
-    #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (bcf, index, reference, iupac_codes, missing, absent, mark_del, mark_ins, mark_snv, mask, mask_with, regions_overlap, chain, include, exclude))]
+    #[pyo3(signature = (bcf, index, reference, options, cache=None))]
     fn new(
         py: Python<'_>,
         bcf: PathBuf,
         index: Option<PathBuf>,
         reference: Py<SequenceReader>,
-        iupac_codes: bool,
-        missing: Option<char>,
-        absent: Option<char>,
-        mark_del: Option<char>,
-        mark_ins: Option<&str>,
-        mark_snv: Option<&str>,
-        mask: Option<PathBuf>,
-        mask_with: &str,
-        regions_overlap: &str,
-        chain: bool,
-        include: Option<String>,
-        exclude: Option<String>,
+        options: &Bound<'_, PyAny>,
+        cache: Option<PyRef<'_, PyBlockCache>>,
     ) -> PyResult<ConsensusBuilder> {
-        let mask_with = match mask_with {
+        let cache = cache::handle(cache)?;
+        fn attr<'py, T: FromPyObjectOwned<'py>>(o: &Bound<'py, PyAny>, name: &str) -> PyResult<T> {
+            o.getattr(name)?.extract::<T>().map_err(Into::into)
+        }
+        let o = options;
+        let iupac_codes: bool = attr(o, "iupac_codes")?;
+        let missing: Option<char> = attr(o, "missing")?;
+        let absent: Option<char> = attr(o, "absent")?;
+        let mark_del: Option<char> = attr(o, "mark_del")?;
+        let mark_ins: Option<String> = attr(o, "mark_ins")?;
+        let mark_snv: Option<String> = attr(o, "mark_snv")?;
+        let mask: Option<PathBuf> = attr(o, "mask")?;
+        let mask_with: String = attr(o, "mask_with")?;
+        let regions_overlap: String = attr(o, "regions_overlap")?;
+        let chain: bool = attr(o, "chain")?;
+        let include: Option<String> = attr(o, "include")?;
+        let exclude: Option<String> = attr(o, "exclude")?;
+        let mask_with = match mask_with.as_str() {
             "upper" => MaskWith::Upper,
             "lower" => MaskWith::Lower,
             s => match byte("mask_with", s.chars().next())? {
@@ -148,7 +158,7 @@ impl ConsensusBuilder {
                 }
             },
         };
-        let regions_overlap = match regions_overlap {
+        let regions_overlap = match regions_overlap.as_str() {
             "start" => Overlap::Start,
             "record" => Overlap::Record,
             "variant" => Overlap::Variant,
@@ -163,8 +173,8 @@ impl ConsensusBuilder {
             missing: byte("missing", missing)?,
             absent: byte("absent", absent)?,
             mark_del: byte("mark_del", mark_del)?,
-            mark_ins: mark("mark_ins", mark_ins)?,
-            mark_snv: mark("mark_snv", mark_snv)?,
+            mark_ins: mark("mark_ins", mark_ins.as_deref())?,
+            mark_snv: mark("mark_snv", mark_snv.as_deref())?,
             mask: None,
             regions_overlap,
             chain,
@@ -185,7 +195,8 @@ impl ConsensusBuilder {
                 options.mask = Some(Arc::new(Mask::parse(&std::fs::read(p)?, mask_with)?));
             }
             let (csi, at) = open_index(&bcf, index.as_deref())?;
-            let variants = BcfReader::open(FileSource::open(&bcf)?, csi)?;
+            let mut variants = BcfReader::open(FileSource::open(&bcf)?, csi)?;
+            variants.set_cache(cache);
             Ok((Consensus::new(variants, filter, options)?, at))
         });
         let (consensus, index) = built.or_raise()?;
@@ -204,6 +215,14 @@ impl ConsensusBuilder {
     #[getter]
     fn index_path(&self) -> String {
         path_str(&self.index)
+    }
+
+    fn set_cache(&self, py: Python<'_>, cache: Option<PyRef<'_, PyBlockCache>>) -> PyResult<()> {
+        let cache = cache::handle(cache)?;
+        self.inner.run(py, |b| {
+            b.consensus.variants_mut().set_cache(cache);
+            Ok(())
+        })
     }
 
     fn clone_context(&self, py: Python<'_>, reference: Py<SequenceReader>) -> PyResult<Self> {
@@ -281,4 +300,10 @@ impl ConsensusBuilder {
     fn close(&self, py: Python<'_>) {
         drop(self.inner.take(py));
     }
+}
+
+/// Whether `text` is a haplotype `bcftools consensus -H` takes.
+#[pyfunction]
+pub fn is_haplotype(text: &str) -> bool {
+    omicsweave_consensus::is_haplotype(text)
 }

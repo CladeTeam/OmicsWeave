@@ -7,13 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use numpy::{Element, PyReadonlyArray1};
-use omicsweave_bgzf::SeekStats;
 use omicsweave_core::sidecar::{self, SourceIdentity};
 use omicsweave_core::{Error, Locus, ReadAt, Result, Span, Strand};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedStr;
-use pyo3::types::PyDict;
 
 use crate::error::{Done, Fail};
 
@@ -202,17 +200,6 @@ pub fn path_str(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Physical BGZF work, separate from cache lookup counters and output size.
-pub fn seek_stats(py: Python<'_>, stats: SeekStats) -> PyResult<Bound<'_, PyDict>> {
-    let out = PyDict::new(py);
-    out.set_item("read_calls", stats.read_calls)?;
-    out.set_item("read_bytes", stats.read_bytes)?;
-    out.set_item("inflate_calls", stats.inflate_calls)?;
-    out.set_item("compacted_bytes", stats.compacted_bytes)?;
-    out.set_item("discarded_bytes", stats.discarded_bytes)?;
-    Ok(out)
-}
-
 /// A dense-query key as the Python layer passes it: chromosome, ascending
 /// `(start, end)` spans and the strand as `+`, `-`, `.` or `?`.
 pub type LocusKey = (PyBackedStr, Vec<(u32, u32)>, PyBackedStr);
@@ -236,5 +223,98 @@ pub fn with_locus<R>(key: &LocusKey, f: impl FnOnce(&Locus<'_>) -> Result<R>) ->
     } else {
         let spans: Vec<Span> = spans.iter().map(|&(s, e)| Span::new(s, e)).collect();
         f(&Locus::new(chrom, &spans, strand)?)
+    }
+}
+
+/// `threads`, or every core the process may run on (CPU affinity and
+/// cgroup limits included) for `None`.
+pub fn threads_or_available(threads: Option<usize>) -> PyResult<usize> {
+    match threads {
+        Some(0) => Err(pyo3::exceptions::PyValueError::new_err(
+            "threads must be at least 1",
+        )),
+        Some(n) => Ok(n),
+        None => Ok(std::thread::available_parallelism().map_or(1, |n| n.get())),
+    }
+}
+
+/// Plans are immutable, so callbacks may inspect them while a run owns the
+/// output files. A second run must fail without waiting for its caller.
+pub struct PlanRunState {
+    process: u32,
+    running: AtomicBool,
+}
+
+impl PlanRunState {
+    pub fn new() -> PlanRunState {
+        PlanRunState {
+            process: std::process::id(),
+            running: AtomicBool::new(false),
+        }
+    }
+
+    pub fn begin(&self) -> PyResult<PlanRun<'_>> {
+        if self.process != process_id() {
+            return Err(PyRuntimeError::new_err(
+                "plan cannot be reused after fork; plan it again in this process",
+            ));
+        }
+        self.running
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| PyRuntimeError::new_err("plan is already running"))?;
+        Ok(PlanRun(&self.running))
+    }
+}
+
+pub struct PlanRun<'a>(&'a AtomicBool);
+
+impl Drop for PlanRun<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The workers a writer encodes and compresses blocks on; one (the
+/// default: writers stay free of threads, so a process may fork) is the
+/// calling thread. The file does not depend on the count.
+pub struct Workers {
+    pool: Option<omicsweave_core::exec::Pool>,
+    process: u32,
+}
+
+impl Workers {
+    pub fn new(threads: usize) -> PyResult<Workers> {
+        let n = threads;
+        if n == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "threads must be at least 1",
+            ));
+        }
+        Ok(Workers {
+            pool: (n > 1).then(|| omicsweave_core::exec::Pool::new(n)),
+            process: std::process::id(),
+        })
+    }
+
+    pub fn exec(&self) -> omicsweave_core::exec::Exec<'_> {
+        match &self.pool {
+            None => omicsweave_core::exec::Exec::Inline,
+            Some(pool) => omicsweave_core::exec::Exec::Pool {
+                pool,
+                limit: 2 * pool.threads(),
+            },
+        }
+    }
+}
+
+impl Drop for Workers {
+    fn drop(&mut self) {
+        if self.process != std::process::id()
+            && let Some(pool) = self.pool.take()
+        {
+            // Only the calling thread survives fork. Joining inherited
+            // workers or locking their queue cannot make progress here.
+            std::mem::forget(pool);
+        }
     }
 }

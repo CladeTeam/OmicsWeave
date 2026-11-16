@@ -1,9 +1,12 @@
-//! Explicit process-local control of caller-owned decoded blocks.
+//! A process-local store of decoded blocks that readers share. Which
+//! blocks a query needs and how they are scheduled belong to the native
+//! layer (loaders); Python attaches a cache, sizes it and reads its
+//! counters.
 
 use std::sync::Arc;
 
 use crate::shared::process_id;
-use omicsweave_core::cache::{BlockCache, BlockKey, SourceToken};
+use omicsweave_core::cache::BlockCache;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -15,72 +18,6 @@ fn check_process(process: u32) -> PyResult<()> {
         ));
     }
     Ok(())
-}
-
-#[pyclass(frozen, eq, hash, skip_from_py_object, module = "omicsweave.cache")]
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct CacheNamespace {
-    pub token: SourceToken,
-    process: u32,
-}
-
-impl CacheNamespace {
-    pub fn new(token: SourceToken) -> Self {
-        Self {
-            token,
-            process: process_id(),
-        }
-    }
-}
-
-#[pymethods]
-impl CacheNamespace {
-    fn __repr__(&self) -> String {
-        format!("CacheNamespace({})", self.token.get())
-    }
-}
-
-#[pyclass(
-    frozen,
-    eq,
-    hash,
-    skip_from_py_object,
-    name = "BlockKey",
-    module = "omicsweave.cache"
-)]
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct CacheKey {
-    key: BlockKey,
-    process: u32,
-}
-
-impl CacheKey {
-    pub fn new(key: BlockKey) -> Self {
-        Self {
-            key,
-            process: process_id(),
-        }
-    }
-}
-
-#[pymethods]
-impl CacheKey {
-    #[getter]
-    fn source(&self) -> PyResult<CacheNamespace> {
-        check_process(self.process)?;
-        Ok(CacheNamespace::new(self.key.source))
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "CacheKey(source={}, kind={}, stream={:?}, block={}, variant={})",
-            self.key.source.get(),
-            self.key.kind,
-            self.key.stream,
-            self.key.block,
-            self.key.variant
-        )
-    }
 }
 
 #[pyclass(frozen, name = "BlockCache", module = "omicsweave._native")]
@@ -130,34 +67,10 @@ impl PyBlockCache {
         Ok(d)
     }
 
-    fn keys(&self, py: Python<'_>) -> PyResult<Vec<CacheKey>> {
+    /// Drops every entry; blocks leased by a running query stay valid.
+    fn clear(&self, py: Python<'_>) -> PyResult<()> {
         let cache = self.handle()?;
-        Ok(py
-            .detach(|| cache.keys())
-            .into_iter()
-            .map(CacheKey::new)
-            .collect())
-    }
-
-    fn evict(&self, py: Python<'_>, key: &CacheKey) -> PyResult<bool> {
-        check_process(key.process)?;
-        let cache = self.handle()?;
-        Ok(py.detach(|| cache.evict(key.key)))
-    }
-
-    #[pyo3(signature = (source=None))]
-    fn clear(&self, py: Python<'_>, source: Option<&CacheNamespace>) -> PyResult<()> {
-        let cache = self.handle()?;
-        let source = source
-            .map(|s| {
-                check_process(s.process)?;
-                Ok::<_, PyErr>(s.token)
-            })
-            .transpose()?;
-        py.detach(|| match source {
-            Some(s) => cache.clear_source(s),
-            None => cache.clear(),
-        });
+        py.detach(|| cache.clear());
         Ok(())
     }
 

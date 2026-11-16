@@ -8,13 +8,15 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray2, PyUntype
 use omicsweave_core::{
     ContactEntry, ContactQuery, ContactRead, ContactUnit, FileSource, Region, Result,
 };
-use omicsweave_hic::{BuildOptions, Chrom, HicHeader, HicReader, HicSidecar, Record};
+use omicsweave_hic::{
+    BlockBins, BlockLayout, BuildOptions, Chrom, HicHeader, HicReader, HicSidecar, Record,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use crate::cache::{self, CacheKey, CacheNamespace, PyBlockCache};
+use crate::cache::{self, PyBlockCache};
 use crate::error::{Done, OrRaise};
-use crate::shared::{Shared, path_str, save_sidecar, slice};
+use crate::shared::{Shared, Workers, path_str, save_sidecar, slice};
 
 fn unit(name: &str) -> PyResult<ContactUnit> {
     ContactUnit::parse(name)
@@ -102,29 +104,22 @@ impl ContactReader {
         })
     }
 
-    fn cache_namespace(&self, py: Python<'_>) -> PyResult<CacheNamespace> {
-        self.inner
-            .run(py, |c| Ok(CacheNamespace::new(c.reader.cache_namespace())))
-    }
-
-    fn describe_cache(&self, py: Python<'_>, tile: Tile) -> PyResult<Vec<CacheKey>> {
-        let q = query(&tile)?;
+    /// The chromosome pairs, by name, that have a contact map, in
+    /// chromosome order.
+    fn maps(&self, py: Python<'_>) -> PyResult<Vec<(String, String)>> {
+        let chroms = &self.chroms;
         self.inner.run(py, |c| {
-            let mut keys = Vec::new();
-            c.reader.describe_cache(q, &mut keys)?;
-            Ok(keys.into_iter().map(CacheKey::new).collect())
-        })
-    }
-
-    fn prefetch_cache(&self, py: Python<'_>, tile: Tile) -> PyResult<()> {
-        let q = query(&tile)?;
-        self.inner.run(py, |c| {
-            let mut requests = Vec::new();
-            c.reader.cache_plan(q, &mut requests)?;
-            for request in requests {
-                c.reader.load_cached_block(&request)?;
-            }
-            Ok(())
+            let mut pairs: Vec<(u32, u32)> = c.reader.footer().matrices.keys().copied().collect();
+            pairs.sort_unstable();
+            Ok(pairs
+                .into_iter()
+                .filter_map(|(a, b)| {
+                    Some((
+                        chroms.get(a as usize)?.0.clone(),
+                        chroms.get(b as usize)?.0.clone(),
+                    ))
+                })
+                .collect())
         })
     }
 
@@ -290,13 +285,30 @@ fn close_with_sidecar(
 pub struct HicWriter {
     inner: Shared<omicsweave_hic::HicWriter<BufWriter<File>>>,
     path: PathBuf,
+    /// The pool the writer's jobs run on, alive as long as it is.
+    _workers: Workers,
+}
+
+/// Bins per block side, within and between chromosomes (`None`: the
+/// Juicer grid); `None` as a whole is the default layout.
+type Blocks = Option<(Option<u32>, Option<u32>)>;
+
+fn layout(blocks: Blocks) -> BlockLayout {
+    let bins = |b: Option<u32>| b.map_or(BlockBins::Juicer, BlockBins::Fixed);
+    match blocks {
+        None => BlockLayout::default(),
+        Some((intra, inter)) => BlockLayout {
+            intra: bins(intra),
+            inter: bins(inter),
+        },
+    }
 }
 
 #[pymethods]
 impl HicWriter {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (path, version, genome, attributes, chroms, bp_resolutions, frag_resolutions, sites, level))]
+    #[pyo3(signature = (path, version, genome, attributes, chroms, bp_resolutions, frag_resolutions, sites, level, blocks=None, threads=1))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
@@ -308,7 +320,10 @@ impl HicWriter {
         frag_resolutions: Vec<u32>,
         sites: Vec<Vec<u32>>,
         level: u32,
+        blocks: Blocks,
+        threads: usize,
     ) -> PyResult<HicWriter> {
+        let workers = Workers::new(threads)?;
         let h = header(
             version,
             genome,
@@ -320,9 +335,17 @@ impl HicWriter {
         );
         py.detach(|| -> Result<HicWriter> {
             let out = BufWriter::new(File::create(&path)?);
+            let writer = omicsweave_hic::HicWriter::create_exec(
+                out,
+                h,
+                level,
+                layout(blocks),
+                workers.exec(),
+            )?;
             Ok(HicWriter {
-                inner: Shared::new_writer(omicsweave_hic::HicWriter::create(out, h, level)?),
+                inner: Shared::new_writer(writer),
                 path,
+                _workers: workers,
             })
         })
         .or_raise()
@@ -373,14 +396,15 @@ impl HicWriter {
 pub struct HicBuilder {
     inner: Shared<omicsweave_hic::HicBuilder>,
     path: PathBuf,
-    level: u32,
+    options: BuildOptions,
+    workers: Workers,
 }
 
 #[pymethods]
 impl HicBuilder {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (path, version, genome, attributes, chroms, bp_resolutions, frag_resolutions, sites, level))]
+    #[pyo3(signature = (path, version, genome, attributes, chroms, bp_resolutions, frag_resolutions, sites, level, blocks=None, threads=1))]
     fn new(
         path: PathBuf,
         version: i32,
@@ -391,6 +415,8 @@ impl HicBuilder {
         frag_resolutions: Vec<u32>,
         sites: Vec<Vec<u32>>,
         level: u32,
+        blocks: Blocks,
+        threads: usize,
     ) -> PyResult<HicBuilder> {
         let h = header(
             version,
@@ -404,7 +430,11 @@ impl HicBuilder {
         Ok(HicBuilder {
             inner: Shared::new(omicsweave_hic::HicBuilder::new(h).or_raise()?),
             path,
-            level,
+            options: BuildOptions {
+                level,
+                blocks: layout(blocks),
+            },
+            workers: Workers::new(threads)?,
         })
     }
 
@@ -439,11 +469,7 @@ impl HicBuilder {
         };
         py.detach(|| -> Result<Option<String>> {
             let out = BufWriter::new(File::create(&self.path)?);
-            let options = BuildOptions {
-                level: self.level,
-                ..Default::default()
-            };
-            let (out, made) = builder.finish_with_sidecar(out, &options)?;
+            let (out, made) = builder.finish_exec(out, &self.options, self.workers.exec())?;
             out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
             close_with_sidecar(&self.path, made, sidecar)
         })

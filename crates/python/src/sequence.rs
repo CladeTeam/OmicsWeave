@@ -10,13 +10,13 @@ use std::sync::Arc;
 use numpy::{
     Element, PY_ARRAY_API, PyArray1, PyArrayDescrMethods, PyArrayMethods, PyReadwriteArray1,
 };
-use omicsweave_core::cache::{BlockCache, BlockKey, SourceToken};
+use omicsweave_core::cache::BlockCache;
 use omicsweave_core::{Error, FileSource, Locus, Result, SequenceRead};
 use omicsweave_fasta::{Fai, FastaReader, Gzi, TWOBIT_MAGIC, TwoBitReader, fai_path, gzi_path};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use crate::cache::{self, CacheKey, CacheNamespace, PyBlockCache};
+use crate::cache::{self, PyBlockCache};
 use crate::error::{Done, OrRaise};
 use crate::shared::{LocusKey, Shared, head, path_str, with_locus};
 
@@ -30,27 +30,6 @@ impl Sequences {
         match self {
             Self::Fasta(r) => r.set_cache(cache),
             Self::TwoBit(r) => r.set_cache(cache),
-        }
-    }
-
-    fn namespace(&self) -> SourceToken {
-        match self {
-            Self::Fasta(r) => r.cache_namespace(),
-            Self::TwoBit(r) => r.cache_namespace(),
-        }
-    }
-
-    fn describe(&self, locus: &Locus<'_>, keys: &mut Vec<BlockKey>) -> Result<()> {
-        match self {
-            Self::Fasta(r) => r.describe_cache(locus, keys),
-            Self::TwoBit(r) => r.describe_cache(locus, keys),
-        }
-    }
-
-    fn prefetch(&mut self, locus: &Locus<'_>) -> Result<()> {
-        match self {
-            Self::Fasta(r) => r.prefetch_cache(locus),
-            Self::TwoBit(r) => r.prefetch_cache(locus),
         }
     }
 
@@ -117,22 +96,6 @@ fn index<T>(given: Option<&Path>, beside: PathBuf, parse: fn(&[u8]) -> Result<T>
         }),
         Err(e) => Err(e.into()),
     }
-}
-
-/// Opens the sequence file at `path` by its content (FASTA, bgzip FASTA,
-/// 2bit) with the indexes beside it.
-pub(crate) fn open_sequences(path: &Path) -> Result<Sequences> {
-    let source = FileSource::open(path)?;
-    Ok(match SequenceKind::of(&head(&source, 4)?) {
-        SequenceKind::TwoBit => Sequences::TwoBit(TwoBitReader::open(source, false)?),
-        kind => Sequences::Fasta(open_fasta(
-            path,
-            source,
-            kind == SequenceKind::Bgzf,
-            None,
-            None,
-        )?),
-    })
 }
 
 /// Opens `.fa` with its `.fai`, or `.fa.gz` with its `.fai` and `.gzi`.
@@ -264,24 +227,6 @@ impl SequenceReader {
         self.inner.run(py, |r| Ok(r.set_cache(cache)?))
     }
 
-    fn cache_namespace(&self, py: Python<'_>) -> PyResult<CacheNamespace> {
-        self.inner
-            .run(py, |r| Ok(CacheNamespace::new(r.namespace())))
-    }
-
-    fn describe_cache(&self, py: Python<'_>, key: LocusKey) -> PyResult<Vec<CacheKey>> {
-        self.inner.run(py, |r| {
-            let mut keys = Vec::new();
-            with_locus(&key, |locus| r.describe(locus, &mut keys))?;
-            Ok(keys.into_iter().map(CacheKey::new).collect())
-        })
-    }
-
-    fn prefetch_cache(&self, py: Python<'_>, key: LocusKey) -> PyResult<()> {
-        self.inner
-            .run(py, |r| Ok(with_locus(&key, |locus| r.prefetch(locus))?))
-    }
-
     fn clone_context(&self, py: Python<'_>) -> PyResult<Self> {
         let r = self.inner.run(py, |r| Ok(r.try_clone()?))?;
         Ok(Self {
@@ -331,6 +276,64 @@ impl SequenceReader {
 
     fn close(&self, py: Python<'_>) {
         drop(self.inner.take(py));
+    }
+}
+
+/// A 2bit file being written: the sequence names come first (the
+/// directory precedes the records), the sequences in their order.
+#[pyclass(frozen, module = "omicsweave._native")]
+pub struct TwoBitWriter {
+    inner: Shared<omicsweave_fasta::TwoBitWriter<BufWriter<File>>>,
+}
+
+#[pymethods]
+impl TwoBitWriter {
+    /// `wide_offsets` stores 64-bit offsets (2bit version 1), which files of
+    /// 4 GiB or more need.
+    #[new]
+    #[pyo3(signature = (path, names, wide_offsets=false))]
+    fn new(
+        py: Python<'_>,
+        path: PathBuf,
+        names: Vec<String>,
+        wide_offsets: bool,
+    ) -> PyResult<TwoBitWriter> {
+        py.detach(|| -> Result<TwoBitWriter> {
+            let out = BufWriter::new(File::create(&path)?);
+            let version = u32::from(wide_offsets);
+            let writer = omicsweave_fasta::TwoBitWriter::create(out, names, version)?;
+            Ok(TwoBitWriter {
+                inner: Shared::new_writer(writer),
+            })
+        })
+        .or_raise()
+    }
+
+    /// The name of the next sequence to add, or None once every one is.
+    fn next_name(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        self.inner.run(py, |w| Ok(w.next_name().map(str::to_owned)))
+    }
+
+    /// Adds the next sequence: N and lowercase runs are kept as blocks,
+    /// bases other than ACGT become N.
+    fn add(&self, py: Python<'_>, name: &str, seq: &[u8]) -> PyResult<()> {
+        self.inner.run(py, |w| -> Done<()> {
+            let (record, packed) = omicsweave_fasta::encode_twobit(seq)?;
+            Ok(w.add(name, &record, &mut &packed[..])?)
+        })
+    }
+
+    /// Writes the directory; every named sequence must have been added.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let Some(writer) = self.inner.take(py) else {
+            return Ok(());
+        };
+        py.detach(|| -> Result<()> {
+            let out = writer.finish()?;
+            out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+            Ok(())
+        })
+        .or_raise()
     }
 }
 

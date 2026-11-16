@@ -37,10 +37,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<cache::PyBlockCache>()?;
-    m.add_class::<cache::CacheKey>()?;
-    m.add_class::<cache::CacheNamespace>()?;
     m.add_class::<sequence::SequenceReader>()?;
     m.add_class::<sequence::FastaWriter>()?;
+    m.add_class::<sequence::TwoBitWriter>()?;
     m.add_class::<track::TrackReader>()?;
     m.add_class::<track::BigWigWriter>()?;
     m.add_class::<interval::IntervalReader>()?;
@@ -56,14 +55,17 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(index::build_fasta_index, m)?)?;
     m.add_function(wrap_pyfunction!(alignment::build_bam_index, m)?)?;
     m.add_function(wrap_pyfunction!(alignment::build_cram_index, m)?)?;
+    m.add_function(wrap_pyfunction!(variant::build_bcf_index, m)?)?;
     m.add_function(wrap_pyfunction!(index::build_sidecar, m)?)?;
+    m.add_function(wrap_pyfunction!(index::read_sidecar, m)?)?;
     m.add_function(wrap_pyfunction!(index::detect, m)?)?;
-    m.add_function(wrap_pyfunction!(convert::convert, m)?)?;
-    m.add_function(wrap_pyfunction!(convert::plan_convert, m)?)?;
+    m.add_class::<convert::ConvertPlan>()?;
     m.add_function(wrap_pyfunction!(convert::conversions, m)?)?;
     m.add_function(wrap_pyfunction!(convert::parse_size_py, m)?)?;
     m.add_function(wrap_pyfunction!(convert::human_size, m)?)?;
-    m.add_function(wrap_pyfunction!(quant::quantify, m)?)?;
-    m.add_function(wrap_pyfunction!(quant::plan_quant, m)?)?;
+    m.add_class::<quant::QuantPlan>()?;
+    m.add_function(wrap_pyfunction!(quant::quant_defaults, m)?)?;
+    m.add_function(wrap_pyfunction!(annotation::read_aliases, m)?)?;
+    m.add_function(wrap_pyfunction!(consensus::is_haplotype, m)?)?;
     Ok(())
 }

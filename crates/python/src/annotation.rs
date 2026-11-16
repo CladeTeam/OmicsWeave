@@ -79,6 +79,26 @@ fn aliases(pairs: Option<Vec<(String, String)>>) -> Option<Aliases> {
     pairs.map(Aliases::from_pairs)
 }
 
+/// The aliases of a two-column file (`from to` per line, `#` comments), as
+/// `(from, to)` pairs.
+#[pyfunction]
+pub fn read_aliases(py: Python<'_>, path: PathBuf) -> PyResult<Vec<(String, String)>> {
+    py.detach(|| -> Result<Vec<(String, String)>> {
+        let text = std::fs::read_to_string(&path).map_err(|e| omicsweave_core::Error::Io {
+            kind: e.kind(),
+            detail: format!("{}: {e}", path.display()),
+        })?;
+        let aliases = Aliases::parse(&text)?;
+        let mut pairs: Vec<(String, String)> = aliases
+            .pairs()
+            .map(|(a, b)| (a.to_owned(), b.to_owned()))
+            .collect();
+        pairs.sort();
+        Ok(pairs)
+    })
+    .or_raise()
+}
+
 /// A dict of named numpy columns.
 struct Columns<'py> {
     dict: Bound<'py, PyDict>,
@@ -123,6 +143,12 @@ impl IntervalSet {
             inner: Arc::new(set),
             process: std::process::id(),
         }
+    }
+
+    /// The set, for native consumers in this process.
+    pub(crate) fn shared(&self) -> PyResult<Arc<gtf::IntervalSet>> {
+        check_process(self.process)?;
+        Ok(Arc::clone(&self.inner))
     }
 }
 
@@ -217,20 +243,35 @@ impl IntervalSet {
         Ok(c.dict)
     }
 
-    /// Rows overlapping `chrom:[start, end)`, in start order.
+    /// Rows overlapping `chrom:[start, end)` (`mode="overlaps"`), lying
+    /// within it (`"within"`) or covering all of it (`"containing"`).
+    #[pyo3(signature = (chrom, start, end, mode="overlaps"))]
     fn overlaps<'py>(
         &self,
         py: Python<'py>,
         chrom: &str,
         start: u32,
         end: u32,
+        mode: &str,
     ) -> PyResult<Bound<'py, PyArray1<u32>>> {
         check_process(self.process)?;
+        if !matches!(mode, "overlaps" | "within" | "containing") {
+            return Err(PyValueError::new_err(format!(
+                "mode must be overlaps, within or containing, not {mode:?}"
+            )));
+        }
         let s = Arc::clone(&self.inner);
         let hits = py.detach(|| {
             let mut out = Vec::new();
             if let Some(seqid) = s.seqid_of(chrom) {
-                s.overlaps(seqid, start, end, &mut out);
+                match mode {
+                    "overlaps" => s.overlaps(seqid, start, end, &mut out),
+                    "within" => s.index().contained_in(seqid, start, end, &mut out),
+                    _ => s.index().containing(seqid, start, end, &mut out),
+                }
+                if mode != "overlaps" {
+                    out.sort_by_key(|&r| (s.start[r as usize], r));
+                }
             }
             out
         });
@@ -286,18 +327,7 @@ fn selection(
 }
 
 fn check_selection(ann: &gtf::Annotation, sel: &Option<Selection>) -> Result<()> {
-    if let Some(s) = sel {
-        let ok = |v: &[u32], n: usize| {
-            v.windows(2).all(|w| w[0] < w[1]) && v.iter().all(|&x| (x as usize) < n)
-        };
-        if !ok(&s.genes, ann.genes().len()) || !ok(&s.transcripts, ann.transcripts().len()) {
-            return Err(Error::invalid(
-                "selection",
-                "rows must be ascending, distinct and in range",
-            ));
-        }
-    }
-    Ok(())
+    sel.as_ref().map_or(Ok(()), |s| s.check(ann))
 }
 
 impl GeneAnnotation {
@@ -331,7 +361,7 @@ impl GeneAnnotation {
     /// Reads a GTF or GFF3 file (plain, gzip or BGZF). `attributes` is
     /// `"all"`, `"none"`, or a list of keys to keep.
     #[new]
-    #[pyo3(signature = (path, attributes=None, keys=None, aliases=None, strict=false, threads=0, dialect=None))]
+    #[pyo3(signature = (path, attributes=None, keys=None, aliases=None, strict=false, threads=None, dialect=None, batch_bytes=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -340,8 +370,9 @@ impl GeneAnnotation {
         keys: Option<Vec<String>>,
         aliases: Option<Vec<(String, String)>>,
         strict: bool,
-        threads: usize,
+        threads: Option<usize>,
         dialect: Option<&str>,
+        batch_bytes: Option<usize>,
     ) -> PyResult<GeneAnnotation> {
         let attributes = match (attributes.unwrap_or("all"), keys) {
             ("all", None) => AttributePolicy::All,
@@ -368,8 +399,8 @@ impl GeneAnnotation {
             attributes,
             aliases: self::aliases(aliases),
             strict,
-            threads,
-            ..ReadOptions::default()
+            threads: threads.unwrap_or(0),
+            batch_bytes: batch_bytes.unwrap_or(ReadOptions::default().batch_bytes),
         };
         let ann = py
             .detach(|| gtf::Annotation::read(&path, &opts))
@@ -512,6 +543,33 @@ impl GeneAnnotation {
             .array("phase", phase)?
             .strings("type", ftype)?
             .array("feature", rows)?
+            .dict)
+    }
+
+    /// Records that are neither genes, transcripts nor their features
+    /// (GFF3 `region`s, `repeat_region`s, ...), as columns.
+    fn others<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        check_process(self.process)?;
+        let a = Arc::clone(&self.inner);
+        let o = a.others();
+        let (ftype, source, score, id) = py.detach(|| {
+            (
+                strings(a.pool(), o.feature_type.iter().copied()),
+                strings(a.pool(), o.source.iter().copied()),
+                strings(a.pool(), o.score.iter().copied()),
+                strings(a.pool(), o.id.iter().copied()),
+            )
+        });
+        Ok(Columns::new(py)
+            .array("seqid", o.seqid.clone())?
+            .array("start", o.start.clone())?
+            .array("end", o.end.clone())?
+            .array("strand", strands(&o.strand))?
+            .array("phase", o.phase.clone())?
+            .strings("type", ftype)?
+            .strings("source", source)?
+            .strings("score", score)?
+            .strings("id", id)?
             .dict)
     }
 

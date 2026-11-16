@@ -1,4 +1,5 @@
-//! Variants (BCF + CSI): the genotype matrix of a region.
+//! Variants (BCF + CSI): the records of a region as columns, and their
+//! genotype matrix.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -7,13 +8,14 @@ use std::sync::Arc;
 use numpy::{IntoPyArray, PyArray1};
 use omicsweave_bgzf::{BinIndex, locate_index};
 use omicsweave_core::{Error, FileSource, Region, Result};
-use omicsweave_vcf::{BcfReader, Strings};
+use omicsweave_vcf::{BcfReader, Column, RecordFilter, RecordQuery, Strings, Values};
+use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 
-use crate::cache::{self, CacheKey, CacheNamespace, PyBlockCache};
+use crate::cache::{self, PyBlockCache};
 use crate::error::{Done, OrRaise};
-use crate::shared::{Shared, path_str, seek_stats};
+use crate::shared::{Shared, path_str, threads_or_available};
 
 /// The CSI at `given`, or else `<bcf>.csi` as htslib finds it; it must
 /// exist (indexes are built explicitly, never on open).
@@ -23,7 +25,7 @@ pub(crate) fn open_index(bcf: &Path, given: Option<&Path>) -> Result<(BinIndex, 
         None => locate_index(bcf).ok_or_else(|| Error::Io {
             kind: std::io::ErrorKind::NotFound,
             detail: format!(
-                "no index of {} found (.csi beside it); write it with `ow convert --index`",
+                "no index of {} found (.csi beside it); build it with Bcf.build_index()",
                 bcf.display()
             ),
         })?,
@@ -48,6 +50,34 @@ type Matrix<'py> = (
     Bound<'py, PyArray1<i8>>,
     Bound<'py, PyArray1<bool>>,
 );
+
+/// `(name, kind, width, values)`: kind `flag`, `int`, `float` or `str`
+/// (values then `(offsets, data)`).
+fn py_column<'py>(py: Python<'py>, c: Column) -> PyResult<Bound<'py, PyAny>> {
+    let (kind, width, values) = match c.values {
+        Values::Flag(v) => ("flag", 1, v.into_pyarray(py).into_any()),
+        Values::Int { width, values } => ("int", width, values.into_pyarray(py).into_any()),
+        Values::Float { width, values } => ("float", width, values.into_pyarray(py).into_any()),
+        Values::Str(s) => ("str", 1, py_strings(py, s).into_bound_py_any(py)?),
+    };
+    (c.name, kind, width, values).into_bound_py_any(py)
+}
+
+/// Builds the `.csi` of a sorted BGZF BCF beside it, as `bcftools index`
+/// does; returns its path.
+#[pyfunction]
+#[pyo3(signature = (path, min_shift=omicsweave_vcf::CSI_MIN_SHIFT, threads=None))]
+pub fn build_bcf_index(
+    py: Python<'_>,
+    path: PathBuf,
+    min_shift: u32,
+    threads: Option<usize>,
+) -> PyResult<String> {
+    let threads = threads_or_available(threads)?;
+    py.detach(|| omicsweave_vcf::build_index_file(&path, min_shift, threads))
+        .map(|at| path_str(&at))
+        .or_raise()
+}
 
 #[pyclass(frozen, module = "omicsweave._native")]
 pub struct VariantReader {
@@ -119,32 +149,6 @@ impl VariantReader {
         })
     }
 
-    fn cache_namespace(&self, py: Python<'_>) -> PyResult<CacheNamespace> {
-        self.inner
-            .run(py, |r| Ok(CacheNamespace::new(r.cache_namespace())))
-    }
-
-    fn describe_cache(
-        &self,
-        py: Python<'_>,
-        chrom: &str,
-        start: u32,
-        end: u32,
-    ) -> PyResult<Vec<CacheKey>> {
-        self.inner.run(py, |r| {
-            let mut keys = Vec::new();
-            r.describe_cache(Region::new(chrom, start, end), &mut keys)?;
-            Ok(keys.into_iter().map(CacheKey::new).collect())
-        })
-    }
-
-    fn prefetch_cache(&self, py: Python<'_>, chrom: &str, start: u32, end: u32) -> PyResult<()> {
-        self.inner.run(
-            py,
-            |r| Ok(r.prefetch_cache(Region::new(chrom, start, end))?),
-        )
-    }
-
     fn clone_context(&self, py: Python<'_>) -> PyResult<Self> {
         let reader = self.inner.run(py, |r| Ok(r.try_clone()?))?;
         Ok(Self {
@@ -153,18 +157,6 @@ impl VariantReader {
             samples: self.samples.clone(),
             all_sample_ids: Arc::clone(&self.all_sample_ids),
             index: self.index.clone(),
-        })
-    }
-
-    fn stream_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let stats = self.inner.run(py, |r| Ok(r.stream_stats()))?;
-        seek_stats(py, stats)
-    }
-
-    fn reset_stream_stats(&self, py: Python<'_>) -> PyResult<()> {
-        self.inner.run(py, |r| {
-            r.reset_stats();
-            Ok(())
         })
     }
 
@@ -193,6 +185,69 @@ impl VariantReader {
             m.gt.into_pyarray(py),
             m.phased.into_pyarray(py),
         ))
+    }
+
+    /// The records overlapping `chrom:[start, end)` that `include` keeps
+    /// (or `exclude` leaves out; bcftools expressions), with the genotype
+    /// matrix of `samples`, QUAL, FILTER and the `info` and `format`
+    /// fields: a dict of columns, fields as `(name, kind, width, values)`.
+    #[pyo3(signature = (chrom, start, end, samples=None, info=Vec::new(), format=Vec::new(),
+                        include=None, exclude=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn records<'py>(
+        &self,
+        py: Python<'py>,
+        chrom: &str,
+        start: u32,
+        end: u32,
+        samples: Option<Vec<usize>>,
+        info: Vec<String>,
+        format: Vec<String>,
+        include: Option<String>,
+        exclude: Option<String>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let samples = samples.as_deref().unwrap_or(&self.all_sample_ids);
+        let query = RecordQuery { info, format };
+        let t = self.inner.run(py, |r| -> Done<_> {
+            let mut filter = match (&include, &exclude) {
+                (Some(_), Some(_)) => {
+                    return Err(
+                        Error::invalid("variants", "give include or exclude, not both").into(),
+                    );
+                }
+                (Some(e), None) => Some(RecordFilter::include(r.header(), e)?),
+                (None, Some(e)) => Some(RecordFilter::exclude(r.header(), e)?),
+                (None, None) => None,
+            };
+            Ok(r.records(
+                Region::new(chrom, start, end),
+                samples,
+                &query,
+                filter.as_mut(),
+            )?)
+        })?;
+        let m = t.genotypes;
+        let d = PyDict::new(py);
+        d.set_item("start", m.start.into_pyarray(py))?;
+        d.set_item("end", m.end.into_pyarray(py))?;
+        d.set_item("id", py_strings(py, m.id))?;
+        d.set_item("ref", py_strings(py, m.reference))?;
+        d.set_item("alt", py_strings(py, m.alt))?;
+        d.set_item("ploidy", m.ploidy)?;
+        d.set_item("gt", m.gt.into_pyarray(py))?;
+        d.set_item("phased", m.phased.into_pyarray(py))?;
+        d.set_item("qual", t.qual.into_pyarray(py))?;
+        d.set_item("filters", py_strings(py, t.filters))?;
+        let columns = |cs: Vec<Column>| -> PyResult<Bound<'py, PyList>> {
+            let items = cs
+                .into_iter()
+                .map(|c| py_column(py, c))
+                .collect::<PyResult<Vec<_>>>()?;
+            PyList::new(py, items)
+        };
+        d.set_item("info", columns(t.info)?)?;
+        d.set_item("format", columns(t.format)?)?;
+        Ok(d)
     }
 
     fn close(&self, py: Python<'_>) {
