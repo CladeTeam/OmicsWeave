@@ -8,16 +8,17 @@ beforehand:
   (``ow convert hg38.fa hg38.fa.gz``)
 - signal: one bigWig per track (CUT&Tag G4 / R-loop, ...), up to 146;
   bedGraph or wig is converted
-  (``ow convert G4_K562_rep1.bedGraph G4_K562_rep1.bw --chrom-sizes hg38.fa.fai``)
+  (``ow convert G4_K562_rep1.bedGraph G4_K562_rep1.bw --chrom-sizes hg38.fa.gz.fai``)
 - peaks: one bigBed per track, plus their union ``union_peaks.bb``; BED is
   not read by region and is converted
-  (``ow convert G4_K562.bed G4_K562.bb --chrom-sizes hg38.fa.fai``)
+  (``ow convert G4_K562.bed G4_K562.bb --chrom-sizes hg38.fa.gz.fai``)
 
 Two pipelines:
 
 - tracks: 131 kb windows tiling each chromosome, a fresh random overlap
   each epoch (``seed + epoch``); bp signal of every track, normalized by
-  its genome-wide mean and averaged into ``resolution`` bins.
+  its mean over covered bases and averaged into ``resolution`` bins.
+  Tracks without a positive, finite header mean keep their original scale.
 - peaks: 5 kb one-hot windows for binary classification; positives centred
   on peaks, negatives drawn where no peak lies; per-track 0/1 bin coverage.
 
@@ -62,11 +63,12 @@ def one_hot(bases: np.ndarray) -> np.ndarray:
 
 def bin_coverage(start: np.ndarray, end: np.ndarray, region: Region, resolution: int) -> np.ndarray:
     """0/1 per ``resolution``-base bin of ``region``: covered by any interval."""
-    nbins = len(region) // resolution
+    nbins = -(-len(region) // resolution)
     # Columns are uint32: widen before subtracting.
     start = np.clip(start.astype(np.int64), region.start, region.end) - region.start
     end = np.clip(end.astype(np.int64), region.start, region.end) - region.start
-    first, last = start // resolution, -(-end // resolution)
+    nonempty = start < end
+    first, last = start[nonempty] // resolution, -(-end[nonempty] // resolution)
     edges = np.zeros(nbins + 1, np.int32)
     np.add.at(edges, first, 1)
     np.add.at(edges, last, -1)
@@ -93,7 +95,10 @@ class TiledWindows(Sampler[Region]):
         rng = np.random.default_rng(self.seed + self.epoch)
         out = []
         for chrom, size in self.chroms.items():
-            starts = np.arange(int(rng.integers(self.length)), size - self.length, self.length)
+            if size < self.length:
+                continue
+            offset = int(rng.integers(min(self.length, size - self.length + 1)))
+            starts = np.arange(offset, size - self.length + 1, self.length)
             jitter = rng.integers(-self.length // 4, self.length // 4 + 1, len(starts))
             starts = np.clip(starts + jitter, 0, size - self.length)
             out += [Region(chrom, int(s), int(s) + self.length) for s in starts]
@@ -133,16 +138,20 @@ class TrackWindows(Dataset):
 
     def _open(self) -> tuple[SequenceReader, list[TrackReader], np.ndarray]:
         # Opened in the worker on its first sample; readers are kept for every
-        # later query (and pickle by path if a worker is spawned). The cache
-        # belongs to this process: it is made here and never pickled.
+        # later query. Keep dataset construction free of open readers: the
+        # shared cache belongs to this process and cannot cross fork/pickle.
         if self._readers is None:
             cache = BlockCache(max_bytes=self.cache_bytes)
             sequence = SequenceReader(self.reference, cache=cache)
             signals = [TrackReader(track, cache=cache) for track in self.tracks]
-            # Genome-wide mean of covered bases, from the bigWig header.
-            means = np.array(
-                [r.summary.sum / max(r.summary.bases_covered, 1) for r in signals], np.float32
-            )
+            # A header summary is optional; empty/all-zero tracks need no scaling.
+            means = np.ones(len(signals), np.float32)
+            for i, reader in enumerate(signals):
+                summary = reader.summary
+                if summary is not None and summary.bases_covered:
+                    mean = summary.sum / summary.bases_covered
+                    if np.isfinite(mean) and mean > 0:
+                        means[i] = mean
             self._readers = sequence, signals, means
         return self._readers
 
@@ -152,15 +161,16 @@ class TrackWindows(Dataset):
             # The minus strand: bases come reverse complemented, bins reversed.
             region = region.with_strand("-")
         bases = sequence.fetch(region).bases
-        rows = [reader.bins(region, self.resolution, "sum").values[0] for reader in signals]
+        rows = []
+        for reader, mean in zip(signals, means, strict=True):
+            bins = reader.bins(region, self.resolution, "sum")
+            # edges are local to the oriented query, including a partial last bin.
+            rows.append(np.nan_to_num(bins["sum"]) / (np.diff(bins.edges) * mean))
         signal = (
-            np.stack(rows)
+            np.stack(rows).astype(np.float32)
             if rows
             else np.empty((0, -(-len(region) // self.resolution)), np.float32)
         )
-        np.nan_to_num(signal, copy=False)
-        # Missing bases count as 0: the bin mean is its sum over its width.
-        signal /= self.resolution * means[:, None]
         return {"sequence": bases, "signal": signal}
 
 
@@ -172,7 +182,9 @@ class PeakWindows(Sampler[tuple[Region, int]]):
     from the chromosomes where the union has no peak. Yields (region, label)."""
 
     def __init__(self, union: BigBed, chroms: Mapping[str, int], length: int, *, seed: int = 0):
-        self.union, self.chroms, self.length, self.seed = union, dict(chroms), length, seed
+        self.union = union
+        self.chroms = {c: n for c, n in chroms.items() if n >= length}
+        self.length, self.seed = length, seed
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -192,7 +204,7 @@ class PeakWindows(Sampler[tuple[Region, int]]):
             names, sizes = list(self.chroms), np.array(list(self.chroms.values()))
             while len(items) < 2 * positives:
                 chrom = names[rng.choice(len(names), p=sizes / sizes.sum())]
-                s = int(rng.integers(0, self.chroms[chrom] - self.length))
+                s = int(rng.integers(0, self.chroms[chrom] - self.length + 1))
                 region = Region(chrom, s, s + self.length)
                 if len(peaks.fetch(region)) == 0:
                     items.append((region, 0))
@@ -220,11 +232,14 @@ class PeakDataset(Dataset):
     def __getitem__(self, item: tuple[Region, int]) -> dict[str, np.ndarray]:
         region, label = item
         sequence, peak_sets = self._open()
-        coverage = np.stack(
-            [
-                bin_coverage(h.start, h.end, region, self.resolution)
-                for h in (p.fetch(region) for p in peak_sets)
-            ]
+        rows = [
+            bin_coverage(h.start, h.end, region, self.resolution)
+            for h in (p.fetch(region) for p in peak_sets)
+        ]
+        coverage = (
+            np.stack(rows)
+            if rows
+            else np.empty((0, -(-len(region) // self.resolution)), np.float32)
         )
         return {
             "sequence": one_hot(sequence.fetch(region).bases),
@@ -257,6 +272,7 @@ def main() -> None:
         num_workers=16,
         prefetch_factor=4,  # batches each worker keeps ready
         persistent_workers=True,  # readers stay open across epochs
+        multiprocessing_context="spawn",  # native readers/caches are created in each worker
         pin_memory=True,
     )
     for epoch in range(3):
@@ -273,6 +289,7 @@ def main() -> None:
         num_workers=8,
         prefetch_factor=128,
         persistent_workers=True,
+        multiprocessing_context="spawn",
     )
     for epoch in range(3):
         candidates.set_epoch(epoch)

@@ -8,11 +8,12 @@ converted once beforehand:
   (``ow convert hg38.fa hg38.fa.gz``)
 - bp tracks (bigWig): ATAC, DNase, CAGE +/-, RNA polyA +/-, RNA total +/-;
   signal kept as bedGraph or wig is converted
-  (``ow convert cage_plus.bedGraph cage_plus.bw --chrom-sizes hg38.fa.fai``)
+  (``ow convert cage_plus.bedGraph cage_plus.bw --chrom-sizes hg38.fa.gz.fai``)
 - coarse tracks (bigWig): 11 histone marks and CTCF, pooled to 128 bp
 - Hi-C: ``.hic``, read at 2048 bp bins; cooler files cannot be read a tile
   at a time and are converted
-  (``ow convert k562.mcool k562.hic --resolutions 2048``)
+  (``ow convert k562.mcool k562.hic --resolutions 2048``). This selects an
+  existing 2048 bp resolution; it does not rebin another resolution.
 - expression: one CellPack matrix (``.cpk``), a row per cell, read with
   ``pycellpack``
 
@@ -92,8 +93,11 @@ def load_cells(manifest: str) -> list[Cell]:
         Cell(
             e["name"],
             e["row"],
-            {a: BigWig(e["bp"][a]) if a in e["bp"] else None for a in BP_ASSAYS},
-            {a: BigWig(e["coarse"][a]) if a in e["coarse"] else None for a in COARSE_ASSAYS},
+            {a: BigWig(e["bp"][a]) if e.get("bp", {}).get(a) else None for a in BP_ASSAYS},
+            {
+                a: BigWig(e["coarse"][a]) if e.get("coarse", {}).get(a) else None
+                for a in COARSE_ASSAYS
+            },
             Hic(e["hic"]) if e.get("hic") else None,
         )
         for e in entries
@@ -139,7 +143,7 @@ class AnchorBatches(Sampler[list[Key]]):
             reverse = bool(rng.random() < 0.5)
             batch = []
             for c in rng.choice(len(self.cells), self.cells_per_window, replace=False):
-                observed = [a for a, f in enumerate(self.cells[c].bp.values()) if f is not None]
+                observed = [a for a, name in enumerate(BP_ASSAYS) if self.cells[c].bp.get(name)]
                 n = int(round(self.target_share * len(observed)))
                 targets = tuple(sorted(rng.choice(observed, n, replace=False).tolist()))
                 batch.append(Key(region, int(c), reverse, targets))
@@ -149,16 +153,6 @@ class AnchorBatches(Sampler[list[Key]]):
         return len(self.anchors)
 
 
-_COMPLEMENT = np.arange(256, dtype=np.uint8)
-for a, b in (b"AT", b"TA", b"CG", b"GC", b"at", b"ta", b"cg", b"gc"):
-    _COMPLEMENT[a] = b
-
-
-def _flip(a: np.ndarray) -> np.ndarray:
-    """``a`` reversed along its position axis (the last)."""
-    return np.ascontiguousarray(a[..., ::-1])
-
-
 @dataclass
 class _Readers:
     cache: BlockCache  # decoded blocks shared by every reader of the worker
@@ -166,7 +160,7 @@ class _Readers:
     bp: list[list[TrackReader | None]]  # [cell][assay]
     coarse: list[list[TrackReader | None]]
     hic: list[ContactReader | None]
-    scale: np.ndarray  # [cell, assay]: genome-wide mean of each bp track
+    scale: np.ndarray  # [cell, assay]: positive covered-base mean, or 1
     expression: Store
 
 
@@ -176,7 +170,8 @@ def _track(file: BigWig | None, cache: BlockCache) -> TrackReader | None:
 
 def _mean(reader: TrackReader | None) -> float:
     s = None if reader is None else reader.summary
-    return 1.0 if s is None or s.bases_covered == 0 else s.sum / s.bases_covered
+    mean = 1.0 if s is None or s.bases_covered == 0 else s.sum / s.bases_covered
+    return mean if np.isfinite(mean) and mean > 0 else 1.0
 
 
 class CenoWindows(Dataset):
@@ -192,17 +187,21 @@ class CenoWindows(Dataset):
         # here too: it belongs to one process and is never pickled.
         if self._readers is None:
             cache = BlockCache(max_bytes=CACHE_BYTES)
-            bp = [[_track(f, cache) for f in c.bp.values()] for c in self.cells]
+            bp = [[_track(c.bp.get(a), cache) for a in BP_ASSAYS] for c in self.cells]
+            hic = [None if c.hic is None else ContactReader(c.hic, cache=cache) for c in self.cells]
+            for reader in hic:
+                if reader is not None and HIC_BIN not in reader.resolutions():
+                    raise ValueError(f"{reader.source}: requires a stored {HIC_BIN} bp resolution")
             self._readers = _Readers(
                 cache=cache,
                 sequence=SequenceReader(self.reference, cache=cache),
                 bp=bp,
-                coarse=[[_track(f, cache) for f in c.coarse.values()] for c in self.cells],
-                hic=[
-                    None if c.hic is None else ContactReader(c.hic, cache=cache) for c in self.cells
+                coarse=[
+                    [_track(c.coarse.get(a), cache) for a in COARSE_ASSAYS] for c in self.cells
                 ],
+                hic=hic,
                 scale=np.array([[_mean(r) for r in row] for row in bp], np.float32),
-                expression=Store(self.expression).astype(np.float32),
+                expression=Store(self.expression, dtype=np.float32),
             )
         return self._readers
 
@@ -226,27 +225,29 @@ class CenoWindows(Dataset):
     ) -> tuple[np.ndarray, np.ndarray]:
         """``COARSE`` bp bins, binned by the reader: the mean with missing
         bases as 0, valid where every base has data."""
-        n = len(region) // COARSE
+        n = -(-len(region) // COARSE)
         values = np.zeros((len(readers), n), np.float32)
         valid = np.zeros((len(readers), n), np.bool_)
         for row, ok, reader in zip(values, valid, readers, strict=True):
             if reader is not None:
-                stats = reader.bins(region, COARSE, ("sum", "coverage")).values
-                row[:] = np.nan_to_num(stats[0]) / COARSE
-                ok[:] = stats[1] == 1
+                stats = reader.bins(region, COARSE, ("sum", "coverage"))
+                row[:] = np.nan_to_num(stats["sum"]) / np.diff(stats.edges)
+                ok[:] = stats["coverage"] == 1
         return values, valid
 
     def _sample(self, key: Key, bases: np.ndarray, expression: np.ndarray) -> dict[str, np.ndarray]:
         r = self._readers
         assert r is not None
-        bp, bp_valid = self._signal(r.bp[key.cell], key.region)
+        # Dense readers orient results 5' to 3'; sequence also handles IUPAC complements.
+        region = key.region.with_strand("-" if key.reverse else "+")
+        bp, bp_valid = self._signal(r.bp[key.cell], region)
         bp /= r.scale[key.cell][:, None]
-        coarse, coarse_valid = self._bins(r.coarse[key.cell], key.region)
+        coarse, coarse_valid = self._bins(r.coarse[key.cell], region)
 
-        # The tile is read on the 2048 bp grid nearest the shifted window, so
+        # The tile starts at the 2048 bp grid point before the shifted window, so
         # it always holds WINDOW / HIC_BIN bins.
         start = key.region.start // HIC_BIN * HIC_BIN
-        grid = Region(key.region.chrom, start, start + WINDOW)
+        grid = Region(region.chrom, start, start + WINDOW, region.strand)
         window = ContactWindow(grid, grid, HIC_BIN)
         hic = r.hic[key.cell]
         if hic is not None:
@@ -255,16 +256,14 @@ class CenoWindows(Dataset):
         else:
             contacts = np.zeros(window.shape, np.float32)
 
-        observed = np.array([f is not None for f in self.cells[key.cell].bp.values()])
+        observed = np.array([self.cells[key.cell].bp.get(a) is not None for a in BP_ASSAYS])
         target = np.zeros(len(BP_ASSAYS), np.bool_)
         target[list(key.targets)] = True
         inputs = bp * (observed & ~target)[:, None]
 
         if key.reverse:
-            bases = _COMPLEMENT[bases[::-1]]
-            inputs, bp, bp_valid = (_flip(a[STRAND_SWAP]) for a in (inputs, bp, bp_valid))
-            coarse, coarse_valid = _flip(coarse), _flip(coarse_valid)
-            contacts = np.ascontiguousarray(contacts[::-1, ::-1])
+            # Readers reversed positions; stranded assay channels still need swapping.
+            inputs, bp, bp_valid = (a[STRAND_SWAP] for a in (inputs, bp, bp_valid))
             observed, target = observed[STRAND_SWAP], target[STRAND_SWAP]
         return {
             "sequence": bases,  # [L] uint8 ASCII tokens
@@ -283,10 +282,14 @@ class CenoWindows(Dataset):
     def __getitems__(self, keys: list[Key]) -> list[dict[str, np.ndarray]]:
         r = self._open()
         # One read per distinct window: the batch's cells share its bases.
-        bases = {k.region: r.sequence.fetch(k.region).bases for k in keys}
+        regions = [k.region.with_strand("-" if k.reverse else "+") for k in keys]
+        bases = {region: r.sequence.fetch(region).bases for region in dict.fromkeys(regions)}
         # One CellPack decode for the batch's cells.
         expression = r.expression[[self.cells[k.cell].row for k in keys]].read_dense()
-        return [self._sample(k, bases[k.region], e) for k, e in zip(keys, expression, strict=True)]
+        return [
+            self._sample(k, bases[region], e)
+            for k, region, e in zip(keys, regions, expression, strict=True)
+        ]
 
     def __getitem__(self, key: Key) -> dict[str, np.ndarray]:
         return self.__getitems__([key])[0]
@@ -318,8 +321,9 @@ def main() -> None:
         CenoWindows(reference, cells, "/data/ceno/expression.cpk"),
         batch_sampler=batches,  # one window x 8 cells per batch
         num_workers=16,
-        prefetch_factor=2,  # batches each worker keeps ready
+        prefetch_factor=128,  # batches each worker keeps ready
         persistent_workers=True,  # readers stay open across epochs
+        multiprocessing_context="spawn",  # keep native state local to each worker
         pin_memory=True,
     )
     for epoch in range(2):
