@@ -360,7 +360,12 @@ impl Annotation {
                     });
                 }
             }
-            let (ts, te) = thick.map_or((ce, ce), |(s, e)| (s.max(cs), e.min(ce)));
+            let (ts, te) = thick
+                .and_then(|(s, e)| {
+                    let (s, e) = (s.max(cs), e.min(ce));
+                    (s < e).then_some((s, e))
+                })
+                .unwrap_or((ce, ce));
             buf.extend_from_slice(self.seqid_name(t.seqid[ti]).as_bytes());
             buf.push(b'\t');
             put_u32(&mut buf, cs);

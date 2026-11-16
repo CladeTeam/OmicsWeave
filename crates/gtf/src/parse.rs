@@ -125,6 +125,9 @@ impl Raw {
     /// Moves the records of `part` (a later batch) to the end, re-interning
     /// its strings in this pool.
     pub fn append(&mut self, part: Raw) -> Result<()> {
+        if self.len().saturating_add(part.len()) > crate::model::ROW_LIMIT as usize {
+            return Err(Error::Unsupported("more than 2^30 annotation records"));
+        }
         let mut map = Vec::with_capacity(part.pool.len());
         for id in 0..part.pool.len() as u32 {
             map.push(self.pool.intern(part.pool.bytes(id))?);
@@ -305,6 +308,9 @@ pub(crate) fn parse_batch(
 }
 
 fn parse_record(raw: &mut Raw, line: &[u8], no: u64, dialect: Dialect, keep: &Keep) -> Result<()> {
+    if raw.len() >= crate::model::ROW_LIMIT as usize {
+        return Err(Error::Unsupported("more than 2^30 annotation records"));
+    }
     let mut cols: [&[u8]; 9] = [b""; 9];
     let mut n = 0;
     let mut rest = line;
@@ -402,7 +408,10 @@ fn parse_record(raw: &mut Raw, line: &[u8], no: u64, dialect: Dialect, keep: &Ke
                 let k = f.pool.intern(key)?;
                 let v = f.pool.intern(value)?;
                 let kv = (if quoted { k } else { k | UNQUOTED }, v);
-                let n = pairs.len() as u32;
+                let n = u32::try_from(pairs.len())
+                    .ok()
+                    .filter(|&n| n != NONE)
+                    .ok_or(Error::Unsupported("more than 2^32 attribute pairs"))?;
                 let id = *pair_ids
                     .entry(((kv.0 as u64) << 32) | kv.1 as u64)
                     .or_insert(n);
@@ -470,9 +479,12 @@ fn parse_record(raw: &mut Raw, line: &[u8], no: u64, dialect: Dialect, keep: &Ke
     }
     let std = f.std;
     raw.std.push(std);
-    raw.parent_offsets.push(raw.parents.len() as u32);
-    raw.tag_offsets.push(raw.tags.len() as u32);
-    raw.attr_offsets.push(raw.attrs.len() as u32);
+    let offset = |n: usize| {
+        u32::try_from(n).map_err(|_| Error::Unsupported("more than 2^32 attribute values"))
+    };
+    raw.parent_offsets.push(offset(raw.parents.len())?);
+    raw.tag_offsets.push(offset(raw.tags.len())?);
+    raw.attr_offsets.push(offset(raw.attrs.len())?);
     Ok(())
 }
 

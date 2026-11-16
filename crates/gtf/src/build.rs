@@ -233,13 +233,20 @@ fn group_gff3(raw: &Raw, kind_of: &[Option<FeatureKind>], report: &mut Report) -
     }
     let mut parent = vec![NONE; n];
     let mut flags = vec![0u8; n];
+    let mut parents_precede_children = true;
     for r in 0..n {
         if dup[r] {
             continue;
         }
+        let source = if raw.std[r][ID] == NONE {
+            r as u32
+        } else {
+            first[&raw.std[r][ID]]
+        };
         for &p in raw.parents(r) {
             match first.get(&p) {
                 Some(&pr) => {
+                    parents_precede_children &= pr < source;
                     if parent[r] == NONE {
                         parent[r] = pr;
                     }
@@ -248,6 +255,9 @@ fn group_gff3(raw: &Raw, kind_of: &[Option<FeatureKind>], report: &mut Report) -
                 None => report.push(ProblemKind::UnknownParent, raw.line[r], p),
             }
         }
+    }
+    if !parents_precede_children {
+        check_parent_cycles(raw, &first, &dup, report);
     }
     // A transcript is the parent of exon-level features, or a leaf below
     // another non-feature record (a transcript without exons).
@@ -407,6 +417,68 @@ fn group_gff3(raw: &Raw, kind_of: &[Option<FeatureKind>], report: &mut Report) -
     g
 }
 
+/// A parent-first logical ID graph is acyclic by construction. For other orders,
+/// iterative DFS checks every parent edge, including secondary parents,
+/// without consuming call-stack depth on malformed hierarchies.
+fn check_parent_cycles(raw: &Raw, first: &IdMap<u32, u32>, dup: &[bool], report: &mut Report) {
+    let mut state = vec![0u8; raw.len()];
+    // Discontinuous feature records share one logical ID and contribute
+    // all of their edges. Link those rows without allocating per-ID Vecs.
+    let mut next_record = vec![NONE; raw.len()];
+    for r in 0..raw.len() {
+        if dup[r] {
+            continue;
+        }
+        let node = first.get(&raw.std[r][ID]).copied().unwrap_or(r as u32) as usize;
+        if node != r {
+            next_record[r] = next_record[node];
+            next_record[node] = r as u32;
+        }
+    }
+    let mut stack = Vec::new();
+    for root in 0..raw.len() {
+        if dup[root] || state[root] != 0 {
+            continue;
+        }
+        // Non-first records are traversed through their logical node.
+        if first
+            .get(&raw.std[root][ID])
+            .is_some_and(|&r| r as usize != root)
+        {
+            continue;
+        }
+        state[root] = 1;
+        stack.push((root, root, 0));
+        while let Some((node, r, edge)) = stack.last_mut() {
+            let parents = raw.parents(*r);
+            if *edge == parents.len() {
+                if next_record[*r] != NONE {
+                    *r = next_record[*r] as usize;
+                    *edge = 0;
+                    continue;
+                }
+                state[*node] = 2;
+                stack.pop();
+                continue;
+            }
+            let pid = parents[*edge];
+            *edge += 1;
+            let Some(&p) = first.get(&pid) else {
+                continue;
+            };
+            let p = p as usize;
+            match state[p] {
+                0 => {
+                    state[p] = 1;
+                    stack.push((p, p, 0));
+                }
+                1 => report.push(ProblemKind::BadNesting, raw.line[*r], pid),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Counting sort of `items` by `group(item)` into CSR offsets.
 fn bucket<T: Copy>(items: &[T], groups: usize, group: impl Fn(&T) -> u32) -> (Vec<u32>, Vec<T>) {
     let mut offsets = vec![0u32; groups + 1];
@@ -442,6 +514,11 @@ fn assemble(
         txs: tt,
         feats,
     } = groups;
+    // Multi-parent GFF3 records can expand to more feature rows than
+    // input records. RowRef reserves the upper two bits for its table.
+    if feats.len() > crate::model::ROW_LIMIT as usize {
+        return Err(Error::Unsupported("more than 2^30 annotation feature rows"));
+    }
     let kind = |rec: u32| kind_of[rec as usize].unwrap_or(FeatureKind::Other);
     // Features of each transcript, by (start, end, kind, record).
     let (f_off, mut f_rows) = bucket(&feats, tt.len(), |&(t, _)| t);
@@ -601,7 +678,10 @@ fn assemble(
                     txs.tag_values.push(v);
                 }
             }
-            txs.tag_offsets.push(txs.tag_values.len() as u32);
+            txs.tag_offsets.push(
+                u32::try_from(txs.tag_values.len())
+                    .map_err(|_| Error::Unsupported("more than 2^32 transcript tag values"))?,
+            );
             txs.tag_bits.push(bits);
             let (src, ftype, score, phase) = if tx.record != NONE {
                 let r = tx.record as usize;
@@ -740,4 +820,33 @@ fn assemble(
         report,
         cache: Cache::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::{Keep, parse_batch};
+
+    #[test]
+    fn cycle_check_unifies_discontinuous_feature_ids() {
+        let raw = parse_batch(
+            b"c\t.\tCDS\t1\t2\t.\t+\t0\tID=a\nc\t.\tCDS\t3\t4\t.\t+\t0\tID=b;Parent=a\nc\t.\tCDS\t5\t6\t.\t+\t0\tID=a;Parent=b\n",
+            1, Dialect::Gff3, &Keep::All,
+        ).unwrap();
+        let mut first = id_map(raw.len());
+        for r in 0..raw.len() {
+            first.entry(raw.std[r][ID]).or_insert(r as u32);
+        }
+        let mut report = Report::default();
+        check_parent_cycles(&raw, &first, &[false; 3], &mut report);
+        assert_eq!(report.count(ProblemKind::BadNesting), 1);
+        assert_eq!(report.problems[0].line, 2);
+        assert_eq!(raw.pool.str(report.problems[0].id), "a");
+        let ann = crate::Annotation::parse(
+            b"##gff-version 3\nc\t.\tCDS\t1\t2\t.\t+\t0\tID=a\nc\t.\tCDS\t3\t4\t.\t+\t0\tID=b;Parent=a\nc\t.\tCDS\t5\t6\t.\t+\t0\tID=a;Parent=b\n",
+            &crate::ReadOptions::default(),
+        ).unwrap();
+        assert_eq!(ann.report().count(ProblemKind::DuplicateId), 0);
+        assert!(ann.report().count(ProblemKind::BadNesting) > 0);
+    }
 }

@@ -71,7 +71,9 @@ impl Csr {
 
     pub(crate) fn push_row(&mut self, values: impl IntoIterator<Item = u32>) {
         self.values.extend(values);
-        self.offsets.push(self.values.len() as u32);
+        self.offsets.push(
+            u32::try_from(self.values.len()).expect("more than 2^32 derived interval memberships"),
+        );
     }
 
     pub fn heap_bytes(&self) -> usize {
@@ -139,7 +141,9 @@ impl IntervalSet {
         let mut seqid_names = Vec::with_capacity(chroms.len());
         for c in chroms {
             let id = pool.intern(c.as_bytes())?;
-            if seqid_names.contains(&id) {
+            // Only chromosome names have been interned in this fresh pool;
+            // a new name receives the next dense ID in constant time.
+            if id as usize != seqid_names.len() {
                 return Err(Error::invalid(
                     "interval set",
                     format!("chromosome {c:?} twice"),

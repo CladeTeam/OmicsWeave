@@ -147,6 +147,27 @@ proptest! {
 }
 
 #[test]
+fn interval_columns_preserve_chromosome_order_and_reject_duplicates() {
+    let names: Vec<String> = (0..1024).map(|i| format!("contig_{i}")).collect();
+    let mut chroms: Vec<&str> = names.iter().map(String::as_str).collect();
+    let make = |chroms: &[&str]| {
+        IntervalSet::from_columns(chroms, vec![], vec![], vec![], vec![], None, None, None)
+    };
+    let set = make(&chroms).unwrap();
+    assert_eq!(set.seqid_count(), chroms.len());
+    for (i, name) in chroms.iter().enumerate() {
+        assert_eq!(set.seqid_name(i as u32), *name);
+    }
+    for at in [0, 511, 1023] {
+        chroms.push(chroms[at]);
+        assert!(make(&chroms).unwrap_err().to_string().contains("twice"));
+        chroms.pop();
+    }
+    assert!(make(&["", ""]).is_err());
+    assert!(make(&[]).unwrap().is_empty());
+}
+
+#[test]
 fn interval_sets_from_any_source() {
     let mut b = IntervalSetBuilder::new().chroms(["chr1", "chr2"]).unwrap();
     b.push("chr2", 100, 200, Strand::Unstranded, NONE, Some("peak1"))

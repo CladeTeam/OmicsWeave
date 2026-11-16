@@ -206,34 +206,37 @@ impl Annotation {
         }
         out.clear();
         let f = &self.features;
+        let mut coding: Option<(u32, u32)> = None;
         for i in self.transcripts.features(t) {
             let i = i as usize;
             if f.kind[i].is_coding() {
-                push_merged(out, f.start[i], f.end[i]);
+                if part == TranscriptPart::Cds {
+                    push_merged(out, f.start[i], f.end[i]);
+                } else {
+                    coding = Some(match coding {
+                        Some((lo, hi)) => (lo.min(f.start[i]), hi.max(f.end[i])),
+                        None => (f.start[i], f.end[i]),
+                    });
+                }
             }
         }
         if part == TranscriptPart::Cds {
             return;
         }
-        let (Some(first), Some(last)) = (out.first(), out.last()) else {
+        let Some((lo, hi)) = coding else {
             return;
         };
-        let (lo, hi) = (first.0, last.1);
         let low_side =
             (part == TranscriptPart::Utr5) != self.transcripts.strand[t as usize].is_reverse();
-        let mut exons = Vec::new();
-        self.exon_blocks(t, &mut exons);
-        out.clear();
-        for (s, e) in exons {
-            let (s, e) = if low_side {
-                (s, e.min(lo))
+        self.exon_blocks(t, out);
+        out.retain_mut(|(s, e)| {
+            if low_side {
+                *e = (*e).min(lo);
             } else {
-                (s.max(hi), e)
-            };
-            if s < e {
-                out.push((s, e));
+                *s = (*s).max(hi);
             }
-        }
+            *s < *e
+        });
     }
 
     /// Introns of every transcript (owner: transcript), cached.
@@ -349,8 +352,15 @@ impl<'a> Derive<'a> {
     /// The transcripts of gene `g` that are in scope.
     fn gene_transcripts(&self, g: u32) -> impl Iterator<Item = u32> + 'a {
         let range = self.ann.genes.transcripts(g);
-        let sel = self.selection;
-        range.filter(move |t| sel.is_none_or(|s| s.transcripts.binary_search(t).is_ok()))
+        let selected = self.selection.map(|s| {
+            let lo = s.transcripts.partition_point(|&t| t < range.start);
+            let hi = s.transcripts[lo..].partition_point(|&t| t < range.end) + lo;
+            &s.transcripts[lo..hi]
+        });
+        let n = selected.map_or(range.len(), <[u32]>::len);
+        (0..n)
+            .filter(move |&i| selected.is_none_or(|rows| i == 0 || rows[i] != rows[i - 1]))
+            .map(move |i| selected.map_or(range.start + i as u32, |rows| rows[i]))
     }
 
     /// Introns between the exon blocks of each transcript (owner:
@@ -533,6 +543,7 @@ impl<'a> Derive<'a> {
         let mut events: Vec<(u32, bool, u32)> = Vec::new();
         let mut blocks = Vec::new();
         let mut active: Vec<u32> = Vec::new();
+        let mut next_active = Vec::new();
         for unit in units {
             let first = unit[0] as usize;
             events.clear();
@@ -575,17 +586,11 @@ impl<'a> Derive<'a> {
                         out.genes.push_row(unit.iter().copied());
                     }
                 }
+                let begin = i;
                 while i < events.len() && events[i].0 == p {
-                    let (_, add, t) = events[i];
-                    match active.binary_search(&t) {
-                        Ok(at) if !add => {
-                            active.remove(at);
-                        }
-                        Err(at) if add => active.insert(at, t),
-                        _ => {}
-                    }
                     i += 1;
                 }
+                update_active(&mut active, &mut next_active, &events[begin..i]);
                 prev = p;
             }
         }
@@ -707,5 +712,77 @@ impl<'a> Derive<'a> {
                 )
             }
         })
+    }
+}
+
+/// Coordinate events are ordered as removals then additions, each by
+/// transcript. Updating the sorted set in bulk avoids shifting a long
+/// active vector once per transcript sharing an exon boundary.
+fn update_active(active: &mut Vec<u32>, scratch: &mut Vec<u32>, events: &[(u32, bool, u32)]) {
+    // Small groups retain the allocation-free binary-search fast path.
+    if events.len() <= 8 {
+        for &(_, add, t) in events {
+            match active.binary_search(&t) {
+                Ok(at) if !add => {
+                    active.remove(at);
+                }
+                Err(at) if add => active.insert(at, t),
+                _ => {}
+            }
+        }
+        return;
+    }
+    let split = events.partition_point(|&(_, add, _)| !add);
+    let (remove, add) = events.split_at(split);
+    scratch.clear();
+    let mut r = 0;
+    for &t in active.iter() {
+        while r < remove.len() && remove[r].2 < t {
+            r += 1;
+        }
+        if r == remove.len() || remove[r].2 != t {
+            scratch.push(t);
+        }
+    }
+    active.clear();
+    let mut i = 0;
+    for &(_, _, t) in add {
+        while i < scratch.len() && scratch[i] < t {
+            active.push(scratch[i]);
+            i += 1;
+        }
+        if active.last() != Some(&t) {
+            active.push(t);
+        }
+        if i < scratch.len() && scratch[i] == t {
+            i += 1;
+        }
+    }
+    active.extend_from_slice(&scratch[i..]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    proptest! {
+        #[test]
+        fn coordinate_events_match_ordered_sets(
+            rows in prop::collection::btree_set(0u32..128, 0..128),
+            edits in prop::collection::vec((any::<bool>(), 0u32..128), 0..128),
+        ) {
+            let mut expected: BTreeSet<u32> = rows.clone();
+            let mut active: Vec<u32> = rows.into_iter().collect();
+            let mut events: Vec<_> = edits.into_iter().map(|(add, t)| (7, add, t)).collect();
+            events.sort_unstable();
+            for &(_, add, t) in &events {
+                if add { expected.insert(t); } else { expected.remove(&t); }
+            }
+            let mut scratch = Vec::new();
+            update_active(&mut active, &mut scratch, &events);
+            prop_assert_eq!(active, expected.into_iter().collect::<Vec<_>>());
+        }
     }
 }

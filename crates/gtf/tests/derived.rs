@@ -183,6 +183,124 @@ fn naive_bins(a: &Annotation, genes: &[u32]) -> Vec<(u32, u32, Vec<u32>)> {
 }
 
 #[test]
+fn transcript_parts_merge_codons_and_select_utrs_by_strand() {
+    use omicsweave_gtf::TranscriptPart;
+
+    for strand in ['+', '-', '.', '?'] {
+        for explicit_exons in [false, true] {
+            let mut text = String::new();
+            use std::fmt::Write;
+            let mut pieces = vec![
+                ("UTR", 1, 5, '.'),
+                ("CDS", 6, 10, '2'),
+                ("CDS", 21, 24, '0'),
+                ("stop_codon", 25, 27, '0'),
+                ("UTR", 28, 30, '.'),
+            ];
+            if explicit_exons {
+                pieces.extend([("exon", 1, 10, '.'), ("exon", 21, 30, '.')]);
+            }
+            for (kind, start, end, phase) in pieces.into_iter().rev() {
+                writeln!(text, "c\t.\t{kind}\t{start}\t{end}\t.\t{strand}\t{phase}\tgene_id \"g\"; transcript_id \"t\";").unwrap();
+            }
+            let ann = read(&text);
+            let mut out = vec![(99, 100)];
+            for (part, expected) in [
+                (TranscriptPart::Exons, vec![(0, 10), (20, 30)]),
+                (TranscriptPart::Cds, vec![(5, 10), (20, 27)]),
+                (
+                    TranscriptPart::Utr5,
+                    if strand == '-' {
+                        vec![(27, 30)]
+                    } else {
+                        vec![(0, 5)]
+                    },
+                ),
+                (
+                    TranscriptPart::Utr3,
+                    if strand == '-' {
+                        vec![(0, 5)]
+                    } else {
+                        vec![(27, 30)]
+                    },
+                ),
+            ] {
+                ann.part_blocks(0, part, &mut out);
+                assert_eq!(out, expected);
+            }
+            assert_eq!(ann.cds_lengths(), [9]);
+            assert_eq!(ann.transcript_lengths(), [20]);
+        }
+    }
+    let noncoding = read("c\t.\texon\t1\t10\t.\t+\t.\tgene_id \"g\"; transcript_id \"t\";\n");
+    for part in [
+        TranscriptPart::Cds,
+        TranscriptPart::Utr5,
+        TranscriptPart::Utr3,
+    ] {
+        let mut out = vec![(99, 100)];
+        noncoding.part_blocks(0, part, &mut out);
+        assert!(out.is_empty());
+    }
+}
+
+#[test]
+fn shared_exon_boundaries_and_sparse_transcripts_match_base_sets() {
+    use omicsweave_gtf::Selection;
+    use std::fmt::Write;
+
+    let mut text = String::new();
+    for i in 0..128 {
+        // Shared starts/ends exercise bulk updates; the additional pieces
+        // interleave removals and additions across transcript identities.
+        for (s, e) in [(1, 20), (41 + i % 8, 60 + i % 8), (81, 100)] {
+            writeln!(
+                text,
+                "c\t.\texon\t{s}\t{e}\t.\t+\t.\tgene_id \"g\"; transcript_id \"t{i}\";"
+            )
+            .unwrap();
+        }
+    }
+    let ann = read(&text);
+    let bins = ann.exon_bins(false);
+    let transcript_bits: Vec<_> = (0..ann.transcripts().len() as u32)
+        .map(|t| exon_bits(&ann, t))
+        .collect();
+    let want = naive_bins(&ann, &[0]);
+    let got: Vec<_> = (0..bins.set.len())
+        .map(|i| {
+            (
+                bins.set.start[i],
+                bins.set.end[i],
+                bins.transcripts.get(i as u32).to_vec(),
+            )
+        })
+        .collect();
+    assert_eq!(got, want);
+    for transcripts in [vec![], vec![0], vec![0, 0, 63, 127], (0..128).collect()] {
+        let selection = Selection {
+            genes: vec![0],
+            transcripts: transcripts.clone(),
+        };
+        let sparse = ann.derive().selection(&selection).exon_bins(false);
+        for (p, _) in transcript_bits[0].iter().take(100).enumerate() {
+            let mut want: Vec<_> = transcripts
+                .iter()
+                .copied()
+                .filter(|&t| transcript_bits[t as usize][p])
+                .collect();
+            want.dedup();
+            let row = (0..sparse.set.len())
+                .find(|&i| sparse.set.start[i] <= p as u32 && (p as u32) < sparse.set.end[i]);
+            assert_eq!(
+                row.map_or(&[][..], |i| sparse.transcripts.get(i as u32)),
+                want
+            );
+        }
+    }
+}
+
+#[test]
 fn exon_bins_per_gene_and_aggregate() {
     for seed in 0..6 {
         let a = random(seed);

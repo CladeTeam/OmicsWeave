@@ -439,6 +439,53 @@ c\ts\texon\t1\t10\t.\t+\t.\tgene_id \"g2\"; transcript_id \"t1\";
 }
 
 #[test]
+fn gff3_parent_cycles_are_diagnosed_without_recursion() {
+    for body in [
+        "c\t.\tregion\t1\t10\t.\t+\t.\tID=a;Parent=a\n",
+        "c\t.\tregion\t1\t10\t.\t+\t.\tID=a;Parent=b\nc\t.\tregion\t1\t10\t.\t+\t.\tID=b;Parent=a\n",
+        "c\t.\tregion\t1\t10\t.\t+\t.\tID=root\nc\t.\tregion\t1\t10\t.\t+\t.\tID=a;Parent=root,b\nc\t.\tregion\t1\t10\t.\t+\t.\tID=b;Parent=a\n",
+    ] {
+        let text = format!("##gff-version 3\n{body}");
+        let mut expected = None;
+        for (threads, batch_bytes) in [(1, 1), (4, 32), (2, 1 << 20)] {
+            let opts = ReadOptions {
+                threads,
+                batch_bytes,
+                ..ReadOptions::default()
+            };
+            let ann = Annotation::parse(text.as_bytes(), &opts).unwrap();
+            assert!(ann.report().count(ProblemKind::BadNesting) > 0);
+            let strict = ReadOptions {
+                strict: true,
+                ..opts
+            };
+            let err = Annotation::parse(text.as_bytes(), &strict)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(expected.get_or_insert_with(|| err.clone()), &err);
+        }
+    }
+    // A long parent chain must neither exhaust the stack nor look cyclic.
+    let mut text = "##gff-version 3\n".to_owned();
+    for i in 0..16_384 {
+        use std::fmt::Write;
+        writeln!(
+            text,
+            "c\t.\tregion\t1\t10\t.\t+\t.\tID=r{i};Parent=r{}",
+            i + 1
+        )
+        .unwrap();
+    }
+    text.push_str("c\t.\tregion\t1\t10\t.\t+\t.\tID=r16384\n");
+    let ann = read(&text);
+    assert_eq!(ann.report().count(ProblemKind::BadNesting), 0);
+
+    let diamond = b"##gff-version 3\nc\t.\tregion\t1\t10\t.\t+\t.\tID=leaf;Parent=left,right\nc\t.\tregion\t1\t10\t.\t+\t.\tID=left;Parent=root\nc\t.\tregion\t1\t10\t.\t+\t.\tID=right;Parent=root\nc\t.\tregion\t1\t10\t.\t+\t.\tID=root\n";
+    let ann = Annotation::parse(diamond, &ReadOptions::default()).unwrap();
+    assert_eq!(ann.report().count(ProblemKind::BadNesting), 0);
+}
+
+#[test]
 fn aliases_rename_and_match() {
     let opts = ReadOptions {
         aliases: Some(Aliases::from_pairs([("1", "chr1"), ("MT", "chrM")])),
@@ -456,6 +503,27 @@ fn aliases_rename_and_match() {
     assert_eq!(plain.match_seqids(&bam, None), [Some(0), None, Some(1)]);
     let lengths = plain.seqid_lengths(&[("chr1", 248956422), ("chrM", 16569)], None);
     assert_eq!(lengths, [Some(248956422), Some(16569)]);
+}
+
+#[test]
+fn bed12_coding_span_stays_within_exon_bounds() {
+    for (cds_start, cds_end, expected) in [(21, 30, (10, 10)), (1, 5, (4, 5)), (1, 3, (10, 10))] {
+        let text = format!(
+            "c\t.\texon\t5\t10\t.\t+\t.\tgene_id \"g\"; transcript_id \"t\";\nc\t.\tCDS\t{cds_start}\t{cds_end}\t.\t+\t0\tgene_id \"g\"; transcript_id \"t\";\n"
+        );
+        let ann = read(&text);
+        let mut bed = Vec::new();
+        ann.write_bed12(&mut bed, None).unwrap();
+        let text = String::from_utf8(bed).unwrap();
+        let columns: Vec<_> = text.trim_end().split('\t').collect();
+        assert_eq!(
+            (
+                columns[6].parse::<u32>().unwrap(),
+                columns[7].parse::<u32>().unwrap()
+            ),
+            expected
+        );
+    }
 }
 
 #[test]

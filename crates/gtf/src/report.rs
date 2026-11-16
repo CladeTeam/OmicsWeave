@@ -29,7 +29,8 @@ pub enum ProblemKind {
     OutsideParent,
     /// A GFF3 hierarchy that is not gene → transcript → feature (an exon
     /// directly under a gene that also has transcripts, a transcript under
-    /// a transcript, ...); the record is kept among the others.
+    /// a transcript, or cyclic Parent links). Records that cannot be
+    /// assigned to the hierarchy are kept among the others.
     BadNesting,
     /// A GFF3 transcript with several parents; the first is used.
     MultipleParents,
