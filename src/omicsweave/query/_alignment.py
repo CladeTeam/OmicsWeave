@@ -13,7 +13,8 @@ from .. import _native
 from ..cache import BlockCache
 from ..cache import native as native_cache
 from ..formats import Bai, Bam, BgzipFasta, Crai, Cram, Csi, Fasta, PathLike, TwoBit, detect
-from ..types import AlignmentField, Alignments, Cigars, RegionLike
+from ..types import AlignmentField, Alignments, Cigars, Modifications, RegionLike
+from ..types._alignment import modification_code
 from ..types._genome import as_region
 from ..types._string import StringVector
 from ._base import CachedReader, resolve
@@ -79,8 +80,8 @@ class AlignmentReader(CachedReader):
 
     CRAM decoding follows htslib's defaults: ``verify_checksums`` checks
     block CRC32s and slice reference MD5s, ``decode_md`` generates the MD
-    and NM tags records do not store, and reads stored without a name are
-    named ``<name_prefix>:<n>`` (default: the file's name).
+    and NM tags records do not store when querying ``"aux"``, and reads
+    stored without a name are named ``<name_prefix>:<n>`` (default: the file's name).
 
     ``cache`` optionally supplies caller-owned decoded BGZF blocks (BAM)
     or prepared containers and decoded slices (CRAM). The file, index and
@@ -152,26 +153,41 @@ class AlignmentReader(CachedReader):
         """The SAM header text as stored."""
         return self._native.header_text()
 
-    def fetch(self, region: RegionLike, fields: Fields = NO_FIELDS) -> Alignments:
+    def fetch(
+        self,
+        region: RegionLike,
+        fields: Fields = NO_FIELDS,
+        *,
+        modification_codes: Iterable[str | int] | None = None,
+    ) -> Alignments:
         """The records overlapping ``region``, with the variable-length
         ``fields`` asked for (:class:`~omicsweave.types.AlignmentField`
-        flags, names such as ``("name", "seq")``, or ``"all"``)."""
+        flags, names such as ``("name", "seq")``, or ``"all"``).
+
+        ``"modifications"`` decodes the ``MM`` / ``ML`` tags into
+        :class:`~omicsweave.types.Modifications`; ``modification_codes``
+        keeps only some codes (letters such as ``"m"`` / ``"h"``, ChEBI
+        numbers such as ``17596``). A CRAM needs its reference for them, as
+        for ``"seq"``: positions count the read's bases."""
         r = as_region(region)
-        (start, end, flag, mapq, mate_tid, mate_start, tlen, names, seqs, quals, cigars, aux) = (
-            self._native.query(r.chrom, r.start, r.end, int(_fields(fields)))
+        wanted = _fields(fields)
+        codes: list[int] = []
+        if modification_codes is not None:
+            if not wanted & AlignmentField.MODIFICATIONS:
+                raise ValueError("modification_codes filters the 'modifications' field: ask for it")
+            if isinstance(modification_codes, str | int):
+                modification_codes = (modification_codes,)
+            codes = [modification_code(c) for c in modification_codes]
+        fixed, names, seqs, quals, cigars, aux, mods = self._native.query(
+            r.chrom, r.start, r.end, int(wanted), codes
         )
         return Alignments(
             r,
-            start,
-            end,
-            flag,
-            mapq,
-            mate_tid,
-            mate_start,
-            tlen,
+            *fixed,
             _strings(names),
             _strings(seqs),
             _strings(quals),
             None if cigars is None else Cigars(*cigars),
             _strings(aux),
+            None if mods is None else Modifications(*mods),
         )

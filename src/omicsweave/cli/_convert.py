@@ -42,9 +42,14 @@ def register(commands: Any) -> None:
         "convert",
         help="convert a file into another format",
         description=(
-            "Convert SOURCE into TARGET, streaming and in parallel within a memory budget.\n\n"
+            "Convert SOURCE into TARGET with a thread and memory budget.\n\n"
             "SOURCE's format is told by its content, TARGET's by its name (.fa.gz,\n"
-            ".2bit, .bcf, .bam, .bb, .bw, .hic); --from and --to state them instead.\n"
+            ".2bit, .bcf, .bam, .bb, .bigmaf, .bw, .hic, .ffm); --from and --to state\n"
+            "them instead.\n"
+            "Motif collections (MEME, JASPAR, TRANSFAC, HOMER, CIS-BP, HOCOMOCO,\n"
+            "Cluster-Buster, BaMM, ProBound, GLAM2, FFM) take several sources (such as a\n"
+            "shell glob, pwms/*.txt) and write them all to one .ffm.\n"
+            "Motif inputs and models are loaded in memory; their size estimate is not an RSS cap.\n"
             "What a conversion passes over (rows of unknown chromosomes) is printed\n"
             "as a warning.\n"
             "TARGET and its companion files (.fai, .gzi, .csi, .bai, .sidecar) appear\n"
@@ -53,8 +58,13 @@ def register(commands: Any) -> None:
         epilog=_routes(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("source", metavar="SOURCE", help="the file to convert")
-    p.add_argument("target", metavar="TARGET", help="the file to write")
+    p.add_argument(
+        "paths",
+        metavar="SOURCE [SOURCE ...] TARGET",
+        nargs="+",
+        help="the file to convert and the file to write; motif collections take several "
+        "sources, converted together",
+    )
     p.add_argument(
         "--from",
         dest="source_format",
@@ -78,7 +88,8 @@ def register(commands: Any) -> None:
         "--level",
         type=int,
         metavar="L",
-        help="compression level: bgzip, BCF, BAM 0-12; bigBed, bigWig, hic 1-9",
+        help="compression level: bgzip, BCF, BAM, bigBed, bigWig 0-12; "
+        "hic 0-9 (larger values use 9)",
     )
     output.add_argument(
         "--index",
@@ -97,8 +108,8 @@ def register(commands: Any) -> None:
         "--chrom-sizes",
         metavar="FILE",
         help="bigBed / bigWig chromosome lengths (chrom.sizes, .fai or .2bit; "
-        "default: each chromosome's largest interval end); pairs to hic: the "
-        "chromosomes in order (default: the #chromsize lines; short text needs it)",
+        "default: each chromosome's largest interval end, MAF's srcSize); pairs to hic: the "
+        "chromosomes in order (default: the #chromsize lines; short and HiC-Pro text need it)",
     )
     output.add_argument(
         "--resolutions",
@@ -124,6 +135,13 @@ def register(commands: Any) -> None:
         "--strand",
         choices=("+", "-", "."),
         help="the items of this strand (default: all; overlapping strands are an error)",
+    )
+    maf = p.add_argument_group("MAF to bigMaf")
+    maf.add_argument(
+        "--ref-species",
+        metavar="NAME",
+        help="the reference species, whose component opens every block (such as hg38; "
+        "default: the species of the first block's first component)",
     )
     output.add_argument(
         "--sidecar",
@@ -205,9 +223,13 @@ def _bbi(args: argparse.Namespace) -> BbiOptions | None:
 
 
 def run(args: argparse.Namespace) -> int:
+    if len(args.paths) < 2:
+        print("ow convert: error: give a SOURCE and a TARGET", file=sys.stderr)
+        raise SystemExit(2)
+    *sources, target = args.paths
     plan = convert.plan(
-        _file(args.source, args.source_format),
-        _file(args.target, args.target_format),
+        [_file(s, args.source_format) for s in sources],
+        _file(target, args.target_format),
         **budget_of(args),
         level=args.level,
         index=args.index or False,
@@ -217,6 +239,7 @@ def run(args: argparse.Namespace) -> int:
         value=args.value,
         mod=args.mod,
         strand=args.strand,
+        ref_species=args.ref_species,
         sidecar=args.sidecar,
         add_contigs=args.add_contigs,
         sort=args.sort,

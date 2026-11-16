@@ -24,7 +24,24 @@ from ._fai import Fai
 from ._fasta import BgzipFasta, Fasta, GzipFasta
 from ._gzi import Gzi
 from ._hic import Hic
-from ._pairs import GzipJuicerShort, GzipPairs, JuicerShort, Pairs
+from ._maf import GzipMaf, Maf
+from ._motif import (
+    Bamm,
+    CisBp,
+    Dpcm,
+    Dpwm,
+    Ffm,
+    Glam2,
+    Homer,
+    Jaspar,
+    JasparPfm,
+    Meme,
+    Pcm,
+    ProBound,
+    Pwm,
+    Transfac,
+)
+from ._pairs import GzipHicProPairs, GzipJuicerShort, GzipPairs, HicProPairs, JuicerShort, Pairs
 from ._sam import GzipSam, Sam
 from ._sidecar import Sidecar
 from ._twobit import TwoBit
@@ -69,8 +86,26 @@ FORMATS: Mapping[str, type[File]] = MappingProxyType(
             GzipPairs,
             JuicerShort,
             GzipJuicerShort,
+            HicProPairs,
+            GzipHicProPairs,
             BedMethyl,
             GzipBedMethyl,
+            Maf,
+            GzipMaf,
+            Meme,
+            Jaspar,
+            JasparPfm,
+            Transfac,
+            Homer,
+            CisBp,
+            Pcm,
+            Pwm,
+            Dpcm,
+            Dpwm,
+            Bamm,
+            ProBound,
+            Glam2,
+            Ffm,
         )
     }
 )
@@ -84,12 +119,23 @@ def detect(path: PathLike) -> File:
     inflated; CRAM by ``CRAM``). A ``.crai`` is gzip text whose first line
     is six tab-separated integers. Text, inflated first when gzip compressed, is VCF when it
     starts with ``##fileformat=VCF``, SAM with a header line (``@HD``,
-    ``@SQ``, ...), FASTA with ``>``, 4DN pairs with ``## pairs format``.
+    ``@SQ``, ...), FASTA with ``>``, 4DN pairs with ``## pairs format``,
+    MAF with ``##maf``. Motif texts: MEME with ``MEME version``, CIS-BP with
+    a ``Pos A C G T`` header, TRANSFAC with line codes and a ``P0`` header,
+    ProBound with a JSON object holding ``coefficients``, GLAM2 with its
+    ``GLAM2: Gapped Local Alignment of Motifs`` banner; ``>``-headed
+    numeric matrices are JASPAR (``A [ ... ]`` rows), HOMER (a numeric third
+    header column), raw PFM (four rows per motif), PCM / PWM (four values
+    per row; PWM when any is negative) or their dinucleotide forms (sixteen
+    per row). Square 4 x 4 matrices cannot be told apart and need their
+    format named. An FFM is told by its magic number.
     Other text is told from its first 64 KiB: wig when a ``track`` line
     says ``type=wiggle_0`` or a line declares a ``fixedStep`` /
     ``variableStep`` section, bedGraph when a ``track`` line says
     ``type=bedGraph`` or every data line has four fields, the last a
-    number, Juicer short when every data line is ``str1 chr1 pos1 frag1
+    number, HiC-Pro when every data line has 12 or 13 fields, +/- strands
+    in columns 4 and 7 and non-negative u64 positions in columns 3 and 6,
+    Juicer short when every data line is ``str1 chr1 pos1 frag1
     str2 chr2 pos2 frag2 [score]``, bedMethyl when every data line is BED9
     with modkit's nine counts or ENCODE's coverage and percentage, and BED
     otherwise. Names play no part,

@@ -25,7 +25,9 @@ class TwoBitWriter(Writer[TwoBit]):
     (the file's directory precedes its records). Runs of N and of lowercase
     (soft-masked) bases are kept as blocks; bases other than A, C, G and T
     become N, as the UCSC tools store them. ``wide_offsets`` stores 64-bit
-    offsets (2bit version 1), which files of 4 GiB or more need."""
+    offsets (2bit version 1), needed when any record starts beyond
+    ``2**32 - 1`` bytes. The final record may extend past 4 GiB with
+    32-bit offsets."""
 
     def __init__(self, path: PathLike, names: Iterable[str], *, wide_offsets: bool = False) -> None:
         native = _native.TwoBitWriter(os.fspath(path), list(names), wide_offsets)

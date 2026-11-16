@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use omicsweave_bbi::WriteOptions;
 use omicsweave_convert::{
-    Conversion, Format, Index, Options, Plan, Progress, Report, human, parse_size, plan, run,
+    Conversion, Format, Index, Options, Plan, Progress, Report, detect_sources, human, parse_size,
+    plan, run,
 };
 use omicsweave_core::Result;
 use pyo3::prelude::*;
@@ -15,24 +16,34 @@ use crate::quant::budget;
 use crate::shared::{PlanRunState, path_str};
 use crate::track::write_options;
 
-/// The conversion of `src` into `dst`, and the source's format. A format
-/// not named is told by content for the source and by name for the
-/// destination.
+/// The conversion of `src` (and `more_src`, for conversions that read
+/// several sources) into `dst`, and the source's format. A format not named
+/// is told by content for the sources (every file, which must agree)
+/// and by name for the destination.
 fn choose(
     src: PathBuf,
+    more_src: Vec<PathBuf>,
     dst: PathBuf,
     src_format: Option<&str>,
     dst_format: Option<&str>,
 ) -> Result<(Conversion, Format)> {
     let from = match src_format {
         Some(name) => Format::from_name(name)?,
-        None => Format::detect(&src)?,
+        None if more_src.is_empty() && src.exists() => Format::detect(&src)?,
+        None => {
+            let all: Vec<PathBuf> = std::iter::once(src.clone())
+                .chain(more_src.iter().cloned())
+                .collect();
+            detect_sources(&all)?
+        }
     };
     let to = match dst_format {
         Some(name) => Format::from_name(name)?,
         None => Format::from_extension(&dst)?,
     };
-    Ok((Conversion::between(from, to, src, dst)?, from))
+    let mut conversion = Conversion::between(from, to, src, dst)?;
+    conversion.add_sources(more_src)?;
+    Ok((conversion, from))
 }
 
 /// `(items_per_slot, block_size, compress, level, zoom_levels, zoom_reductions)`.
@@ -68,16 +79,17 @@ impl ConvertPlan {
     /// have is an error) and checks it against the budget without reading
     /// any data.
     #[new]
-    #[pyo3(signature = (src, dst, *, src_format=None, dst_format=None, threads=None,
+    #[pyo3(signature = (src, dst, *, more_src=Vec::new(), src_format=None, dst_format=None, threads=None,
                         memory=None, tmp_dir=None, level=None, index=None, min_shift=None,
                         chrom_sizes=None, resolutions=None, value=None, r#mod=None,
-                        strand=None, sidecar=false, add_contigs=false, sort=false,
+                        strand=None, ref_species=None, sidecar=false, add_contigs=false, sort=false,
                         reference=None, verify_checksums=true, bbi=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         src: PathBuf,
         dst: PathBuf,
+        more_src: Vec<PathBuf>,
         src_format: Option<String>,
         dst_format: Option<String>,
         threads: Option<usize>,
@@ -91,6 +103,7 @@ impl ConvertPlan {
         value: Option<String>,
         r#mod: Option<String>,
         strand: Option<String>,
+        ref_species: Option<String>,
         sidecar: bool,
         add_contigs: bool,
         sort: bool,
@@ -101,8 +114,13 @@ impl ConvertPlan {
         let budget = budget(threads, memory, tmp_dir)?;
         let (p, source) = py
             .detach(|| -> Result<(Plan, Format)> {
-                let (mut conversion, source) =
-                    choose(src, dst, src_format.as_deref(), dst_format.as_deref())?;
+                let (mut conversion, source) = choose(
+                    src,
+                    more_src,
+                    dst,
+                    src_format.as_deref(),
+                    dst_format.as_deref(),
+                )?;
                 conversion.configure(&Options {
                     level,
                     index: index.as_deref().map(Index::from_name).transpose()?,
@@ -111,6 +129,7 @@ impl ConvertPlan {
                     value,
                     mod_code: r#mod,
                     strand,
+                    ref_species,
                     sidecar,
                     add_contigs,
                     sort,

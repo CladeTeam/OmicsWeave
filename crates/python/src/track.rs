@@ -5,8 +5,7 @@ use std::io::BufWriter;
 use std::path::PathBuf;
 
 use numpy::{
-    IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray1, PyReadwriteArray2,
-    PyUntypedArrayMethods,
+    IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyUntypedArrayMethods,
 };
 use omicsweave_bbi::{BbiReader, Chrom, Kind, WriteOptions};
 use omicsweave_core::{
@@ -113,8 +112,11 @@ impl TrackReader {
         &self,
         py: Python<'_>,
         key: LocusKey,
-        mut out: PyReadwriteArray1<'_, f32>,
+        out: &Bound<'_, PyArray1<f32>>,
     ) -> PyResult<()> {
+        let mut out = out
+            .try_readwrite()
+            .map_err(|error| PyValueError::new_err(format!("out cannot be written: {error}")))?;
         let out = out
             .as_slice_mut()
             .map_err(|_| PyValueError::new_err("out must be a contiguous float32 array"))?;
@@ -135,7 +137,7 @@ impl TrackReader {
         phase: u32,
         stats: Vec<String>,
         exact: bool,
-        mut out: PyReadwriteArray2<'_, f32>,
+        out: &Bound<'_, PyArray2<f32>>,
     ) -> PyResult<()> {
         let stats = stats
             .iter()
@@ -159,6 +161,9 @@ impl TrackReader {
                 "out must be a C-contiguous float32 array",
             ));
         }
+        let mut out = out
+            .try_readwrite()
+            .map_err(|error| PyValueError::new_err(format!("out cannot be written: {error}")))?;
         let out = out
             .as_slice_mut()
             .map_err(|_| PyValueError::new_err("out must be a C-contiguous float32 array"))?;
@@ -184,8 +189,8 @@ impl TrackReader {
         })
     }
 
-    /// The intervals with data in `chrom:[start, end)`, clipped to it, as
-    /// (start, end, value) columns.
+    /// The intervals with data in `chrom:[start, end)`, cut to it with
+    /// `clip`, as (start, end, value) columns.
     #[allow(clippy::type_complexity)]
     fn intervals<'py>(
         &self,
@@ -193,13 +198,16 @@ impl TrackReader {
         chrom: &str,
         start: u32,
         end: u32,
+        clip: bool,
     ) -> PyResult<(
         Bound<'py, PyArray1<u32>>,
         Bound<'py, PyArray1<u32>>,
         Bound<'py, PyArray1<f32>>,
     )> {
         let (s, e, v) = self.inner.run(py, |t| -> Done<_> {
-            let n = t.reader.query_entries(Region::new(chrom, start, end))?;
+            let n = t
+                .reader
+                .query_entries(Region::new(chrom, start, end), clip)?;
             t.entries.resize(n, TrackEntry::default());
             t.reader.write_entries(&mut t.entries)?;
             let s: Vec<_> = t.entries.iter().map(|x| x.start).collect();

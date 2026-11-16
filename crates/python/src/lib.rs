@@ -13,8 +13,11 @@ mod consensus;
 mod contact;
 mod convert;
 mod error;
+mod ffm;
 mod index;
 mod interval;
+mod motif;
+mod msa;
 mod quant;
 mod sequence;
 mod shared;
@@ -43,6 +46,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<track::TrackReader>()?;
     m.add_class::<track::BigWigWriter>()?;
     m.add_class::<interval::IntervalReader>()?;
+    m.add_class::<msa::MsaReader>()?;
     m.add_class::<interval::BigBedWriter>()?;
     m.add_class::<contact::ContactReader>()?;
     m.add_class::<contact::HicWriter>()?;
@@ -67,5 +71,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(quant::quant_defaults, m)?)?;
     m.add_function(wrap_pyfunction!(annotation::read_aliases, m)?)?;
     m.add_function(wrap_pyfunction!(consensus::is_haplotype, m)?)?;
+    motif::register(m)?;
     Ok(())
 }

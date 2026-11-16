@@ -127,11 +127,12 @@ class TrackReader(CachedReader):
         self._native.bins(native_key(key), resolution, phase, [str(s) for s in stats], exact, out)
         return SignalBins(key, int(resolution), int(phase), stats, out)
 
-    def intervals(self, region: RegionLike) -> SignalIntervals:
-        """The runs of constant signal in ``region``, as stored, in genomic
-        order whatever the strand."""
+    def intervals(self, region: RegionLike, *, clip: bool = True) -> SignalIntervals:
+        """The runs of constant signal in ``region``, in genomic order
+        whatever the strand. Runs are cut to the region, so they cover only
+        queried bases; ``clip=False`` keeps their stored bounds."""
         r = as_region(region)
-        return SignalIntervals(r, *self._native.intervals(r.chrom, r.start, r.end))
+        return SignalIntervals(r, *self._native.intervals(r.chrom, r.start, r.end, clip))
 
 
 class StrandedTrackReader(Reader):
@@ -210,10 +211,11 @@ class StrandedTrackReader(Reader):
         track, key = self._side(locus)
         return track.bins(key, resolution, stats, phase=phase, exact=exact, out=out)
 
-    def intervals(self, region: RegionLike) -> SignalIntervals:
-        """The stored runs of the region's strand, in genomic order."""
+    def intervals(self, region: RegionLike, *, clip: bool = True) -> SignalIntervals:
+        """The stored runs of the region's strand, in genomic order; see
+        :meth:`TrackReader.intervals` for ``clip``."""
         track, key = self._side(as_region(region))
-        return track.intervals(key)  # type: ignore[arg-type]
+        return track.intervals(key, clip=clip)  # type: ignore[arg-type]
 
 
 class _Pair:

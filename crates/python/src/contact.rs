@@ -4,7 +4,9 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
 
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadwriteArray2, PyUntypedArrayMethods};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyUntypedArrayMethods,
+};
 use omicsweave_core::{
     ContactEntry, ContactQuery, ContactRead, ContactUnit, FileSource, Region, Result,
 };
@@ -172,7 +174,7 @@ impl ContactReader {
         &self,
         py: Python<'_>,
         tile: Tile,
-        mut out: PyReadwriteArray2<'_, f32>,
+        out: &Bound<'_, PyArray2<f32>>,
         flip_rows: bool,
         flip_cols: bool,
     ) -> PyResult<()> {
@@ -192,6 +194,9 @@ impl ContactReader {
                 "out must be a C-contiguous float32 array",
             ));
         }
+        let mut out = out
+            .try_readwrite()
+            .map_err(|error| PyValueError::new_err(format!("out cannot be written: {error}")))?;
         let out = out
             .as_slice_mut()
             .map_err(|_| PyValueError::new_err("out must be a C-contiguous float32 array"))?;

@@ -27,9 +27,9 @@ struct Intervals {
 type Columns = (Vec<u32>, Vec<u32>, Vec<i64>, Vec<u8>);
 
 impl Intervals {
-    fn query(&mut self, region: Region<'_>) -> Result<Columns> {
+    fn query(&mut self, region: Region<'_>, clip: bool) -> Result<Columns> {
         let source: &mut dyn IntervalRead = self.reader.as_mut();
-        let size: IntervalSize = source.query(region)?;
+        let size: IntervalSize = source.query(region, clip)?;
         self.entries.resize(size.entries, IntervalEntry::default());
         let mut offsets = vec![0i64; size.entries + 1];
         let mut data = vec![0u8; size.annotation_bytes];
@@ -116,7 +116,8 @@ impl IntervalReader {
     }
 
     /// The features overlapping `chrom:[start, end)` as columns: starts,
-    /// ends, and the annotations as Arrow string offsets and bytes.
+    /// ends (cut to the region with `clip`), and the annotations as Arrow
+    /// string offsets and bytes.
     #[allow(clippy::type_complexity)]
     fn query<'py>(
         &self,
@@ -124,6 +125,7 @@ impl IntervalReader {
         chrom: &str,
         start: u32,
         end: u32,
+        clip: bool,
     ) -> PyResult<(
         Bound<'py, PyArray1<u32>>,
         Bound<'py, PyArray1<u32>>,
@@ -131,7 +133,7 @@ impl IntervalReader {
         Bound<'py, PyArray1<u8>>,
     )> {
         let (s, e, o, d) = self.inner.run(py, |t| -> Done<Columns> {
-            Ok(t.query(Region::new(chrom, start, end))?)
+            Ok(t.query(Region::new(chrom, start, end), clip)?)
         })?;
         Ok((
             s.into_pyarray(py),

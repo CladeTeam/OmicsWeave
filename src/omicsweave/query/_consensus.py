@@ -17,10 +17,14 @@ from ..types import (
     AllAlt,
     Alleles,
     ConsensusBatch,
+    ConsensusRecords,
     ConsensusSequence,
     Haplotype,
+    Record,
     RegionLike,
     Samples,
+    StringVector,
+    Variant,
 )
 from ..types._genome import Region, Spliced, as_region
 from ._base import CachedReader, conversion, resolve
@@ -85,15 +89,14 @@ def _key(region: RegionLike) -> Region:
     return as_region(region)
 
 
-def _selector(alleles: Alleles) -> tuple[str, list[str], str | None]:
-    match alleles:
-        case AllAlt():
-            return ("all", [], None)
-        case Samples(names):
-            return ("samples", list(names), None)
-        case Haplotype(sample, haplotype):
-            return ("haplotype", [sample], haplotype)
-    raise TypeError(f"expected AllAlt, Samples or Haplotype, not {alleles!r}")
+_SELECTIONS = (AllAlt, Samples, Haplotype, Record, Variant)
+
+
+def _selector(alleles: Alleles) -> Alleles:
+    """``alleles``, checked: the native layer reads it by ``kind``."""
+    if not isinstance(alleles, _SELECTIONS):
+        raise TypeError(f"expected AllAlt, Samples, Haplotype, Record or Variant, not {alleles!r}")
+    return alleles
 
 
 class ConsensusReader(CachedReader):
@@ -106,9 +109,8 @@ class ConsensusReader(CachedReader):
     --index``). ``reference`` is an open :class:`SequenceReader`, shared and
     left open, or a sequence file, which this reader opens (with ``cache``)
     and closes. ``options`` are those of ``bcftools consensus``
-    (:class:`ConsensusOptions`). Each region decodes the records it takes
-    once; consecutive reads of one region reuse its reference and records,
-    and :meth:`fetch_batch` builds a whole batch in one call.
+    (:class:`ConsensusOptions`). Each call loads its reference and records;
+    :meth:`fetch_batch` shares that load among its selections in one call.
 
     ``cache`` holds the BCF's decoded BGZF blocks (and the reference's,
     when this reader opens it).
@@ -116,6 +118,14 @@ class ConsensusReader(CachedReader):
     A region on ``"-"`` reads the reverse complement of its consensus
     (IUPAC codes complemented, case kept); the chain stays on the forward
     strand. ``"+"``, ``"."`` and ``"?"`` read forward.
+
+    The selection says whose sequence it is. :class:`AllAlt`,
+    :class:`Samples` and :class:`Haplotype` build a genome's view: every
+    record they choose an allele for applies. :class:`Record` and
+    :class:`Variant` build one variant's view, as variant effect prediction
+    scores it: that record's ALT applies and every other record of the
+    region is left out. :meth:`records` lists the records a region takes, in
+    the order :class:`Record` counts them.
     """
 
     def __init__(
@@ -170,6 +180,14 @@ class ConsensusReader(CachedReader):
         alleles = AllAlt() if alleles is None else alleles
         bases, chain = self._native.sequence(r.chrom, r.start, r.end, r.strand, _selector(alleles))
         return ConsensusSequence(r, alleles, bases, chain)
+
+    def records(self, region: RegionLike) -> ConsensusRecords:
+        """The records ``region`` takes after ``regions_overlap`` and the
+        filter, in file order: ``Record(i)`` is row ``i``. Masked records
+        remain present and are marked by ``masked``."""
+        r = _key(region)
+        start, end, ref, alt, masked = self._native.records(r.chrom, r.start, r.end)
+        return ConsensusRecords(r, start, end, StringVector(*ref), StringVector(*alt), masked)
 
     def fetch_batch(self, region: RegionLike, alleles: Iterable[Alleles]) -> ConsensusBatch:
         """The consensus of ``region`` with each of ``alleles``, each 5' to

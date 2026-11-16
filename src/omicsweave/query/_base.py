@@ -17,12 +17,16 @@ from ..formats import (
     GzipBedGraph,
     GzipBedMethyl,
     GzipFasta,
+    GzipHicProPairs,
     GzipJuicerShort,
+    GzipMaf,
     GzipPairs,
     GzipSam,
     GzipVcf,
     GzipWig,
+    HicProPairs,
     JuicerShort,
+    Maf,
     Mcool,
     Pairs,
     PathLike,
@@ -58,6 +62,10 @@ _CONVERSIONS: dict[type[File], tuple[str, str, str]] = {
     GzipPairs: (".hic", ".hic", ""),
     JuicerShort: (".hic", ".hic", _SIZES),
     GzipJuicerShort: (".hic", ".hic", _SIZES),
+    HicProPairs: (".hic", ".hic", _SIZES),
+    GzipHicProPairs: (".hic", ".hic", _SIZES),
+    Maf: ("bigMaf", ".bigmaf", ""),
+    GzipMaf: ("bigMaf", ".bigmaf", ""),
 }
 
 

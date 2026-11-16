@@ -15,6 +15,7 @@ __all__ = [
     "Intervals",
     "Locus",
     "LocusLike",
+    "MultipleAlignment",
     "Region",
     "RegionLike",
     "Sequence",
@@ -240,7 +241,8 @@ class Sequence:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class Intervals:
-    """The features overlapping ``region``, unclipped, ordered by start.
+    """The features overlapping ``region``, ordered by start: with their
+    stored bounds unless the query cut them to the region.
 
     Columns: ``start`` and ``end`` (``uint32``), and ``annotation``: each
     feature's fields after the third, tab-separated.
@@ -253,3 +255,30 @@ class Intervals:
 
     def __len__(self) -> int:
         return len(self.start)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class MultipleAlignment:
+    """A multiple alignment over ``region``, in the reference's coordinates:
+    ``bases`` (``uint8``, ASCII) holds one row per species of ``species``
+    and one column per reference base, 5' to 3' of the region's strand
+    (reversed and complemented on ``"-"``).
+
+    Columns where the reference has a gap are dropped; ``-`` in another row
+    is a gap against the reference. A species the alignment does not
+    cover at a position holds the reader's fill byte there.
+    """
+
+    region: Region
+    species: tuple[str, ...]
+    bases: np.ndarray
+
+    def __len__(self) -> int:
+        return self.bases.shape[1]
+
+    def row(self, species: str) -> np.ndarray:
+        """The bases of ``species``."""
+        try:
+            return self.bases[self.species.index(species)]
+        except ValueError:
+            raise KeyError(f"no species {species!r}") from None

@@ -1,7 +1,7 @@
-"""Contact pairs as text: 4DN pairs, stored two ways (``.pairs`` and
-``.pairs.gz``), and Juicer's short format, also two ways.
+"""Contact pairs as text: 4DN pairs, Juicer short and HiC-Pro valid pairs,
+each plain or compressed with gzip / BGZF.
 
-Both list one contact per row and convert to ``.hic``; a pairix index
+All list one contact per row and convert to ``.hic``; a pairix index
 beside a ``.pairs.gz`` is not needed.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from ._base import File
 
-__all__ = ["GzipJuicerShort", "GzipPairs", "JuicerShort", "Pairs"]
+__all__ = ["GzipHicProPairs", "GzipJuicerShort", "GzipPairs", "HicProPairs", "JuicerShort", "Pairs"]
 
 
 class Pairs(File):
@@ -40,3 +40,23 @@ class GzipJuicerShort(File):
 
     __slots__ = ()
     format = "gzip-juicer-short"
+
+
+class HicProPairs(File):
+    """HiC-Pro ``.allValidPairs`` / ``.validPairs`` contact rows.
+
+    Conversion needs chromosome sizes and counts each row once, without
+    filtering on mapping quality, restriction fragment or allele. Rows have
+    12 fields, optionally a 13th allele field; positions are non-negative
+    u64 integers and are binned as written, clamped to chromosome lengths.
+    """
+
+    __slots__ = ()
+    format = "hicpro-pairs"
+
+
+class GzipHicProPairs(File):
+    """HiC-Pro valid pairs compressed with gzip or bgzip."""
+
+    __slots__ = ()
+    format = "gzip-hicpro-pairs"

@@ -8,7 +8,7 @@ use numpy::{IntoPyArray, PyArray1};
 use omicsweave_bam::{BamReader, BinIndex, IndexChoice, build_index_file, locate_index};
 use omicsweave_core::{
     AlignmentEntry, AlignmentFields, AlignmentRead, AlignmentsOut, CigarColumn, Error, FileSource,
-    Region, Result, StringColumn,
+    ModificationColumn, ModificationEntry, Region, Result, StringColumn,
 };
 use omicsweave_cram::{CRAM_MAGIC, CramHeader, CramIndex, CramOptions, CramReader};
 use pyo3::prelude::*;
@@ -134,11 +134,78 @@ struct Columns {
     quals: Strings,
     cigars: Option<(Vec<i64>, Vec<u32>)>,
     aux: Strings,
+    modifications: Option<Modifications>,
+}
+
+/// Base modifications of every record, column by column.
+struct Modifications {
+    offsets: Vec<i64>,
+    ref_pos: Vec<i64>,
+    qpos: Vec<i32>,
+    code: Vec<i32>,
+    canonical: Vec<u8>,
+    probability: Vec<u8>,
+    flags: Vec<u8>,
+}
+
+impl Modifications {
+    fn of(offsets: Vec<i64>, rows: &[ModificationEntry]) -> Modifications {
+        let n = rows.len();
+        // Separate vectorized passes are faster for small batches; a single
+        // pass avoids repeatedly streaming large record arrays through cache.
+        if n < 16_384 {
+            return Modifications {
+                offsets,
+                ref_pos: rows.iter().map(|m| m.ref_pos).collect(),
+                qpos: rows.iter().map(|m| m.qpos).collect(),
+                code: rows.iter().map(|m| m.code).collect(),
+                canonical: rows.iter().map(|m| m.canonical).collect(),
+                probability: rows.iter().map(|m| m.probability).collect(),
+                flags: rows.iter().map(|m| m.flags).collect(),
+            };
+        }
+        let mut columns = Modifications {
+            offsets,
+            ref_pos: Vec::with_capacity(n),
+            qpos: Vec::with_capacity(n),
+            code: Vec::with_capacity(n),
+            canonical: Vec::with_capacity(n),
+            probability: Vec::with_capacity(n),
+            flags: Vec::with_capacity(n),
+        };
+        for (i, m) in rows.iter().enumerate() {
+            // SAFETY: every vector owns a distinct allocation with capacity
+            // at least n, and i < rows.len() == n. No vector is reallocated
+            // during the loop. Typed writes preserve each column's element
+            // type and initialize slot i once; lengths stay zero until all
+            // slots of every column are written.
+            unsafe {
+                columns.ref_pos.as_mut_ptr().add(i).write(m.ref_pos);
+                columns.qpos.as_mut_ptr().add(i).write(m.qpos);
+                columns.code.as_mut_ptr().add(i).write(m.code);
+                columns.canonical.as_mut_ptr().add(i).write(m.canonical);
+                columns.probability.as_mut_ptr().add(i).write(m.probability);
+                columns.flags.as_mut_ptr().add(i).write(m.flags);
+            }
+        }
+        // SAFETY: the loop initialized exactly n primitive values in each
+        // allocation, within its capacity, and retained no pointers to them.
+        unsafe {
+            columns.ref_pos.set_len(n);
+            columns.qpos.set_len(n);
+            columns.code.set_len(n);
+            columns.canonical.set_len(n);
+            columns.probability.set_len(n);
+            columns.flags.set_len(n);
+        }
+        columns
+    }
 }
 
 struct Alignments {
     reader: Reads,
     entries: Vec<AlignmentEntry>,
+    mods: Vec<ModificationEntry>,
 }
 
 fn strings(wanted: bool, rows: usize, bytes: usize) -> Strings {
@@ -151,9 +218,14 @@ fn column<'a>(s: &'a mut Strings) -> Option<StringColumn<'a>> {
 }
 
 impl Alignments {
-    fn query(&mut self, region: Region<'_>, fields: AlignmentFields) -> Result<Columns> {
+    fn query(
+        &mut self,
+        region: Region<'_>,
+        fields: AlignmentFields,
+        modification_codes: &[i32],
+    ) -> Result<Columns> {
         let reader = self.reader.read();
-        let size = reader.query(region, fields)?;
+        let size = reader.query_filtered(region, fields, modification_codes)?;
         let n = size.records;
         self.entries.resize(n, AlignmentEntry::default());
         let mut names = strings(fields.contains(AlignmentFields::NAME), n, size.name_bytes);
@@ -163,6 +235,10 @@ impl Alignments {
         let mut cigars = fields
             .contains(AlignmentFields::CIGAR)
             .then(|| (vec![0i64; n + 1], vec![0u32; size.cigar_ops]));
+        let want_mods = fields.contains(AlignmentFields::MODIFICATIONS);
+        let mut mod_offsets = want_mods.then(|| vec![0i64; n + 1]);
+        self.mods
+            .resize(size.modifications, ModificationEntry::default());
         reader.write(AlignmentsOut {
             entries: &mut self.entries,
             names: column(&mut names),
@@ -172,6 +248,10 @@ impl Alignments {
                 .as_mut()
                 .map(|(offsets, ops)| CigarColumn { offsets, ops }),
             aux: column(&mut aux),
+            modifications: mod_offsets.as_mut().map(|offsets| ModificationColumn {
+                offsets,
+                entries: &mut self.mods,
+            }),
         })?;
         let e = &self.entries;
         Ok(Columns {
@@ -187,11 +267,22 @@ impl Alignments {
             quals,
             cigars,
             aux,
+            modifications: mod_offsets.map(|o| Modifications::of(o, &self.mods)),
         })
     }
 }
 
 type PyStrings<'py> = Option<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<u8>>)>;
+
+type PyModifications<'py> = (
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i32>>,
+    Bound<'py, PyArray1<i32>>,
+    Bound<'py, PyArray1<u8>>,
+    Bound<'py, PyArray1<u8>>,
+    Bound<'py, PyArray1<u8>>,
+);
 
 fn py_strings(py: Python<'_>, s: Strings) -> PyStrings<'_> {
     s.map(|(o, d)| (o.into_pyarray(py), d.into_pyarray(py)))
@@ -261,6 +352,7 @@ impl AlignmentReader {
                     inner: Shared::new(Alignments {
                         reader: Reads::Bam(reader),
                         entries: Vec::new(),
+                        mods: Vec::new(),
                     }),
                 });
             }
@@ -279,6 +371,7 @@ impl AlignmentReader {
                 inner: Shared::new(Alignments {
                     reader: Reads::Cram(Box::new(reader)),
                     entries: Vec::new(),
+                    mods: Vec::new(),
                 }),
             })
         })
@@ -321,6 +414,7 @@ impl AlignmentReader {
             inner: Shared::new(Alignments {
                 reader,
                 entries: Vec::new(),
+                mods: Vec::new(),
             }),
             chroms: self.chroms.clone(),
             text: self.text.clone(),
@@ -329,9 +423,14 @@ impl AlignmentReader {
     }
 
     /// The records overlapping `chrom:[start, end)`: the fixed fields as
-    /// columns, then (offsets, data) of names, sequences, qualities, CIGARs
-    /// and aux fields, each `None` unless `fields` asks for it.
+    /// a tuple of columns, then (offsets, data) of names, sequences, qualities, CIGARs
+    /// and aux fields, and (offsets, ref_pos, qpos, code, canonical,
+    /// probability, flags) of base modifications, each `None` unless
+    /// `fields` asks for it. Modifications keep the codes in
+    /// `modification_codes` (letters as ASCII, ChEBI numbers negated), or
+    /// all when it is empty.
     #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (chrom, start, end, fields, modification_codes=Vec::new()))]
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -339,38 +438,55 @@ impl AlignmentReader {
         start: u32,
         end: u32,
         fields: u8,
+        modification_codes: Vec<i32>,
     ) -> PyResult<(
-        Bound<'py, PyArray1<i64>>,
-        Bound<'py, PyArray1<i64>>,
-        Bound<'py, PyArray1<u16>>,
-        Bound<'py, PyArray1<u8>>,
-        Bound<'py, PyArray1<i32>>,
-        Bound<'py, PyArray1<i32>>,
-        Bound<'py, PyArray1<i32>>,
+        (
+            Bound<'py, PyArray1<i64>>,
+            Bound<'py, PyArray1<i64>>,
+            Bound<'py, PyArray1<u16>>,
+            Bound<'py, PyArray1<u8>>,
+            Bound<'py, PyArray1<i32>>,
+            Bound<'py, PyArray1<i32>>,
+            Bound<'py, PyArray1<i32>>,
+        ),
         PyStrings<'py>,
         PyStrings<'py>,
         PyStrings<'py>,
         Option<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<u32>>)>,
         PyStrings<'py>,
+        Option<PyModifications<'py>>,
     )> {
         let fields = AlignmentFields::from_bits(fields).or_raise()?;
         let c = self.inner.run(py, |a| -> Done<Columns> {
-            Ok(a.query(Region::new(chrom, start, end), fields)?)
+            Ok(a.query(Region::new(chrom, start, end), fields, &modification_codes)?)
         })?;
         Ok((
-            c.start.into_pyarray(py),
-            c.end.into_pyarray(py),
-            c.flag.into_pyarray(py),
-            c.mapq.into_pyarray(py),
-            c.mate_tid.into_pyarray(py),
-            c.mate_start.into_pyarray(py),
-            c.tlen.into_pyarray(py),
+            (
+                c.start.into_pyarray(py),
+                c.end.into_pyarray(py),
+                c.flag.into_pyarray(py),
+                c.mapq.into_pyarray(py),
+                c.mate_tid.into_pyarray(py),
+                c.mate_start.into_pyarray(py),
+                c.tlen.into_pyarray(py),
+            ),
             py_strings(py, c.names),
             py_strings(py, c.seqs),
             py_strings(py, c.quals),
             c.cigars
                 .map(|(o, d)| (o.into_pyarray(py), d.into_pyarray(py))),
             py_strings(py, c.aux),
+            c.modifications.map(|m| {
+                (
+                    m.offsets.into_pyarray(py),
+                    m.ref_pos.into_pyarray(py),
+                    m.qpos.into_pyarray(py),
+                    m.code.into_pyarray(py),
+                    m.canonical.into_pyarray(py),
+                    m.probability.into_pyarray(py),
+                    m.flags.into_pyarray(py),
+                )
+            }),
         ))
     }
 
@@ -405,4 +521,53 @@ pub fn build_bam_index(
 pub fn build_cram_index(py: Python<'_>, path: PathBuf) -> PyResult<String> {
     py.detach(|| -> Result<String> { Ok(path_str(&omicsweave_cram::build_index_file(&path)?)) })
         .or_raise()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modification_columns_preserve_values_and_record_offsets() {
+        for n in [0, 7, 16_383, 16_384, 16_385, 200_000] {
+            let rows: Vec<_> = (0..n)
+                .map(|i| ModificationEntry {
+                    ref_pos: i as i64 * 17 - 1,
+                    qpos: (i % 137) as i32,
+                    code: if i % 2 == 0 { b'm' as i32 } else { -17596 },
+                    canonical: b"ACGTN"[i % 5],
+                    probability: (i * 73) as u8,
+                    flags: (i % 8) as u8,
+                    _pad: [0; 5],
+                })
+                .collect();
+            let offsets = vec![0, n as i64 / 3, n as i64 / 3, n as i64];
+            let columns = Modifications::of(offsets.clone(), &rows);
+            assert_eq!(columns.offsets, offsets);
+            assert_eq!(
+                columns.ref_pos,
+                rows.iter().map(|m| m.ref_pos).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                columns.qpos,
+                rows.iter().map(|m| m.qpos).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                columns.code,
+                rows.iter().map(|m| m.code).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                columns.canonical,
+                rows.iter().map(|m| m.canonical).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                columns.probability,
+                rows.iter().map(|m| m.probability).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                columns.flags,
+                rows.iter().map(|m| m.flags).collect::<Vec<_>>()
+            );
+        }
+    }
 }

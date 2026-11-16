@@ -7,9 +7,7 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use numpy::{
-    Element, PY_ARRAY_API, PyArray1, PyArrayDescrMethods, PyArrayMethods, PyReadwriteArray1,
-};
+use numpy::{Element, PY_ARRAY_API, PyArray1, PyArrayDescrMethods, PyArrayMethods};
 use omicsweave_core::cache::BlockCache;
 use omicsweave_core::{Error, FileSource, Locus, Result, SequenceRead};
 use omicsweave_fasta::{Fai, FastaReader, Gzi, TWOBIT_MAGIC, TwoBitReader, fai_path, gzi_path};
@@ -247,8 +245,11 @@ impl SequenceReader {
         &self,
         py: Python<'_>,
         key: LocusKey,
-        mut out: PyReadwriteArray1<'_, u8>,
+        out: &Bound<'_, PyArray1<u8>>,
     ) -> PyResult<()> {
+        let mut out = out
+            .try_readwrite()
+            .map_err(|error| PyValueError::new_err(format!("out cannot be written: {error}")))?;
         let out = out
             .as_slice_mut()
             .map_err(|_| PyValueError::new_err("out must be a contiguous uint8 array"))?;

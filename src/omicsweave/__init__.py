@@ -19,13 +19,15 @@ parallel within a memory budget (``convert.run(source, target)``); the
 columnar tables with overlap queries and derived feature views.
 :mod:`omicsweave.quant` quantifies sorted BAMs in one pass (coverage
 bigWigs, count matrices, ATAC fragments; ``ow quant`` from a shell).
+:mod:`omicsweave.motif` matches motif collections against sequences
+(FIMO, MAST, MCAST and GLAM2Scan as one composable toolkit).
 Failures raise the exceptions of :mod:`omicsweave.errors`.
 
 Python assembles: it names files, picks readers and shapes results. The
 native layer does the work: formats, decoding, encoding, budgets.
 """
 
-from . import annotation, cache, convert, errors, formats, quant, query, types
+from . import annotation, cache, convert, errors, formats, motif, quant, query, types
 from ._native import __version__
 from .errors import OmicsWeaveError
 from .query import open
@@ -41,6 +43,7 @@ __all__ = [
     "convert",
     "errors",
     "formats",
+    "motif",
     "open",
     "quant",
     "query",

@@ -25,6 +25,9 @@ omicsweave-vcf = { path = "../vcf" }
 omicsweave-convert = { path = "../convert" }
 omicsweave-gtf = { path = "../gtf" }
 omicsweave-quant = { path = "../quant" }
+omicsweave-ffm = { path = "../ffm" }
+omicsweave-motif = { path = "../motif" }
+omicsweave-msa = { path = "../msa" }
 pyo3 = { workspace = true, features = ["extension-module"] }
 numpy.workspace = true
 

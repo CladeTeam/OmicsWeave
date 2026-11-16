@@ -11,6 +11,7 @@ from ..formats import (
     BigWig,
     Cram,
     Fasta,
+    Ffm,
     File,
     Hic,
     PathLike,
@@ -21,6 +22,7 @@ from ._alignment import AlignmentReader
 from ._base import conversion
 from ._contact import ContactReader
 from ._interval import IntervalReader
+from ._motif import MotifReader
 from ._sequence import SequenceReader
 from ._track import TrackReader
 from ._variant import VariantReader
@@ -31,7 +33,13 @@ __all__ = ["open"]
 def open(
     source: File | PathLike, **options: object
 ) -> (
-    SequenceReader | TrackReader | IntervalReader | ContactReader | AlignmentReader | VariantReader
+    SequenceReader
+    | TrackReader
+    | IntervalReader
+    | ContactReader
+    | AlignmentReader
+    | VariantReader
+    | MotifReader
 ):
     """The reader of ``source``'s format (a path is detected first);
     ``options`` go to that reader.
@@ -58,4 +66,6 @@ def open(
             return AlignmentReader(file, **options)  # type: ignore[arg-type]
         case Bcf():
             return VariantReader(file, **options)  # type: ignore[arg-type]
+        case Ffm():
+            return MotifReader(file, **options)  # type: ignore[arg-type]
     raise TypeError(f"no reader reads {type(file).__name__}")

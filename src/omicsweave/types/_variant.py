@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import collections.abc as abc
 from dataclasses import dataclass
+from typing import ClassVar
 
 import numpy as np
 
@@ -22,10 +23,13 @@ __all__ = [
     "AllAlt",
     "Alleles",
     "ConsensusBatch",
+    "ConsensusRecords",
     "ConsensusSequence",
     "Genotypes",
     "Haplotype",
+    "Record",
     "Samples",
+    "Variant",
     "Variants",
 ]
 
@@ -123,11 +127,14 @@ class AllAlt:
     """The first ALT of every record, samples ignored (``bcftools consensus
     -s -``); with IUPAC codes, the codes of REF and ALT."""
 
+    kind: ClassVar[str] = "all"
+
 
 @dataclass(frozen=True, slots=True, init=False)
 class Samples:
     """IUPAC codes of these samples' genotypes (``-s a,b`` without ``-H``)."""
 
+    kind: ClassVar[str] = "samples"
     names: tuple[str, ...]
 
     def __init__(self, names: str | abc.Iterable[str]) -> None:
@@ -139,6 +146,7 @@ class Haplotype:
     """One haplotype of one sample (``-s sample -H haplotype``): ``1``, ``2``,
     ..., ``R``, ``A``, ``LR``, ``LA``, ``SR``, ``SA``, ``I`` or ``<N>pIu``."""
 
+    kind: ClassVar[str] = "haplotype"
     sample: str
     haplotype: str = "1"
 
@@ -152,8 +160,68 @@ class Haplotype:
         object.__setattr__(self, "haplotype", haplotype)
 
 
-Alleles = AllAlt | Samples | Haplotype
-"""Which alleles a consensus sequence takes."""
+@dataclass(frozen=True, slots=True)
+class Record:
+    """One record of the region with its ALT ``alt`` (1 is the first),
+    every other record left out: the effect of that one variant. ``index``
+    counts the records the region takes in file order, as
+    :meth:`~omicsweave.query.ConsensusReader.records` lists them."""
+
+    kind: ClassVar[str] = "record"
+    index: int
+    alt: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0:
+            raise ValueError(f"record index {self.index} is negative")
+        if self.alt < 1:
+            raise ValueError(f"alt {self.alt} is not an ALT: they are numbered from 1")
+
+
+@dataclass(frozen=True, slots=True)
+class Variant:
+    """The record of the region at 0-based ``start`` with REF ``ref`` and
+    ALT ``alt`` (one of its ALTs), every other record left out: the effect
+    of that one variant. Alleles compare ignoring case; the first matching
+    record in file order is taken, and a region without one is an error."""
+
+    kind: ClassVar[str] = "variant"
+    start: int
+    ref: str
+    alt: str
+
+    def __post_init__(self) -> None:
+        if self.start < 0:
+            raise ValueError(f"start {self.start} is negative")
+        if not self.ref or not self.alt:
+            raise ValueError("ref and alt must not be empty")
+
+
+Alleles = AllAlt | Samples | Haplotype | Record | Variant
+"""Which alleles a consensus sequence takes: those of a genome
+(:class:`AllAlt`, :class:`Samples`, :class:`Haplotype`), every record they
+choose applied; or one variant (:class:`Record`, :class:`Variant`), every
+other record left out."""
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ConsensusRecords:
+    """The records a consensus region takes, in file order: the order
+    :class:`Record` counts them in."""
+
+    region: Region
+    start: np.ndarray
+    """int64: 0-based position of each record's first REF base."""
+    end: np.ndarray
+    """int64: ``start`` plus the reference span (REF, INFO/END, ...)."""
+    ref: StringVector
+    alt: StringVector
+    """The ALT alleles, comma-separated; empty when there are none."""
+    masked: np.ndarray
+    """bool: left out by the mask, whatever the selection."""
+
+    def __len__(self) -> int:
+        return len(self.start)
 
 
 @dataclass(frozen=True, slots=True, eq=False)

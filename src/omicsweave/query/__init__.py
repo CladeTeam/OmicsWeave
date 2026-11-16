@@ -6,12 +6,14 @@
   :class:`~omicsweave.types.SignalBins`, :class:`~omicsweave.types.SignalIntervals`;
   :class:`StrandedTrackReader` reads a plus / minus pair by the key's strand
 - :class:`IntervalReader`: bigBed -> :class:`~omicsweave.types.Intervals`
+- :class:`MsaReader`: bigMaf (a bigBed) -> :class:`~omicsweave.types.MultipleAlignment`
 - :class:`ContactReader`: ``.hic`` -> :class:`~omicsweave.types.ContactMatrix`,
   :class:`~omicsweave.types.ContactPixels`
 - :class:`ConsensusReader`: BCF (+ CSI) over a reference ->
   :class:`~omicsweave.types.ConsensusSequence`, :class:`~omicsweave.types.ConsensusBatch`
 - :class:`AlignmentReader`: BAM (+ BAI / CSI) -> :class:`~omicsweave.types.Alignments`
 - :class:`VariantReader`: BCF (+ CSI) -> :class:`~omicsweave.types.Genotypes`
+- :class:`MotifReader`: FFM -> :class:`~omicsweave.types.Motif` by number or ID
 
 Each takes a :mod:`omicsweave.formats` file, or a path whose format is
 detected; :func:`open` picks the reader for a file. Text formats (BED,
@@ -26,6 +28,8 @@ from ._base import Reader
 from ._consensus import ConsensusOptions, ConsensusReader
 from ._contact import ContactReader
 from ._interval import IntervalReader
+from ._motif import MotifReader
+from ._msa import MsaReader
 from ._open import open
 from ._sequence import SequenceReader
 from ._track import StrandedTrackReader, TrackReader
@@ -37,6 +41,8 @@ __all__ = [
     "ConsensusReader",
     "ContactReader",
     "IntervalReader",
+    "MotifReader",
+    "MsaReader",
     "Reader",
     "SequenceReader",
     "StrandedTrackReader",

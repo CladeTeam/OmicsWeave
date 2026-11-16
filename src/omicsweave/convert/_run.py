@@ -11,7 +11,7 @@ from .. import _budget, _native
 from .._budget import Budget, MemoryPlan
 from ..formats import BbiOptions, File, PathLike
 from ..formats._bbi import native_options
-from ._files import file_of, native_files
+from ._files import Source, file_of, native_files
 
 __all__ = ["ConvertWarning", "Plan", "Report", "plan", "run"]
 
@@ -89,7 +89,7 @@ class Plan:
 
 
 def plan(
-    source: File | PathLike,
+    source: Source,
     target: File | PathLike,
     *,
     threads: int | None = None,
@@ -103,6 +103,7 @@ def plan(
     value: str | None = None,
     mod: str | None = None,
     strand: Literal["+", "-", "."] | None = None,
+    ref_species: str | None = None,
     sidecar: bool = False,
     add_contigs: bool = False,
     sort: bool = False,
@@ -116,22 +117,29 @@ def plan(
     A path's format is told by content for the source and by name for the
     target; a file object (:mod:`omicsweave.formats`) states it.
 
+    Motif collections convert into one ``.ffm`` from one path or a list of
+    them (``sorted(Path("pwms").glob("*.txt"))``): every file once, in the
+    order given. Every file must hold the same format (named with a file
+    object, or told by content).
+
     ``threads`` (default: every core the process may run on) run the
     parallel stages; ``memory`` (bytes, or a size such as ``"8G"``; default
-    4 GiB) bounds the buffers. Memory that is not buffers (allocator slack,
-    stacks) can take the process a little over. Sorts that outgrow the
-    budget spill to ``tmp_dir`` (default: the target's directory).
+    4 GiB) bounds streaming buffers, excluding allocator slack and stacks.
+    Motif inputs and models are loaded in memory; their size estimate is
+    not an RSS cap. Sorts that outgrow the budget spill to ``tmp_dir``
+    (default: the target's directory).
 
-    - ``level``: compression level (bgzip, BCF, BAM: 0-12; bigBed, bigWig,
-      hic: zlib 1-9).
+    - ``level``: compression level (bgzip, BCF, BAM, bigBed, bigWig: 0-12;
+      hic: zlib 0-9, larger values use 9).
     - ``index``: index a sorted BCF (``True``: ``.csi``) or BAM (``True`` /
       ``"auto"``: ``.bai`` when every reference fits, else ``.csi``;
       ``"bai"``; ``"csi"``, with bins of ``2 ** min_shift`` bases, default
       14).
     - ``chrom_sizes``: bigBed / bigWig chromosome lengths (``chrom.sizes``,
       ``.fai`` or ``.2bit``); by default each chromosome's largest interval
-      end. Pairs to hic: the chromosomes and their order, instead of the
-      ``#chromsize`` header lines (Juicer short text needs it).
+      end (MAF: the reference's ``srcSize``, which a file given is checked
+      against). Pairs to hic: the chromosomes and their order, instead of the
+      ``#chromsize`` header lines (Juicer short and HiC-Pro text need it).
     - ``resolutions``: ``.mcool`` resolutions to convert (default: all);
       pairs to hic: the bin sizes, each a multiple of the finest (default:
       Juicer ``pre``'s 2.5M, 1M, 500k, 250k, 100k, 50k, 25k, 10k, 5k).
@@ -145,6 +153,10 @@ def plan(
     - ``strand``: bedMethyl to bigWig: the items of this strand (``+``,
       ``-``, or ``.`` for combined strands); by default all, and items of
       both strands that overlap are an error.
+    - ``ref_species``: MAF to bigMaf: the reference species, whose
+      component must open every block (kent's ``referenceDb``: the ``src``
+      before its first dot, such as ``hg38``); by default the species of
+      the first block's first component.
     - ``sidecar``: also write the bigBed / bigWig / hic ``.sidecar``.
     - ``add_contigs``: BCF: declare contigs the VCF header lacks (one more
       pass over the source); otherwise an undeclared contig is an error.
@@ -175,6 +187,7 @@ def plan(
         value=value,
         mod=mod,
         strand=strand,
+        ref_species=ref_species,
         sidecar=sidecar,
         add_contigs=add_contigs,
         sort=sort,
@@ -186,7 +199,7 @@ def plan(
 
 
 def run(
-    source: File | PathLike,
+    source: Source,
     target: File | PathLike,
     *,
     progress: Progress | None = None,

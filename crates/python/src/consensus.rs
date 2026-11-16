@@ -20,28 +20,80 @@ use crate::sequence::SequenceReader;
 use crate::shared::{Shared, path_str};
 use crate::variant::open_index;
 
-/// One query's choice of alleles, as the Python selector classes encode it:
-/// (`all`, [], None), (`samples`, names, None) or
-/// (`haplotype`, [sample], haplotype).
-type Selector = (PyBackedStr, Vec<PyBackedStr>, Option<PyBackedStr>);
+/// One query's choice of alleles, read from a Python selector class
+/// (`types.AllAlt`, `Samples`, `Haplotype`, `Record`, `Variant`) by its
+/// `kind` and its attributes.
+enum Selection {
+    AllAlt,
+    Samples(Vec<PyBackedStr>),
+    Haplotype {
+        sample: PyBackedStr,
+        haplotype: PyBackedStr,
+    },
+    Record {
+        index: usize,
+        alt: usize,
+    },
+    Variant {
+        start: i64,
+        reference: PyBackedStr,
+        alt: PyBackedStr,
+    },
+}
+
+impl Selection {
+    fn read(o: &Bound<'_, PyAny>) -> PyResult<Selection> {
+        fn attr<'py, T: FromPyObjectOwned<'py>>(o: &Bound<'py, PyAny>, name: &str) -> PyResult<T> {
+            o.getattr(name)?.extract::<T>().map_err(Into::into)
+        }
+        let kind: PyBackedStr = attr(o, "kind")?;
+        Ok(match &*kind {
+            "all" => Selection::AllAlt,
+            "samples" => Selection::Samples(attr(o, "names")?),
+            "haplotype" => Selection::Haplotype {
+                sample: attr(o, "sample")?,
+                haplotype: attr(o, "haplotype")?,
+            },
+            "record" => Selection::Record {
+                index: attr(o, "index")?,
+                alt: attr(o, "alt")?,
+            },
+            "variant" => Selection::Variant {
+                start: attr(o, "start")?,
+                reference: attr(o, "ref")?,
+                alt: attr(o, "alt")?,
+            },
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown allele selection {other:?}"
+                )));
+            }
+        })
+    }
+}
 
 struct Builder {
     consensus: Consensus,
 }
 
 impl Builder {
-    fn build(
+    fn load(
         &mut self,
         reference: &Shared<crate::sequence::Sequences>,
         region: Region<'_>,
-        selector: &Selector,
-        load: bool,
-    ) -> Done<usize> {
+    ) -> Done<()> {
+        reference.ensure_open()?;
+        let mut guard = reference.lock();
+        let reader = guard.as_mut().ok_or(Fail::Closed)?;
+        Ok(self.consensus.load(reader, region)?)
+    }
+
+    fn build(&mut self, selection: &Selection) -> Done<usize> {
         let names: Vec<&str>;
         let mut local_names = [""; 4];
-        let alleles = match (&*selector.0, selector.1.as_slice(), &selector.2) {
-            ("all", [], None) => Alleles::AllAlt,
-            ("samples", samples, None) => {
+        let alleles = match selection {
+            Selection::AllAlt => Alleles::AllAlt,
+            Selection::Samples(samples) => {
                 if samples.len() <= local_names.len() {
                     for (out, name) in local_names.iter_mut().zip(samples) {
                         *out = name;
@@ -52,21 +104,34 @@ impl Builder {
                     Alleles::Samples(&names)
                 }
             }
-            ("haplotype", [sample], Some(haplotype)) => Alleles::Haplotype { sample, haplotype },
-            _ => {
-                return Err(Fail::Py(PyValueError::new_err(format!(
-                    "bad allele selector {selector:?}"
-                ))));
-            }
+            Selection::Haplotype { sample, haplotype } => Alleles::Haplotype { sample, haplotype },
+            Selection::Record { index, alt } => Alleles::Record {
+                index: *index,
+                alt: *alt,
+            },
+            Selection::Variant {
+                start,
+                reference,
+                alt,
+            } => Alleles::Variant {
+                start: *start,
+                reference: reference.as_bytes(),
+                alt: alt.as_bytes(),
+            },
         };
-        if load {
-            reference.ensure_open()?;
-            let mut guard = reference.lock();
-            let reader = guard.as_mut().ok_or(Fail::Closed)?;
-            self.consensus.load(reader, region)?;
-        }
         Ok(self.consensus.query(alleles)?)
     }
+}
+
+/// Packs strings as Arrow offsets and bytes.
+fn pack<'s>(strings: impl Iterator<Item = &'s [u8]>) -> (Vec<i64>, Vec<u8>) {
+    let mut offsets = vec![0i64];
+    let mut data = Vec::new();
+    for s in strings {
+        data.extend_from_slice(s);
+        offsets.push(data.len() as i64);
+    }
+    (offsets, data)
 }
 
 fn strand(s: &str) -> PyResult<Strand> {
@@ -246,12 +311,14 @@ impl ConsensusBuilder {
         start: u32,
         end: u32,
         strand: &str,
-        selector: Selector,
+        selector: &Bound<'py, PyAny>,
     ) -> PyResult<(Bound<'py, PyArray1<u8>>, Option<String>)> {
         let strand = self::strand(strand)?;
+        let selection = Selection::read(selector)?;
         let reference = &self.reference.get().inner;
         let (bases, chain) = self.inner.run(py, |b| -> Done<_> {
-            let n = b.build(reference, Region::new(chrom, start, end), &selector, true)?;
+            b.load(reference, Region::new(chrom, start, end))?;
+            let n = b.build(&selection)?;
             let mut bases = vec![0u8; n];
             b.consensus.write(strand, &mut bases)?;
             Ok((bases, b.consensus.chain().map(str::to_owned)))
@@ -269,23 +336,29 @@ impl ConsensusBuilder {
         start: u32,
         end: u32,
         strand: &str,
-        selectors: Vec<Selector>,
+        selectors: Vec<Bound<'py, PyAny>>,
     ) -> PyResult<(
         Bound<'py, PyArray1<i64>>,
         Bound<'py, PyArray1<u8>>,
         Vec<Option<String>>,
     )> {
         let strand = self::strand(strand)?;
+        let selections = selectors
+            .iter()
+            .map(Selection::read)
+            .collect::<PyResult<Vec<_>>>()?;
         let reference = &self.reference.get().inner;
         let (offsets, bases, chains) = self.inner.run(py, |b| -> Done<_> {
-            let region = Region::new(chrom, start, end);
-            let mut offsets = Vec::with_capacity(selectors.len() + 1);
+            let mut offsets = Vec::with_capacity(selections.len() + 1);
             offsets.push(0i64);
             let mut bases = Vec::new();
-            let mut chains = Vec::with_capacity(selectors.len());
-            for (index, selector) in selectors.iter().enumerate() {
-                // Only selectors in this call share the loaded region.
-                let n = b.build(reference, region, selector, index == 0)?;
+            let mut chains = Vec::with_capacity(selections.len());
+            // Only selections in this call share the loaded region.
+            if !selections.is_empty() {
+                b.load(reference, Region::new(chrom, start, end))?;
+            }
+            for selection in &selections {
+                let n = b.build(selection)?;
                 let at = bases.len();
                 bases.resize(at + n, 0u8);
                 b.consensus.write(strand, &mut bases[at..])?;
@@ -295,6 +368,56 @@ impl ConsensusBuilder {
             Ok((offsets, bases, chains))
         })?;
         Ok((offsets.into_pyarray(py), bases.into_pyarray(py), chains))
+    }
+
+    /// The records `chrom:[start, end)` takes, in the order a `Record`
+    /// selection counts them: starts, ends (start plus the reference span),
+    /// REF and the comma-joined ALTs as Arrow strings, and whether the mask
+    /// leaves each out.
+    #[allow(clippy::type_complexity)]
+    fn records<'py>(
+        &self,
+        py: Python<'py>,
+        chrom: &str,
+        start: u32,
+        end: u32,
+    ) -> PyResult<(
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+        (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<u8>>),
+        (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<u8>>),
+        Bound<'py, PyArray1<bool>>,
+    )> {
+        let reference = &self.reference.get().inner;
+        let (starts, ends, refs, alts, masked) = self.inner.run(py, |b| -> Done<_> {
+            b.load(reference, Region::new(chrom, start, end))?;
+            let records: Vec<_> = b.consensus.records()?.collect();
+            let starts = records.iter().map(|r| r.start()).collect::<Vec<_>>();
+            let ends = records
+                .iter()
+                .map(|r| r.start() + r.len())
+                .collect::<Vec<_>>();
+            let refs = pack(records.iter().map(|r| r.allele(0)));
+            let joined: Vec<Vec<u8>> = records
+                .iter()
+                .map(|r| {
+                    (1..r.n_alleles())
+                        .map(|i| r.allele(i))
+                        .collect::<Vec<_>>()
+                        .join(&b","[..])
+                })
+                .collect();
+            let alts = pack(joined.iter().map(Vec::as_slice));
+            let masked = records.iter().map(|r| r.masked).collect::<Vec<_>>();
+            Ok((starts, ends, refs, alts, masked))
+        })?;
+        Ok((
+            starts.into_pyarray(py),
+            ends.into_pyarray(py),
+            (refs.0.into_pyarray(py), refs.1.into_pyarray(py)),
+            (alts.0.into_pyarray(py), alts.1.into_pyarray(py)),
+            masked.into_pyarray(py),
+        ))
     }
 
     fn close(&self, py: Python<'_>) {

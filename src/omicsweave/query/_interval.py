@@ -59,8 +59,10 @@ class IntervalReader(CachedReader):
         """The record layout of the bigBed file."""
         return self._schema
 
-    def fetch(self, region: RegionLike) -> Intervals:
-        """The features overlapping ``region``."""
+    def fetch(self, region: RegionLike, *, clip: bool = False) -> Intervals:
+        """The features overlapping ``region``, whole: a feature crossing the
+        region's edges keeps its stored start and end. ``clip=True`` cuts
+        them to the region instead."""
         r = as_region(region)
-        start, end, offsets, data = self._native.query(r.chrom, r.start, r.end)
+        start, end, offsets, data = self._native.query(r.chrom, r.start, r.end, clip)
         return Intervals(r, start, end, StringVector(offsets, data))

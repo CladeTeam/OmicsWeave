@@ -40,9 +40,9 @@ Tile = tuple[str, int, int, str, int, int, int, Unit]
 """A contact-map window: (row chrom, row start, row end, column chrom,
 column start, column end, resolution, unit)."""
 
-Selector = tuple[Literal["all", "samples", "haplotype"], list[str], str | None]
-"""Which alleles a consensus takes: ``("all", [], None)``, ``("samples",
-names, None)`` or ``("haplotype", [sample], haplotype)``."""
+Selector = object
+"""A ``types`` allele selection (``AllAlt``, ``Samples``, ``Haplotype``,
+``Record``, ``Variant``), read by its ``kind`` and attributes."""
 
 Progress = Callable[[str, int, int], object]
 """Called with (phase, bytes read, bytes total) between batches."""
@@ -118,13 +118,15 @@ class ConvertPlan:
     checked against its budget without reading any data. A format not named
     is told by content for the source and by name for the destination;
     ``threads`` ``None`` is every core the process may use, ``memory``
-    ``None`` the default budget (4 GiB)."""
+    ``None`` the default budget (4 GiB). ``more_src`` adds source files to a
+    motif collection."""
 
     def __new__(
         cls,
         src: str,
         dst: str,
         *,
+        more_src: list[str] = ...,
         src_format: str | None = None,
         dst_format: str | None = None,
         threads: int | None = None,
@@ -138,6 +140,7 @@ class ConvertPlan:
         value: str | None = None,
         mod: str | None = None,
         strand: Literal["+", "-", "."] | None = None,
+        ref_species: str | None = None,
         sidecar: bool = False,
         add_contigs: bool = False,
         sort: bool = False,
@@ -261,9 +264,9 @@ class TrackReader:
         reads the full-resolution data, otherwise a zoom level."""
     def zoom_reductions(self) -> list[int]:
         """Bases per record of each zoom level, in file order."""
-    def intervals(self, chrom: str, start: int, end: int) -> tuple[U32, U32, F32]:
-        """The intervals with data in ``chrom:[start, end)``, clipped to it,
-        as (start, end, value) columns."""
+    def intervals(self, chrom: str, start: int, end: int, clip: bool) -> tuple[U32, U32, F32]:
+        """The intervals with data in ``chrom:[start, end)``, clipped when
+        ``clip`` is true, as (start, end, value) columns."""
     def close(self) -> None:
         """Releases the file; later calls raise ``ValueError``."""
 
@@ -307,12 +310,42 @@ class IntervalReader:
     def clone_context(self) -> IntervalReader: ...
     def chroms(self) -> list[tuple[str, int]]:
         """(name, length) of every chromosome."""
-    def query(self, chrom: str, start: int, end: int) -> tuple[U32, U32, I64, U8]:
-        """The features overlapping ``chrom:[start, end)``, unclipped, as
+    def query(self, chrom: str, start: int, end: int, clip: bool) -> tuple[U32, U32, I64, U8]:
+        """The features overlapping ``chrom:[start, end)``, clipped when
+        ``clip`` is true, as
         columns: starts, ends, and the annotations (fields after the third)
         as Arrow ``LargeString`` offsets and bytes."""
     def close(self) -> None:
         """Releases the file; later calls raise ``ValueError``."""
+
+@final
+class MsaReader:
+    def __new__(
+        cls,
+        path: str,
+        species: list[str] | None = None,
+        fill: int = 45,
+        cache: BlockCache | None = None,
+    ) -> MsaReader: ...
+    def chroms(self) -> list[tuple[str, int]]: ...
+    def set_cache(self, cache: BlockCache | None) -> None: ...
+    def clone_context(self) -> MsaReader: ...
+    def fetch(
+        self,
+        chrom: str,
+        start: int,
+        end: int,
+        reverse: bool,
+    ) -> tuple[list[str], U8]: ...
+    def fetch_into(
+        self,
+        chrom: str,
+        start: int,
+        end: int,
+        reverse: bool,
+        out: U8,
+    ) -> None: ...
+    def close(self) -> None: ...
 
 @final
 class BigBedWriter:
@@ -494,6 +527,12 @@ class ConsensusBuilder:
         """The consensus of ``chrom:[start, end)`` with each selector, 5' to
         3' of ``strand``, packed: sequence ``i`` is
         ``bases[offsets[i]:offsets[i + 1]]``; returns (offsets, bases, chains)."""
+    def records(
+        self, chrom: str, start: int, end: int
+    ) -> tuple[I64, I64, tuple[I64, U8], tuple[I64, U8], npt.NDArray[np.bool_]]:
+        """The records ``chrom:[start, end)`` takes, in the order a
+        ``Record`` selection counts them: starts, ends, REF and the
+        comma-joined ALTs (Arrow offsets and bytes), and the mask's flags."""
     def close(self) -> None:
         """Releases the BCF; the reference stays open."""
 
@@ -506,7 +545,8 @@ class AlignmentReader:
     must exist) and the reference its slices need (a ``SequenceReader``,
     whose file and cache are shared; CRAM only). ``verify_checksums``,
     ``decode_md`` and ``name_prefix`` shape CRAM decoding (htslib's
-    defaults)."""
+    defaults). ``decode_md`` synthesizes missing MD/NM tags only when
+    querying AUX."""
 
     def __new__(
         cls,
@@ -529,14 +569,28 @@ class AlignmentReader:
     def index_path(self) -> str:
         """The index file read."""
     def query(
-        self, chrom: str, start: int, end: int, fields: int
+        self,
+        chrom: str,
+        start: int,
+        end: int,
+        fields: int,
+        modification_codes: list[int] = ...,
     ) -> tuple[
-        I64, I64, U16, U8, I32, I32, I32, Strings, Strings, Strings, tuple[I64, U32] | None, Strings
+        tuple[I64, I64, U16, U8, I32, I32, I32],
+        Strings,
+        Strings,
+        Strings,
+        tuple[I64, U32] | None,
+        Strings,
+        tuple[I64, I64, I32, I32, U8, U8, U8] | None,
     ]:
         """The records overlapping ``chrom:[start, end)``: (start, end, flag,
-        mapq, mate_tid, mate_start, tlen), then names, sequences, qualities,
-        CIGARs and aux fields, each ``None`` unless the ``fields`` bits ask
-        for it."""
+        mapq, mate_tid, mate_start, tlen) as one tuple, then names, sequences, qualities,
+        CIGARs and aux fields, and (offsets, ref_pos, qpos, code, canonical,
+        probability, flags) of base modifications, each ``None`` unless the
+        ``fields`` bits ask for it. Modifications keep the codes in
+        ``modification_codes`` (letters as ASCII, ChEBI numbers negated), or
+        all when it is empty."""
     def close(self) -> None:
         """Releases the file; further calls raise ``ValueError``."""
 
@@ -756,3 +810,164 @@ def read_aliases(path: str) -> list[tuple[str, str]]:
 
 def is_haplotype(text: str) -> bool:
     """Whether ``text`` is a haplotype ``bcftools consensus -H`` takes."""
+
+# --- motifs ---------------------------------------------------------------
+
+F64 = npt.NDArray[np.float64]
+U64 = npt.NDArray[np.uint64]
+AlphabetFields = tuple[str, str, str | None, dict[str, str]]
+"""``(name, symbols, complement, aliases)`` of an ``Alphabet``."""
+StringArrays = tuple[I64, U8]
+"""Strings as Arrow ``LargeString`` offsets and bytes."""
+
+def alphabet_preset(name: Literal["dna", "rna", "protein"]) -> AlphabetFields: ...
+
+@final
+class MotifCollection:
+    """An FFM collection read whole and checked on open."""
+
+    def __init__(self, path: str) -> None: ...
+    def alphabet(self) -> AlphabetFields: ...
+    def schema(self) -> list[tuple[str, Literal["string", "integer", "float"]]]: ...
+    def ids(self) -> list[str]: ...
+    def __len__(self) -> int: ...
+    def widths(self) -> U32: ...
+    def motif(
+        self, i: int
+    ) -> tuple[
+        int,
+        bytes | None,
+        float | None,
+        list[tuple[str, U32, F64]],
+        tuple[F64, F64] | None,
+        list[str],
+    ]:
+        """``(width, support, sites, factors, gaps, annotation values)``."""
+
+    def close(self) -> None: ...
+
+@final
+class FfmWriter:
+    """Process-local writer; compression releases the GIL. An inherited
+    writer cannot add motifs after fork; closing it does not write."""
+
+    def __init__(
+        self,
+        path: str,
+        alphabet: object,
+        schema: list[tuple[str, str]],
+        block_records: int,
+        block_values: int,
+    ) -> None: ...
+    def add(self, motif: object, values: list[str]) -> None:
+        """Appends a ``Motif`` with one annotation value per schema key."""
+
+    def __len__(self) -> int: ...
+    def close(self) -> None: ...
+
+def motif_defaults() -> dict[str, dict[str, float | int]]: ...
+def stats_best_of(step: object, p: F64, n: F64) -> F64: ...
+def stats_combine(step: object, pvalues: F64) -> float: ...
+def stats_adjust(step: object, pvalues: F64) -> F64: ...
+def background_nrdb(alphabet: object) -> list[F64]: ...
+def background_glam2(alphabet: object) -> list[F64]: ...
+def background_meme(alphabet: object, text: str) -> list[F64]: ...
+def background_estimate(
+    alphabet: object, offsets: I64, data: U8, order: int, pseudocount: float
+) -> list[F64]: ...
+def background_symmetrized(kmers: list[F64], alphabet: object) -> list[F64]: ...
+def background_sample(
+    kmers: list[F64], alphabet: object, lengths: U64, seed: int
+) -> StringArrays: ...
+def scoring_preset(name: Literal["fimo", "exact"]) -> dict[str, object]: ...
+def scoring_mast(alphabet: object, letters: F64 | None, mode: str) -> dict[str, object]: ...
+def scoring_mcast(kmers: list[F64], alphabet: object) -> dict[str, object]: ...
+def ambiguity_iupac(
+    alphabet: object, rule_: str
+) -> tuple[str, list[tuple[str, str]], str | None]: ...
+def substitution_mcast(letters: F64) -> tuple[float, float, F64]: ...
+def round_significant(values: F64, digits: int) -> F64: ...
+
+@final
+class MotifProgram:
+    """Compiled motifs; ``source`` is a :class:`MotifCollection` or a list of
+    ``Motif``; ``scoring`` a ``Scoring``."""
+
+    def __init__(
+        self,
+        source: object,
+        alphabet: object,
+        kmers: list[F64],
+        scoring: object,
+        strands: str,
+        threads: int | None,
+    ) -> None: ...
+    @staticmethod
+    def combine(programs: list[MotifProgram]) -> MotifProgram: ...
+    def __len__(self) -> int: ...
+    def widths(self) -> U32: ...
+    def model(self, motif: int, strand: str) -> dict[str, object]: ...
+    def scan(
+        self,
+        offsets: I64,
+        data: U8,
+        reductions: list[object],
+        threads: int | None,
+        tile_len: int | None,
+    ) -> list[dict[str, object]]:
+        """One dict per reduction, naming its ``kind`` and holding its columns."""
+
+def dirichlet_glam2(alphabet: object) -> tuple[F64, F64]: ...
+def dirichlet_uniform(n: int) -> tuple[F64, F64]: ...
+def dirichlet_parse_glam2(text: str, n: int) -> tuple[F64, F64]: ...
+def profile_scoring_glam2(
+    alphabet: object,
+) -> tuple[float, float, float, float, tuple[F64, F64]]: ...
+
+@final
+class ProfileProgram:
+    def __init__(
+        self, source: object, alphabet: object, kmers: list[F64], scoring: object, strands: str
+    ) -> None: ...
+    def __len__(self) -> int: ...
+    def scan(
+        self,
+        offsets: I64,
+        data: U8,
+        top: int | None,
+        names: StringArrays | None,
+        limit: int | None,
+        threads: int | None,
+    ) -> dict[str, object]: ...
+
+def text_fimo(
+    hits: object,
+    alphabet: object,
+    motif_ids: list[str],
+    alt_ids: list[str],
+    names: StringArrays,
+    sequences: StringArrays,
+    origins: U64 | None,
+) -> str: ...
+def text_mast_hit_list(
+    report: object,
+    motif_ids: list[str],
+    alt_ids: list[str],
+    numbers: list[int],
+    names: StringArrays,
+    stranded: bool,
+) -> str: ...
+def text_mcast(
+    clusters: object,
+    names: StringArrays,
+    sequences: StringArrays,
+    origins: U64 | None,
+    filter: tuple[float | None, float | None, float | None],
+) -> str: ...
+def text_glam2(
+    alignments: object,
+    alphabet: object,
+    names: StringArrays,
+    sequences: StringArrays,
+    header: tuple[str, str] | None,
+) -> str: ...

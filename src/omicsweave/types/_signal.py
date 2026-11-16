@@ -77,7 +77,8 @@ class SignalBins:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class SignalIntervals:
-    """The runs of constant signal in ``region``, clipped to it, in position order.
+    """The runs of constant signal in ``region``, in position order: cut to
+    the region unless the query asked for the stored bounds.
 
     Columns: ``start`` and ``end`` (``uint32``), ``value`` (``float32``).
     Bases without data lie in no run.
