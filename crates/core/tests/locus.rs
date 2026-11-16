@@ -80,6 +80,14 @@ fn within_checks_converted_keys_and_extreme_spans() {
         spliced.check_within(20),
         Err(Error::RegionOutOfRange { .. })
     ));
+    assert!(matches!(
+        spliced.check_within(2),
+        Err(Error::RegionOutOfRange {
+            start: u32::MAX,
+            end: u32::MAX,
+            len: 2
+        })
+    ));
     let whole_span = [Span::new(0, u32::MAX)];
     let whole = Locus::new("c", &whole_span, Strand::Forward).unwrap();
     assert_eq!(whole.len(), u32::MAX);
