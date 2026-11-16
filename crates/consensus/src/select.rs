@@ -224,12 +224,12 @@ pub(crate) fn choose(
     Ok(Choice::Allele(ialt as usize))
 }
 
-/// Whether the record has genotypes bcftools reads; an error where they do
-/// not fit `int8`.
+/// Whether the record has genotypes bcftools reads; an error if the storage
+/// is not `int8` or its values do not fit it.
 fn readable_gt(site: &Site) -> Result<bool> {
     match site.gt {
         Gt::Absent => Ok(false),
-        Gt::Wide => Err(invalid(site, "genotype values beyond int8")),
+        Gt::Wide => Err(invalid(site, "genotypes not represented with int8")),
         Gt::Bytes => Ok(true),
     }
 }

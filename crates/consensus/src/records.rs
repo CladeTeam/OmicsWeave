@@ -3,7 +3,7 @@
 //! reference span, alleles and genotypes.
 
 use omicsweave_core::{Error, Result};
-use omicsweave_vcf::{GT_MISSING_VALUE, GT_VECTOR_END, Record, VCF_REF};
+use omicsweave_vcf::{BT_INT8, GT_MISSING_VALUE, GT_VECTOR_END, Record, VCF_REF};
 
 /// Genotype values are kept as bcftools reads them: BCF `int8` bytes,
 /// `(allele + 1) << 1 | phased`, with these two specials.
@@ -17,7 +17,7 @@ pub(crate) enum Gt {
     Absent,
     /// One byte per value.
     Bytes,
-    /// Values beyond `int8`, which bcftools does not read.
+    /// Non-`int8` storage or values, which bcftools does not read.
     Wide,
 }
 
@@ -165,7 +165,12 @@ impl Records {
                 }
                 let width = u16::try_from(g.width)
                     .map_err(|_| Error::invalid("vcf record", "ploidy above 65535"))?;
-                (self.push_genotypes(g.values), width)
+                let gt = if rec.genotype_type().is_some_and(|ty| ty != BT_INT8) {
+                    Gt::Wide
+                } else {
+                    self.push_genotypes(g.values)
+                };
+                (gt, width)
             }
         };
         let error = match error {

@@ -121,6 +121,11 @@ fn sample_sets_preserve_iupac_selection_across_inline_and_large_sets() {
             b"AAMAAAAAAAAAAAAA"
         );
     }
+    let repeated: Vec<_> = names.iter().copied().cycle().take(32_768).collect();
+    assert_eq!(
+        query(&mut consensus, Alleles::Samples(&repeated)),
+        b"AAMAAAAAAAAAAAAA"
+    );
     assert_eq!(
         query(&mut consensus, Alleles::Samples(&["S2"])),
         b"AACAAAAAAAAAAAAA"

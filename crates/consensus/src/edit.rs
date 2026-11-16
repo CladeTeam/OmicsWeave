@@ -157,7 +157,13 @@ impl<'a> Edit<'a> {
     }
 
     /// Replaces `remove` bytes at `at` with `insert`.
-    fn splice(&mut self, at: usize, remove: usize, insert: &[u8]) {
+    fn splice(&mut self, at: usize, remove: usize, insert: &[u8]) -> Result<()> {
+        let len = self.len() as usize;
+        if at > len || remove > len - at {
+            return Err(Error::Unsupported(
+                "consensus edit extends beyond the current sequence",
+            ));
+        }
         if at == 0 && insert.is_empty() && remove > 0 && remove == self.len() as usize {
             self.empty_case = self.at(0);
         }
@@ -170,6 +176,7 @@ impl<'a> Edit<'a> {
             self.out.splice(at..at + in_out, insert.iter().copied());
             self.cur += remove - in_out;
         }
+        Ok(())
     }
 
     /// `apply_absent`: fills with `absent` from where the last record's
@@ -438,7 +445,7 @@ impl<'a> Edit<'a> {
                 start as usize,
                 (idx + rlen - start).max(0) as usize,
                 &a[from..],
-            );
+            )?;
         } else {
             self.prev_is_insert = true;
             self.prev_base_pos = pos;
@@ -455,12 +462,12 @@ impl<'a> Edit<'a> {
             if idx + ibeg <= span_end {
                 let start = (idx + ibeg).max(0);
                 let from = (start - idx) as usize;
-                self.splice(start as usize, (span_end - start) as usize, &a[from..]);
+                self.splice(start as usize, (span_end - start) as usize, &a[from..])?;
             } else {
                 // The insertion opens a gap before what it writes.
                 let mut fill = vec![0; (idx + ibeg - span_end) as usize];
                 fill.extend_from_slice(&a[ibeg as usize..]);
-                self.splice(span_end as usize, 0, &fill);
+                self.splice(span_end as usize, 0, &fill)?;
             }
             self.frz_mod = idx + alen - ibeg + 1;
         }
@@ -540,7 +547,7 @@ impl<'a> Edit<'a> {
         if let Some(mark) = mark {
             mark_snv(&original, &mut written, mark);
         }
-        self.splice(idx as usize, rlen as usize, &written);
+        self.splice(idx as usize, rlen as usize, &written)?;
         self.prev_base = last;
         self.prev_base_pos = pos + rlen - 1;
         self.prev_is_insert = false;
@@ -587,11 +594,11 @@ mod tests {
     fn reference_matching_handles_both_initialized_spans() {
         let mut edit = Edit::new(b"ACgtN\xffTtaC", 0, Vec::new());
         check_matches(&edit);
-        edit.splice(2, 3, b"agCT");
+        edit.splice(2, 3, b"agCT").unwrap();
         check_matches(&edit);
-        edit.splice(1, 2, b"T");
+        edit.splice(1, 2, b"T").unwrap();
         check_matches(&edit);
-        edit.splice(0, edit.len() as usize, b"");
+        edit.splice(0, edit.len() as usize, b"").unwrap();
         check_matches(&edit);
     }
 }

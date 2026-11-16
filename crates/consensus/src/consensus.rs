@@ -2,7 +2,7 @@
 //! builds them, from the records a BCF index gives for the region and a
 //! reference read through [`SequenceRead`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use omicsweave_core::orient::complement;
@@ -16,6 +16,40 @@ use crate::edit::{Edit, Marks};
 use crate::mask::Mask;
 use crate::records::{Overlap, RecordFilter, Records};
 use crate::select::{Haplotype, Mode, Scratch, choose};
+
+/// IUPAC selection is a union: inspect each sample only once per record,
+/// retaining first-occurrence order so malformed genotypes fail in order.
+fn select_samples(
+    names: &[&str],
+    mut sample: impl FnMut(&str) -> Result<usize>,
+) -> Result<smallvec::SmallVec<[usize; 4]>> {
+    let mut selected = smallvec::SmallVec::<[usize; 4]>::new();
+    let mut seen = None::<HashSet<usize>>;
+    let mut increasing = true;
+    for name in names {
+        let id = sample(name)?;
+        let fresh = match &mut seen {
+            Some(seen) => seen.insert(id),
+            None if selected.len() <= 4 && selected.contains(&id) => false,
+            None if selected.len() < 4 => true,
+            // Lists in header order are already unique without a hash table.
+            None if increasing && id >= selected[selected.len() - 1] => {
+                id != selected[selected.len() - 1]
+            }
+            None => {
+                let mut ids: HashSet<_> = selected.iter().copied().collect();
+                let fresh = ids.insert(id);
+                seen = Some(ids);
+                fresh
+            }
+        };
+        if fresh {
+            increasing &= selected.last().is_none_or(|&last| id > last);
+            selected.push(id);
+        }
+    }
+    Ok(selected)
+}
 
 /// The `bcftools consensus` options that shape every sequence; which
 /// alleles a sequence takes is chosen per query ([`Alleles`]).
@@ -199,8 +233,9 @@ impl<S: ReadAt> Consensus<S> {
     /// bcftools only warns of it.
     pub fn load(&mut self, reference: &mut impl SequenceRead, region: Region<'_>) -> Result<()> {
         self.ready = false;
-        region.check()?;
         let mut loaded = self.loaded.take().unwrap_or_default();
+        region.check()?;
+        region.check_within(reference.chrom_len(region.chrom)?)?;
         loaded.reference.clear();
         loaded.reference.resize(region.len() as usize, 0);
         reference.sequence(&Locus::from(region), &mut loaded.reference)?;
@@ -273,13 +308,7 @@ impl<S: ReadAt> Consensus<S> {
             Alleles::AllAlt if self.options.iupac_codes => Mode::IupacRefAlt,
             Alleles::AllAlt => Mode::AllAlt,
             Alleles::Samples([]) => return Err(Error::invalid("consensus", "no samples")),
-            Alleles::Samples(names) => {
-                let mut selected = smallvec::SmallVec::with_capacity(names.len());
-                for name in names {
-                    selected.push(sample(name)?);
-                }
-                Mode::IupacSamples(selected)
-            }
+            Alleles::Samples(names) => Mode::IupacSamples(select_samples(names, sample)?),
             Alleles::Haplotype {
                 sample: name,
                 haplotype,
@@ -395,5 +424,54 @@ impl Consensus<FileSource> {
     /// header, index, filter and options.
     pub fn try_clone(&self) -> Result<Self> {
         Ok(self.fork(self.variants.try_clone()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_samples;
+
+    #[test]
+    fn sample_union_resolves_all_names_and_keeps_first_occurrence_order() {
+        for (unique, reverse) in [1, 4, 5, 1024]
+            .into_iter()
+            .flat_map(|n| [(n, false), (n, true)])
+        {
+            let names: Vec<_> = (0..unique)
+                .map(|i| if reverse { unique - i - 1 } else { i })
+                .map(|i| i.to_string())
+                .collect();
+            let requested: Vec<_> = names
+                .iter()
+                .cycle()
+                .take(unique * 17)
+                .map(String::as_str)
+                .collect();
+            let mut lookups = 0;
+            let selected = select_samples(&requested, |s| {
+                lookups += 1;
+                Ok(s.parse().unwrap())
+            })
+            .unwrap();
+            assert_eq!(lookups, requested.len());
+            assert_eq!(
+                &selected[..],
+                &names
+                    .iter()
+                    .map(|s| s.parse::<usize>().unwrap())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(selected.spilled(), unique > 4);
+        }
+        let mut lookups = 0;
+        assert!(
+            select_samples(&["0", "0", "bad", "1"], |s| {
+                lookups += 1;
+                s.parse()
+                    .map_err(|_| omicsweave_core::Error::UnknownChrom(s.to_owned()))
+            })
+            .is_err()
+        );
+        assert_eq!(lookups, 3);
     }
 }
