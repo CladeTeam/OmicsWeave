@@ -14,7 +14,7 @@ use omicsweave_convert::stage::{Outputs, Sizing, sizing, text_batch};
 use omicsweave_convert::{Budget, MemoryPlan, OnProgress, Progress, human};
 use omicsweave_core::exec::{Ordered, Pool};
 use omicsweave_core::{Error, Result};
-use omicsweave_gtf::{Aliases, Annotation, Flank, Select};
+use omicsweave_gtf::{Aliases, Annotation, Flank, Selection};
 
 use crate::accum::alleles::{AlleleStage, Alleles};
 use crate::accum::atac::{Atac, FragmentStage};
@@ -225,33 +225,45 @@ impl Resolver<'_> {
     }
 
     fn space(&mut self, c: &Counts) -> Result<SpaceId> {
-        self.space_of(&c.features, c.biotypes.as_ref())
+        self.space_of(&c.features, c.subset.as_ref())
     }
 
     fn space_of(
         &mut self,
         features: &FeatureSource,
-        biotypes: Option<&Vec<String>>,
+        subset: Option<&Arc<Selection>>,
     ) -> Result<SpaceId> {
-        let selection = match biotypes {
-            Some(b) => Some(
-                self.annotation("a biotype selection")?
-                    .select(&Select::new().gene_biotypes(b.iter().cloned())),
-            ),
-            None => None,
-        };
-        let sel_key = format!("{biotypes:?}");
+        if subset.is_some()
+            && !matches!(
+                features,
+                FeatureSource::GeneExons
+                    | FeatureSource::GeneSpans
+                    | FeatureSource::Promoters(_)
+                    | FeatureSource::GeneActivity(_)
+            )
+        {
+            return Err(Error::invalid("quant", "a gene subset needs gene features"));
+        }
+        let selection = subset.map(Arc::as_ref);
+        // One space per subset object: a shared subset builds its space once.
+        let sel_key = format!("{:?}", subset.map(Arc::as_ptr));
         match features {
             FeatureSource::GeneExons => {
                 let ann = Arc::clone(self.annotation("gene counts")?);
                 self.spaces.register(format!("gene-exons {sel_key}"), || {
-                    Ok(FeatureSpace::gene_exons(&ann, selection.as_ref()))
+                    if let Some(s) = selection {
+                        s.check(&ann)?;
+                    }
+                    Ok(FeatureSpace::gene_exons(&ann, selection))
                 })
             }
             FeatureSource::GeneSpans => {
                 let ann = Arc::clone(self.annotation("gene counts")?);
                 self.spaces.register(format!("gene-spans {sel_key}"), || {
-                    Ok(FeatureSpace::gene_spans(&ann, selection.as_ref()))
+                    if let Some(s) = selection {
+                        s.check(&ann)?;
+                    }
+                    Ok(FeatureSpace::gene_spans(&ann, selection))
                 })
             }
             FeatureSource::Promoters(f) | FeatureSource::GeneActivity(f) => {
@@ -265,12 +277,11 @@ impl Resolver<'_> {
                         f.upstream, f.downstream
                     ),
                     || {
+                        if let Some(s) = selection {
+                            s.check(&ann)?;
+                        }
                         Ok(FeatureSpace::gene_windows(
-                            &ann,
-                            selection.as_ref(),
-                            &lengths,
-                            promoter,
-                            f,
+                            &ann, selection, &lengths, promoter, f,
                         ))
                     },
                 )
@@ -386,11 +397,8 @@ impl Resolver<'_> {
             spans.features = FeatureSource::GeneSpans;
             let vspace = self.space(&spans)?;
             let ann = self.annotation("velocity")?;
-            let genes: Vec<u32> = match &c.biotypes {
-                Some(b) => {
-                    ann.select(&Select::new().gene_biotypes(b.iter().cloned()))
-                        .genes
-                }
+            let genes: Vec<u32> = match &c.subset {
+                Some(s) => s.genes.clone(),
                 None => (0..ann.genes().len() as u32).collect(),
             };
             Some(Velocity {
@@ -499,7 +507,7 @@ impl Resolver<'_> {
                     format!("{}: methylation matrices need distinct names", m.name),
                 ));
             }
-            let space = self.space_of(&x.features, x.biotypes.as_ref())?;
+            let space = self.space_of(&x.features, x.subset.as_ref())?;
             let (rows, bytes) = self.rows(&x.rows, x.whitelist.as_deref())?;
             table_bytes += bytes;
             matrices.push(MatrixStage {
@@ -1021,6 +1029,48 @@ pub fn quantify(task: Task, budget: Budget, progress: OnProgress<'_>) -> Result<
 mod tests {
     use super::*;
     use crate::accum::Accumulator;
+
+    #[test]
+    fn products_share_one_space_per_gene_subset() {
+        let ann = Annotation::parse(
+            b"c\t.\texon\t1\t5\t.\t+\t.\tgene_id \"a\"; transcript_id \"a1\";\n\
+              c\t.\texon\t20\t25\t.\t+\t.\tgene_id \"b\"; transcript_id \"b1\";\n",
+            &omicsweave_gtf::ReadOptions {
+                threads: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut task = Task::new(vec![], "unused");
+        task.annotation = Some(Arc::new(ann));
+        let mut resolver = Resolver {
+            task: &task,
+            inputs: &[],
+            spaces: Spaces::default(),
+            lengths: None,
+            reference: None,
+        };
+        let subset = Arc::new(Selection {
+            genes: vec![0],
+            transcripts: vec![0],
+        });
+        let first = resolver
+            .space_of(&FeatureSource::GeneExons, Some(&subset))
+            .unwrap();
+        let again = resolver
+            .space_of(&FeatureSource::GeneExons, Some(&Arc::clone(&subset)))
+            .unwrap();
+        assert_eq!(first, again);
+        assert_eq!(resolver.spaces.get(first).features.len(), 1);
+        let all = resolver.space_of(&FeatureSource::GeneExons, None).unwrap();
+        assert_ne!(first, all);
+        assert_eq!(resolver.spaces.get(all).features.len(), 2);
+        assert!(
+            resolver
+                .space_of(&FeatureSource::Bins(10), Some(&subset))
+                .is_err()
+        );
+    }
 
     #[test]
     fn fragment_only_whitelist_is_included_in_fixed_memory() {

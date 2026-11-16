@@ -52,6 +52,7 @@ use std::sync::Arc;
 use omicsweave_bam::flag;
 use omicsweave_convert::stage::{Sorter, Spill, read_or_end};
 use omicsweave_core::{Error, Result};
+use omicsweave_gtf::Selection;
 use smallvec::SmallVec;
 use std::io::Read;
 
@@ -148,7 +149,8 @@ pub struct MethylMatrix {
     /// The directory under the product's (`genes`, `bins`, ...).
     pub name: String,
     pub features: FeatureSource,
-    pub biotypes: Option<Vec<String>>,
+    /// Only the genes of this subset of the task's annotation.
+    pub subset: Option<Arc<Selection>>,
     pub rows: RowKey,
     /// Only these row keys, rows in this order.
     pub whitelist: Option<PathBuf>,
@@ -162,7 +164,7 @@ impl MethylMatrix {
         MethylMatrix {
             name: name.into(),
             features,
-            biotypes: None,
+            subset: None,
             rows: RowKey::File,
             whitelist: None,
             contexts: CPG,

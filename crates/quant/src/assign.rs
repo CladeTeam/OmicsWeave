@@ -310,6 +310,80 @@ impl FeatureSpace {
         }
     }
 
+    /// Every row of `set` as its own column (regions built by the caller:
+    /// introns, exon bins, peaks), with id `chrom:start-end` and the row's
+    /// name, or the id when it has none. Invalid public columns are rejected;
+    /// the overlap index is built from the owned coordinates on first query.
+    pub fn of_intervals(mut set: IntervalSet, kind: &str) -> Result<FeatureSpace> {
+        let n = set.len();
+        if n > u32::MAX as usize || set.seqid_count() > u32::MAX as usize {
+            return Err(Error::invalid(
+                "feature space",
+                "too many intervals or chromosomes",
+            ));
+        }
+        if [
+            set.seqid.len(),
+            set.end.len(),
+            set.strand.len(),
+            set.owner.len(),
+            set.name.len(),
+        ]
+        .iter()
+        .any(|&len| len != n)
+        {
+            return Err(Error::invalid(
+                "feature space",
+                "interval columns differ in length",
+            ));
+        }
+        if set.seqid.iter().any(|&s| s as usize >= set.seqid_count()) {
+            return Err(Error::invalid(
+                "feature space",
+                "seqid outside the chromosome list",
+            ));
+        }
+        if set
+            .name
+            .iter()
+            .any(|&name| name != NONE && name as usize >= set.pool().len())
+        {
+            return Err(Error::invalid(
+                "feature space",
+                "name outside the string pool",
+            ));
+        }
+        if let Some((&start, &end)) = set.start.iter().zip(&set.end).find(|(s, e)| s > e) {
+            return Err(Error::InvalidRegion { start, end });
+        }
+        // Public coordinate columns may have been edited after an index was built.
+        set.clear_index();
+        let mut t = FeatureTable::new(kind);
+        for r in 0..set.len() {
+            let chrom = set.seqid_name(set.seqid[r]);
+            let (start, end) = (set.start[r], set.end[r]);
+            let id = format!("{chrom}:{start}-{end}");
+            let name = set.name(r).filter(|n| !n.is_empty()).unwrap_or(id.as_str());
+            t.push(
+                &id,
+                name,
+                chrom,
+                start,
+                end,
+                strand_char(set.strand[r]),
+                (end - start) as u64,
+            );
+        }
+        Ok(FeatureSpace {
+            column: (0..set.len() as u32).collect(),
+            features: Arc::new(t),
+            names: (0..set.seqid_count() as u32)
+                .map(|i| set.seqid_name(i).to_owned())
+                .collect(),
+            set,
+        })
+    }
+
     /// A space over the rows of any interval set: `column[i]` is row `i`'s
     /// column of `features`; `chroms` names the set's seqids.
     pub fn from_set(

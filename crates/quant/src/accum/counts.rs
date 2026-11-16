@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use omicsweave_convert::stage::{Sorter, Spill, read_or_end};
 use omicsweave_core::{Error, Result};
-use omicsweave_gtf::Flank;
+use omicsweave_gtf::{Flank, Selection};
 
 use super::coverage::Tally;
 use super::labeling::{Conversion, Converted, convert};
@@ -223,8 +223,9 @@ pub enum FeatureSource {
 pub struct Counts {
     pub name: String,
     pub features: FeatureSource,
-    /// Only genes of these biotypes (`gene_type` / `gene_biotype`).
-    pub biotypes: Option<Vec<String>>,
+    /// Only the genes (and, for gene features, the transcripts) of this
+    /// subset of the task's annotation.
+    pub subset: Option<Arc<Selection>>,
     pub unit: CountUnit,
     pub rows: RowKey,
     /// Only these row keys, one per line (plain or gzip), rows in this
@@ -251,6 +252,29 @@ pub struct Counts {
 }
 
 impl Counts {
+    /// `features` × reads × input file: records passing [`Filter::new`],
+    /// unstranded, no deduplication, a read overlapping several features
+    /// ambiguous.
+    pub fn new(name: &str, features: FeatureSource) -> Counts {
+        Counts {
+            name: name.into(),
+            features,
+            subset: None,
+            unit: CountUnit::Read,
+            rows: RowKey::File,
+            whitelist: None,
+            umi_tag: *b"UB",
+            dedup: Dedup::None,
+            strand: Strandedness::Unstranded,
+            multi_overlap: false,
+            filter: Filter::new(),
+            max_fragment: 0,
+            table: false,
+            velocity: false,
+            labeled: None,
+        }
+    }
+
     /// Single-cell RNA (STARsolo `Gene`, Cell Ranger): genes × UMIs × `CB`,
     /// the raw matrix over every barcode, `CB` / `UB` used as given,
     /// unique alignments only, forward-stranded (10x 3' and 5').
@@ -258,7 +282,7 @@ impl Counts {
         Counts {
             name: "genes".into(),
             features: FeatureSource::GeneExons,
-            biotypes: None,
+            subset: None,
             unit: CountUnit::Read,
             rows: RowKey::Tag(*b"CB"),
             whitelist: None,
@@ -285,7 +309,7 @@ impl Counts {
         Counts {
             name: "genes".into(),
             features: FeatureSource::GeneExons,
-            biotypes: None,
+            subset: None,
             unit: CountUnit::Read,
             rows: RowKey::File,
             whitelist: None,
@@ -312,7 +336,7 @@ impl Counts {
         Counts {
             name: name.into(),
             features,
-            biotypes: None,
+            subset: None,
             unit: CountUnit::CutSite,
             rows: RowKey::Tag(*b"CB"),
             whitelist: None,
@@ -335,7 +359,7 @@ impl Counts {
         Counts {
             name: "chip".into(),
             features,
-            biotypes: None,
+            subset: None,
             unit: CountUnit::Fragment { tn5: false },
             rows: RowKey::File,
             whitelist: None,
