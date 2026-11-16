@@ -1,0 +1,18 @@
+[package]
+name = "omicsweave-msa"
+description = "Reference-coordinate projection of bigMaf multiple alignments"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-bbi = { path = "../bbi" }
+omicsweave-core = { path = "../core" }
+memchr.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
