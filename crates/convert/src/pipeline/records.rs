@@ -123,11 +123,13 @@ pub(crate) fn run<E: LineEncoder>(ctx: &Context<'_>, spec: Spec<'_, E>) -> Resul
     let mut outputs = Outputs::new();
     let file = outputs.create(spec.dst, spec.format)?;
     let blocks = block_sizing(ctx.budget);
-    let mut writer = Writer::new(
-        BufWriter::with_capacity(WRITE_BUF, file),
-        spec.level,
-        Box::new(ctx.pool.ordered(blocks.limit)),
-    )?;
+    let out = BufWriter::with_capacity(WRITE_BUF, file);
+    let exec: Box<dyn Ordered<Vec<u8>>> = Box::new(ctx.pool.ordered(blocks.limit));
+    let mut writer = if spec.index.is_some() {
+        Writer::new(out, spec.level, exec)?
+    } else {
+        Writer::new_streaming(out, spec.level, exec)?
+    };
     writer.write(&spec.header)?;
     writer.flush_block()?;
     let mut index = spec
@@ -175,15 +177,20 @@ pub(crate) fn run<E: LineEncoder>(ctx: &Context<'_>, spec: Spec<'_, E>) -> Resul
     }
     writer.flush_block()?;
     let end = writer.tell();
-    let done = writer.finish()?;
-    done.out.into_inner().map_err(|e| e.into_error())?;
     if let (Some(ix), Some((kind, _, path))) = (index, &spec.index) {
+        let done = writer.finish()?;
+        done.out.into_inner().map_err(|e| e.into_error())?;
         let bytes = ix.finish(end, &done.blocks)?;
         let format = match kind {
             IndexFormat::Bai => Format::Bai,
             IndexFormat::Csi { .. } => Format::Csi,
         };
         outputs.write(path, format, &bytes)?;
+    } else {
+        writer
+            .finish_streaming()?
+            .into_inner()
+            .map_err(|e| e.into_error())?;
     }
     Ok(Report {
         files: outputs.commit()?,

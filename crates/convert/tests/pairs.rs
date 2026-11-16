@@ -161,6 +161,71 @@ fn budgets() -> Vec<Budget> {
 }
 
 #[test]
+fn leading_whitespace_and_split_scored_first_rows_preserve_contacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let row = Row {
+        names: ("chr1".into(), "chr1".into()),
+        chroms: (Some(0), Some(0)),
+        pos: (1000, 2000),
+        count: 2.5,
+    };
+    let resolutions = [5000];
+    let expected = expected(std::slice::from_ref(&row), &resolutions, "unknown").0;
+    let sizes = sizes_file(dir.path());
+    let text = format!(
+        " \t\r\n#comment\n0 {}chr1 1000 0 16 chr1 2000 1 2.5\n",
+        " ".repeat((1 << 20) + 17)
+    );
+    let options = Options {
+        chrom_sizes: Some(sizes),
+        resolutions: Some(resolutions.to_vec()),
+        ..Options::default()
+    };
+    for storage in STORAGES {
+        let src = dir.path().join("input.short");
+        write_input(&src, text.as_bytes(), storage);
+        for budget in [Budget::new(1, 1 << 28), Budget::new(3, 12 << 20)] {
+            let dst = dir.path().join("output.hic");
+            let report = run(&src, &dst, Format::JuicerShort, &options, budget).unwrap();
+            assert_eq!(report.records, 1);
+            assert_eq!(std::fs::read(&dst).unwrap(), expected);
+        }
+    }
+    let source = format!(
+        " \t\r\n{}",
+        String::from_utf8(pairs_text(
+            std::slice::from_ref(&Row { count: 1.0, ..row }),
+            "unknown"
+        ))
+        .unwrap()
+    );
+    let src = dir.path().join("input.pairs");
+    std::fs::write(&src, source).unwrap();
+    let dst = dir.path().join("pairs.hic");
+    run(
+        &src,
+        &dst,
+        Format::Pairs,
+        &Options {
+            resolutions: Some(resolutions.to_vec()),
+            ..Options::default()
+        },
+        Budget::new(1, 1 << 28),
+    )
+    .unwrap();
+    let integer = Row {
+        names: ("chr1".into(), "chr1".into()),
+        chroms: (Some(0), Some(0)),
+        pos: (1000, 2000),
+        count: 1.0,
+    };
+    assert_eq!(
+        std::fs::read(dst).unwrap(),
+        self::expected(&[integer], &resolutions, "unknown").0
+    );
+}
+
+#[test]
 fn pairs_match_the_builder_in_memory_and_spilled() {
     let dir = tempfile::tempdir().unwrap();
     let mut rng = Rng::new(11);

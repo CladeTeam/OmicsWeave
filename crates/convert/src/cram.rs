@@ -193,11 +193,13 @@ impl CramToBam {
         let mut outputs = Outputs::new();
         let file = outputs.create(&self.dst, Format::Bam)?;
         let blocks = block_sizing(ctx.budget);
-        let mut writer = Writer::new(
-            BufWriter::with_capacity(WRITE_BUF, file),
-            self.level,
-            Box::new(ctx.pool.ordered(blocks.limit)),
-        )?;
+        let out = BufWriter::with_capacity(WRITE_BUF, file);
+        let exec: Box<dyn Ordered<Vec<u8>>> = Box::new(ctx.pool.ordered(blocks.limit));
+        let mut writer = if index.is_some() {
+            Writer::new(out, self.level, exec)?
+        } else {
+            Writer::new_streaming(out, self.level, exec)?
+        };
         writer.write(&bam_header_bytes(sam))?;
         writer.flush_block()?;
         let mut bins = index
@@ -257,15 +259,20 @@ impl CramToBam {
         }
         writer.flush_block()?;
         let end = writer.tell();
-        let done = writer.finish()?;
-        done.out.into_inner().map_err(|e| e.into_error())?;
         if let (Some(ix), Some((kind, _, path))) = (bins, &index) {
+            let done = writer.finish()?;
+            done.out.into_inner().map_err(|e| e.into_error())?;
             let bytes = ix.finish(end, &done.blocks)?;
             let format = match kind {
                 IndexFormat::Bai => Format::Bai,
                 IndexFormat::Csi { .. } => Format::Csi,
             };
             outputs.write(path, format, &bytes)?;
+        } else {
+            writer
+                .finish_streaming()?
+                .into_inner()
+                .map_err(|e| e.into_error())?;
         }
         Ok(Report {
             files: outputs.commit()?,

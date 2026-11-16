@@ -14,7 +14,7 @@
 //! Values are stored as given: a percentage stays 0-100, and nothing is
 //! derived from the counts.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -676,6 +676,42 @@ struct Selected {
     codes: Vec<Vec<u8>>,
 }
 
+/// Common files have only a few modification codes; larger dictionaries
+/// use hashing rather than comparing every row with every known code.
+#[derive(Default)]
+struct Codes<'a> {
+    values: Vec<&'a [u8]>,
+    seen: Option<HashSet<&'a [u8]>>,
+    #[cfg(test)]
+    comparisons: usize,
+}
+
+impl<'a> Codes<'a> {
+    fn insert(&mut self, code: &'a [u8]) {
+        if let Some(seen) = &mut self.seen {
+            if seen.insert(code) {
+                self.values.push(code);
+            }
+            return;
+        }
+        for &value in &self.values {
+            #[cfg(test)]
+            {
+                self.comparisons += 1;
+            }
+            if value == code {
+                return;
+            }
+        }
+        if self.values.len() == 8 {
+            let mut seen: HashSet<_> = self.values.iter().copied().collect();
+            seen.insert(code);
+            self.seen = Some(seen);
+        }
+        self.values.push(code);
+    }
+}
+
 fn parse_selected(batch: &LineBatch, select: &Select) -> Result<Selected> {
     let mut out = Selected {
         dialect: None,
@@ -684,7 +720,7 @@ fn parse_selected(batch: &LineBatch, select: &Select) -> Result<Selected> {
         codes: Vec::new(),
     };
     let mut local: HashMap<&[u8], u32> = HashMap::new();
-    let mut codes: Vec<&[u8]> = Vec::new();
+    let mut codes = Codes::default();
     let mut fields: Vec<&[u8]> = Vec::with_capacity(18);
     for (no, line) in lines(batch) {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -720,9 +756,7 @@ fn parse_selected(batch: &LineBatch, select: &Select) -> Result<Selected> {
             Some(_) => {}
         }
         let code = fields[3];
-        if !codes.contains(&code) {
-            codes.push(code);
-        }
+        codes.insert(code);
         if select.mod_code.as_deref().is_some_and(|m| m != code)
             || select.strand.is_some_and(|s| fields[5] != [s])
         {
@@ -744,7 +778,7 @@ fn parse_selected(batch: &LineBatch, select: &Select) -> Result<Selected> {
             strand: fields[5][0],
         });
     }
-    out.codes = codes.into_iter().map(<[u8]>::to_vec).collect();
+    out.codes = codes.values.into_iter().map(<[u8]>::to_vec).collect();
     Ok(out)
 }
 
@@ -876,5 +910,28 @@ mod tests {
         for v in Value::ALL {
             assert_eq!(Value::from_name(v.name()).unwrap(), v);
         }
+    }
+
+    #[test]
+    fn code_dictionary_preserves_first_occurrence_and_bounds_linear_work() {
+        let names: Vec<_> = (0..16384).map(|i| format!("m{i}")).collect();
+        let mut codes = Codes::default();
+        for name in &names {
+            codes.insert(name.as_bytes());
+        }
+        for name in names.iter().rev() {
+            codes.insert(name.as_bytes());
+        }
+        let expected: Vec<_> = names.iter().map(|n| n.as_bytes()).collect();
+        assert_eq!(codes.values, expected);
+        assert_eq!(codes.comparisons, 36);
+        let mut small = Codes::default();
+        for _ in 0..1000 {
+            for name in &names[..8] {
+                small.insert(name.as_bytes());
+            }
+        }
+        assert_eq!(small.values, &expected[..8]);
+        assert!(small.seen.is_none());
     }
 }

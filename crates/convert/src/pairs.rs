@@ -183,7 +183,8 @@ impl PairsToHic {
         let input = open_text(&self.src, &ctx.pool, s.limit)?;
         let (read, file_len) = (Arc::clone(&input.read), input.file_len);
         let mut text = input.text;
-        let head = read_head(&mut text, self.dialect)?;
+        let head_limit = (ctx.budget.memory / 8).clamp(64 << 10, 8 << 20) as usize;
+        let mut head = read_head(&mut text, self.dialect, head_limit)?;
         let chroms: Vec<(String, u64)> = match &self.chrom_sizes {
             Some(p) => read_chrom_list(p)?
                 .into_iter()
@@ -250,7 +251,12 @@ impl PairsToHic {
             buffer / 2
         };
         let mut fine_sorter: Sorter<'_, Contact> = Sorter::new(&ctx.pool, fine_limit, &tmp);
-        let mut batches = LineBatches::new(text, text_batch(ctx.budget), head.lines + 1);
+        let mut batches = LineBatches::with_prefix(
+            text,
+            text_batch(ctx.budget),
+            head.lines + 1,
+            std::mem::take(&mut head.first_row),
+        );
         let mut exec = ctx.pool.ordered::<Parsed>(s.limit);
         let mut taken = Taken::default();
         while let Some(batch) = batches.next_batch()? {
@@ -392,30 +398,38 @@ struct Head {
     lines: u64,
     /// Short text: the first row has nine fields, the ninth a score.
     scored: bool,
+    /// The first data row, read while telling the short dialect.
+    first_row: Vec<u8>,
 }
 
 /// Reads the `#` and blank lines that open the text, and looks at the first
 /// row.
-fn read_head(text: &mut dyn BufRead, dialect: PairsDialect) -> Result<Head> {
+fn read_head(text: &mut dyn BufRead, dialect: PairsDialect, limit: usize) -> Result<Head> {
     let mut head = Head::default();
     let mut line = Vec::new();
     loop {
-        let buf = text.fill_buf()?;
-        let header = match buf.first() {
-            None => break,
-            Some(b'#') => true,
-            Some(b'\n') => false,
-            Some(b'\r') if buf.get(1) == Some(&b'\n') => false,
-            Some(_) => {
-                if dialect == PairsDialect::Short {
-                    let end = memchr::memchr(b'\n', buf).unwrap_or(buf.len());
-                    head.scored = words(&buf[..end]).count() == 9;
-                }
-                break;
-            }
-        };
         line.clear();
-        text.read_until(b'\n', &mut line)?;
+        if text.take(limit as u64 + 1).read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if line.len() > limit {
+            return Err(Error::invalid(
+                "pairs",
+                format!(
+                    "header or first data line {} exceeds the {limit}-byte probe limit; \
+                     shorten the line or increase memory (the probe is capped at 8 MiB)",
+                    head.lines + 1
+                ),
+            ));
+        }
+        let header = line.first() == Some(&b'#');
+        if !header && !line.iter().all(u8::is_ascii_whitespace) {
+            if dialect == PairsDialect::Short {
+                head.scored = words(&line).count() == 9;
+            }
+            head.first_row = line;
+            break;
+        }
         head.lines += 1;
         if !header || dialect == PairsDialect::Short {
             continue;
@@ -967,6 +981,60 @@ impl Spill for Contact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn header_and_first_row_are_independent_of_reader_boundaries() {
+        let source = b" \t\r\n#chromsize: chr1 1000\r\n#columns: readID chr1 pos1 chr2 pos2\nr\tchr1\t2\tchr1\t5\n";
+        for capacity in [1, 2, 7, 64, 4096] {
+            let mut input = BufReader::with_capacity(capacity, Cursor::new(source));
+            let mut head = read_head(&mut input, PairsDialect::Pairs, 4096).unwrap();
+            assert_eq!(head.chroms, [("chr1".into(), 1000)]);
+            assert_eq!(head.lines, 3);
+            let mut restored = LineBatches::with_prefix(
+                input,
+                16,
+                head.lines + 1,
+                std::mem::take(&mut head.first_row),
+            );
+            let mut rest = Vec::new();
+            while let Some(batch) = restored.next_batch().unwrap() {
+                rest.extend_from_slice(&batch.text);
+            }
+            assert_eq!(rest, b"r\tchr1\t2\tchr1\t5\n");
+        }
+        for ending in ["", "\n", "\r\n"] {
+            let source = format!(
+                " \t\r\n#ignored\n0 {}chr1 2 0 16 chr1 5 1 2.5{ending}",
+                " ".repeat(8192)
+            );
+            for capacity in [1, 7, 1024] {
+                let mut input = BufReader::with_capacity(capacity, Cursor::new(&source));
+                let mut head = read_head(&mut input, PairsDialect::Short, 16384).unwrap();
+                assert!(head.scored);
+                assert_eq!(head.lines, 2);
+                let mut restored = LineBatches::with_prefix(
+                    input,
+                    16,
+                    head.lines + 1,
+                    std::mem::take(&mut head.first_row),
+                );
+                let mut text = Vec::new();
+                while let Some(batch) = restored.next_batch().unwrap() {
+                    text.extend_from_slice(&batch.text);
+                }
+                assert_eq!(text, source.splitn(3, '\n').nth(2).unwrap().as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn first_line_probe_has_a_bounded_extent() {
+        let source = vec![b'#'; 1024];
+        let mut input = Cursor::new(&source);
+        assert!(read_head(&mut input, PairsDialect::Pairs, 63).is_err());
+        assert_eq!(input.position(), 64);
+    }
 
     #[test]
     fn contacts_round_trip_through_run_files() {

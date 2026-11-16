@@ -105,6 +105,30 @@ fn merge_sizing(limit: u64) -> (usize, usize) {
     (fan_in, reader_buf)
 }
 
+/// A generation's run names are determined by its count and merge pass;
+/// retaining one allocated path per spill would grow with the whole input.
+#[derive(Default)]
+struct RunSet {
+    count: usize,
+    pass: Option<usize>,
+    /// A final singleton can keep its name without copying or renaming it.
+    carry: Option<PathBuf>,
+}
+
+impl RunSet {
+    fn path(&self, dir: &Path, index: usize) -> PathBuf {
+        if self.count.checked_sub(1) == Some(index)
+            && let Some(path) = &self.carry
+        {
+            return path.clone();
+        }
+        match self.pass {
+            None => dir.join(format!("run-{index}")),
+            Some(pass) => dir.join(format!("merge-{pass}-{index}")),
+        }
+    }
+}
+
 pub struct Sorter<'p, T: Spill> {
     pool: &'p Pool,
     segments: Vec<Vec<T>>,
@@ -114,7 +138,7 @@ pub struct Sorter<'p, T: Spill> {
     limit: u64,
     parent: PathBuf,
     dir: Option<TempDir>,
-    runs: Vec<PathBuf>,
+    runs: RunSet,
     spilled: u64,
 }
 
@@ -131,7 +155,7 @@ impl<'p, T: Spill> Sorter<'p, T> {
             limit: limit.max(1),
             parent: parent.to_owned(),
             dir: None,
-            runs: Vec::new(),
+            runs: RunSet::default(),
             spilled: 0,
         }
     }
@@ -265,12 +289,10 @@ impl<'p, T: Spill> Sorter<'p, T> {
         if self.dir.is_none() {
             self.dir = Some(TempDir::new(&self.parent)?);
         }
-        let path = self
-            .dir
-            .as_ref()
-            .expect("created above")
-            .path()
-            .join(format!("run-{}", self.runs.len()));
+        let path = self.runs.path(
+            self.dir.as_ref().expect("created above").path(),
+            self.runs.count,
+        );
         let file = File::create(&path).map_err(|e| with_path(e, &path))?;
         let mut w = BufWriter::with_capacity(1 << 20, file);
         let mut buf = Vec::new();
@@ -288,7 +310,7 @@ impl<'p, T: Spill> Sorter<'p, T> {
         )?;
         self.spilled = spilled;
         w.flush()?;
-        self.runs.push(path);
+        self.runs.count += 1;
         Ok(())
     }
 
@@ -297,12 +319,15 @@ impl<'p, T: Spill> Sorter<'p, T> {
         let (fan_in, reader_buf) = merge_sizing(self.limit);
         self.compact_runs(fan_in, reader_buf)?;
         let ranges = Ranges::new(self.pool, self.sorted_ranges()?);
-        if self.runs.is_empty() {
+        if self.runs.count == 0 {
             return Ok(Merge::Ranges(ranges));
         }
-        let mut sources = Vec::with_capacity(self.runs.len() + 1);
-        for path in &self.runs {
-            let f = File::open(path).map_err(|e| with_path(e, path))?;
+        let mut sources = Vec::with_capacity(self.runs.count + 1);
+        for i in 0..self.runs.count {
+            let path = self
+                .runs
+                .path(self.dir.as_ref().expect("runs have a directory").path(), i);
+            let f = File::open(&path).map_err(|e| with_path(e, &path))?;
             sources.push(Source::Run(BufReader::with_capacity(reader_buf, f)));
         }
         sources.push(Source::Ranges(ranges));
@@ -314,19 +339,19 @@ impl<'p, T: Spill> Sorter<'p, T> {
     /// Bound open run files and reader buffers independently of run count.
     fn compact_runs(&mut self, fan_in: usize, reader_buf: usize) -> Result<()> {
         let mut pass = 0;
-        while self.runs.len() > fan_in {
+        while self.runs.count > fan_in {
             let runs = std::mem::take(&mut self.runs);
-            for (group, paths) in runs.chunks(fan_in).enumerate() {
+            self.runs.pass = Some(pass);
+            let dir = self.dir.as_ref().expect("runs have a directory").path();
+            for begin in (0..runs.count).step_by(fan_in) {
+                let end = begin.saturating_add(fan_in).min(runs.count);
+                let mut paths: Vec<_> = (begin..end).map(|i| runs.path(dir, i)).collect();
+                let path = self.runs.path(dir, self.runs.count);
                 if paths.len() == 1 {
-                    self.runs.push(paths[0].clone());
+                    self.runs.carry = paths.pop();
+                    self.runs.count += 1;
                     continue;
                 }
-                let path = self
-                    .dir
-                    .as_ref()
-                    .expect("runs have a directory")
-                    .path()
-                    .join(format!("merge-{pass}-{group}"));
                 let sources = paths
                     .iter()
                     .map(|p| {
@@ -350,10 +375,10 @@ impl<'p, T: Spill> Sorter<'p, T> {
                 out.flush()?;
                 drop(out);
                 drop(merged);
-                for p in paths {
+                for p in &paths {
                     std::fs::remove_file(p).map_err(|e| with_path(e, p))?;
                 }
-                self.runs.push(path);
+                self.runs.count += 1;
             }
             pass += 1;
         }
@@ -687,7 +712,8 @@ mod tests {
         for key in 0..5 {
             sorter.extend(vec![Rec(key, Vec::new())]).unwrap();
         }
-        std::fs::write(&sorter.runs[0], [0]).unwrap();
+        let path = sorter.runs.path(sorter.dir.as_ref().unwrap().path(), 0);
+        std::fs::write(path, [0]).unwrap();
         assert!(sorter.finish().is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         let mut sorter = Sorter::new(&pool, 1, dir.path());

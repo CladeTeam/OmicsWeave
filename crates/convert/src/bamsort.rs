@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use omicsweave_bam::{BAM_MAGIC, Record, Reference, Scanner, flag};
 use omicsweave_bgzf::{BinningIndex, IndexFormat, Writer, try_csi_levels};
@@ -103,7 +105,7 @@ impl BamSort {
         let file = File::open(&self.src).map_err(|e| with_path(e, &self.src))?;
         let file_len = file.metadata()?.len();
         let blocks = block_sizing(ctx.budget);
-        let mut scan = Scanner::new(
+        let mut scan = Scanner::new_streaming(
             BufReader::with_capacity(READ_CHUNK, file),
             Box::new(ctx.pool.ordered(blocks.limit)),
         );
@@ -148,7 +150,7 @@ impl BamSort {
                 let bytes = std::mem::replace(&mut batch, Vec::with_capacity(target));
                 let seq = first;
                 first = records;
-                exec.submit(Box::new(move || parse_batch(&bytes, seq, n_refs)))?;
+                exec.submit(Box::new(move || parse_batch(bytes, seq, n_refs)))?;
                 while let Some(parsed) = exec.next(false)? {
                     sorter.extend(parsed)?;
                 }
@@ -168,11 +170,13 @@ impl BamSort {
         ctx.progress("sort", bytes_read, file_len);
         let mut merged = sorter.finish()?;
 
-        let mut writer = Writer::new(
-            BufWriter::with_capacity(WRITE_BUF, file),
-            self.level,
-            Box::new(ctx.pool.ordered(blocks.limit)),
-        )?;
+        let out = BufWriter::with_capacity(WRITE_BUF, file);
+        let exec: Box<dyn Ordered<Vec<u8>>> = Box::new(ctx.pool.ordered(blocks.limit));
+        let mut writer = if index.is_some() {
+            Writer::new(out, self.level, exec)?
+        } else {
+            Writer::new_streaming(out, self.level, exec)?
+        };
         writer.write(&header_bytes(&text, &out_refs))?;
         writer.flush_block()?;
         let mut ix = index
@@ -180,13 +184,13 @@ impl BamSort {
             .map(|(format, _)| BinningIndex::new(*format, out_refs.len(), writer.tell()));
         let mut n = 0u64;
         while let Some(r) = merged.next_record()? {
-            writer.flush_try(r.data.len())?;
+            writer.flush_try(r.data.bytes().len())?;
             if let Some(ix) = ix.as_mut() {
                 ix.amend_last(writer.tell());
             }
-            writer.write(&r.data)?;
+            writer.write(r.data.bytes())?;
             if let Some(ix) = ix.as_mut() {
-                let d = &r.data[4..];
+                let d = &r.data.bytes()[4..];
                 let flags = (u32_at(d, 12) >> 16) as u16;
                 ix.push(
                     i32_at(d, 0),
@@ -204,15 +208,20 @@ impl BamSort {
         drop(merged);
         writer.flush_block()?;
         let end = writer.tell();
-        let done = writer.finish()?;
-        done.out.into_inner().map_err(|e| e.into_error())?;
         if let (Some(ix), Some((kind, suffix))) = (ix, index) {
+            let done = writer.finish()?;
+            done.out.into_inner().map_err(|e| e.into_error())?;
             let bytes = ix.finish(end, &done.blocks)?;
             let format = match kind {
                 IndexFormat::Bai => Format::Bai,
                 IndexFormat::Csi { .. } => Format::Csi,
             };
             outputs.write(&suffixed(&self.dst, suffix), format, &bytes)?;
+        } else {
+            writer
+                .finish_streaming()?
+                .into_inner()
+                .map_err(|e| e.into_error())?;
         }
         Ok(Report {
             files: outputs.commit()?,
@@ -276,13 +285,48 @@ struct Sorted {
     /// Input order.
     seq: u64,
     end: i64,
-    data: Vec<u8>,
+    data: RecordData,
+}
+
+/// Input batches enter the sorter whole. Sharing their immutable bytes
+/// avoids an allocation and payload copy for every buffered record.
+enum RecordData {
+    Owned(Vec<u8>),
+    Shared(Arc<Vec<u8>>, Range<u32>),
+}
+
+impl RecordData {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes, range) => &bytes[range.start as usize..range.end as usize],
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Owned(bytes) => bytes.capacity(),
+            Self::Shared(bytes, range) => {
+                // All ranges of a batch enter the buffer together. Charge
+                // excess capacity and the Arc allocation once, to its first
+                // row; the full-buffer reservation lasts through spilling.
+                (range.end - range.start) as usize
+                    + if range.start == 0 {
+                        bytes.capacity() - bytes.len()
+                            + size_of::<Vec<u8>>()
+                            + 2 * size_of::<usize>()
+                    } else {
+                        0
+                    }
+            }
+        }
+    }
 }
 
 impl Sorted {
     /// The sort fields of `data`, a record with its `block_size`.
-    fn new(seq: u64, end: i64, data: Vec<u8>) -> Sorted {
-        let d = &data[4..];
+    fn new(seq: u64, end: i64, data: RecordData) -> Sorted {
+        let d = &data.bytes()[4..];
         let flags = (u32_at(d, 12) >> 16) as u16;
         let pos = ((i32_at(d, 4) as i64 + 1) as u64) & (u64::MAX >> 1);
         Sorted {
@@ -301,12 +345,12 @@ impl Spill for Sorted {
         (self.tid, self.pos, self.seq)
     }
     fn mem_size(&self) -> usize {
-        self.data.capacity()
+        self.data.heap_bytes()
     }
     fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.seq.to_le_bytes());
         out.extend_from_slice(&self.end.to_le_bytes());
-        out.extend_from_slice(&self.data);
+        out.extend_from_slice(self.data.bytes());
     }
     fn decode(input: &mut impl Read) -> Result<Option<Sorted>> {
         let mut h = [0u8; 20];
@@ -319,7 +363,7 @@ impl Spill for Sorted {
         let mut data = vec![0u8; 4 + size];
         data[..4].copy_from_slice(&h[16..]);
         input.read_exact(&mut data[4..])?;
-        Ok(Some(Sorted::new(seq, end, data)))
+        Ok(Some(Sorted::new(seq, end, RecordData::Owned(data))))
     }
 }
 
@@ -344,22 +388,53 @@ fn reg2bin(beg: i64, end: i64) -> u16 {
 /// Checks the records of `bytes` (each after its `block_size`) as
 /// `sam_read1` checks them, sets the `bin` it recomputes, and gives them
 /// input numbers from `first` on.
-fn parse_batch(bytes: &[u8], first: u64, n_refs: usize) -> Result<Vec<Sorted>> {
-    let mut out = Vec::new();
+fn parse_batch(mut bytes: Vec<u8>, first: u64, n_refs: usize) -> Result<Vec<Sorted>> {
+    if bytes.len() > u32::MAX as usize {
+        return Err(Error::Unsupported("BAM sort batch exceeds 4 GiB"));
+    }
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if 4 + u32_at(&bytes, 0) as usize == bytes.len() {
+        let (_, end) = prepare_record(&mut bytes, 0, n_refs)?;
+        bytes.shrink_to_fit();
+        return Ok(vec![Sorted::new(first, end, RecordData::Owned(bytes))]);
+    }
+    let mut ends = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
-        let size = u32_at(bytes, at) as usize;
-        let total = 4 + size;
-        let rec = Record::parse(&bytes[at + 4..at + total], n_refs)?;
-        let mut data = bytes[at..at + total].to_vec();
-        if u32_at(&data, 16) & 0xffff != 0 {
-            let bin = reg2bin(rec.pos as i64, rec.end());
-            data[14..16].copy_from_slice(&bin.to_le_bytes());
-        }
-        out.push(Sorted::new(first + out.len() as u64, rec.end(), data));
+        let (total, end) = prepare_record(&mut bytes, at, n_refs)?;
+        ends.push(end);
+        at += total;
+    }
+    bytes.shrink_to_fit();
+    let bytes = Arc::new(bytes);
+    let mut out = Vec::with_capacity(ends.len());
+    at = 0;
+    for end in ends {
+        let total = 4 + u32_at(&bytes, at) as usize;
+        out.push(Sorted::new(
+            first + out.len() as u64,
+            end,
+            RecordData::Shared(Arc::clone(&bytes), at as u32..(at + total) as u32),
+        ));
         at += total;
     }
     Ok(out)
+}
+
+fn prepare_record(bytes: &mut [u8], at: usize, n_refs: usize) -> Result<(usize, i64)> {
+    let total = 4 + u32_at(bytes, at) as usize;
+    let (end, bin) = {
+        let rec = Record::parse(&bytes[at + 4..at + total], n_refs)?;
+        let bin =
+            (u32_at(bytes, at + 16) & 0xffff != 0).then(|| reg2bin(rec.pos as i64, rec.end()));
+        (rec.end(), bin)
+    };
+    if let Some(bin) = bin {
+        bytes[at + 14..at + 16].copy_from_slice(&bin.to_le_bytes());
+    }
+    Ok((total, end))
 }
 
 fn header_error(detail: impl Into<String>) -> Error {
@@ -624,21 +699,27 @@ fn sorted_header(text: &[u8], refs: &[Reference]) -> Result<(Vec<u8>, Vec<OutRef
         }
     }
     // Lines for references without one, after the last @SQ line.
-    let mut after = order.iter().rposition(|l| l.kind == *b"SQ");
+    let at = order
+        .iter()
+        .rposition(|l| l.kind == *b"SQ")
+        .map_or(order.len(), |i| i + 1);
+    let mut missing = Vec::new();
     for r in all.iter().filter(|r| r.line.is_none()) {
         if r.name.is_empty() {
             return Err(header_error("a reference has an empty name"));
         }
-        let line = Line {
+        missing.push(Line {
             kind: *b"SQ",
             tags: vec![
                 [&b"SN:"[..], &r.name].concat(),
                 format!("LN:{}", r.len).into_bytes(),
             ],
-        };
-        let at = after.map_or(order.len(), |a| a + 1);
-        order.insert(at, line);
-        after = Some(at);
+        });
+    }
+    if !missing.is_empty() {
+        // Move the trailing non-SQ lines once, independently of the number
+        // of synthesized references.
+        order.splice(at..at, missing);
     }
     match order.first_mut().filter(|l| l.kind == *b"HD") {
         Some(hd) => {
@@ -739,6 +820,36 @@ mod tests {
     }
 
     #[test]
+    fn many_missing_references_keep_the_trailing_header_order() {
+        let references: Vec<_> = (0..4096)
+            .map(|i| Reference {
+                name: format!("r{i}"),
+                len: 5,
+            })
+            .collect();
+        let mut source = b"@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:r0\tLN:5\n".to_vec();
+        let mut tail = Vec::new();
+        for i in 0..8192 {
+            tail.extend_from_slice(format!("@RG\tID:g{i}\n").as_bytes());
+        }
+        source.extend_from_slice(&tail);
+        let (actual, out_refs) = sorted_header(&source, &references).unwrap();
+        let mut expected = b"@HD\tVN:1.6\tSO:coordinate\n".to_vec();
+        for reference in &references {
+            expected.extend_from_slice(format!("@SQ\tSN:{}\tLN:5\n", reference.name).as_bytes());
+        }
+        expected.extend_from_slice(&tail);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            out_refs,
+            references
+                .iter()
+                .map(|r| (r.name.as_bytes().to_vec(), r.len))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn malformed_headers_fail_as_in_htslib() {
         for bad in [
             &b"@SQ\tSN:a\n"[..],
@@ -763,5 +874,77 @@ mod tests {
         assert_eq!(reg2bin(0, 1 << 14), 4681);
         assert_eq!(reg2bin(0, (1 << 14) + 1), 585);
         assert_eq!(reg2bin(0, 1 << 29), 0);
+    }
+
+    #[test]
+    fn batches_share_checked_payload_and_charge_its_full_capacity() {
+        let mut bytes = Vec::with_capacity(16384);
+        for i in 0..32 {
+            let mut record = vec![0; 32];
+            record[4..8].copy_from_slice(&(i % 11i32).to_le_bytes());
+            record[8..12].copy_from_slice(&(0xbeef_1e02u32).to_le_bytes());
+            record[12..16].copy_from_slice(&(1u32 | (((i & 1) * 16) as u32) << 16).to_le_bytes());
+            record[16..20].copy_from_slice(&1u32.to_le_bytes());
+            record[20..28].fill(255);
+            record.extend_from_slice(b"r\0");
+            record.extend_from_slice(&16u32.to_le_bytes());
+            record.extend_from_slice(&[0x10, 30]);
+            bytes.extend_from_slice(&(record.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&record);
+        }
+        let records = parse_batch(bytes, 7, 1).unwrap();
+        assert_eq!(records.len(), 32);
+        let RecordData::Shared(first, _) = &records[0].data else {
+            panic!("a parsed batch shares its input");
+        };
+        let expected_heap = first.capacity() + size_of::<Vec<u8>>() + 2 * size_of::<usize>();
+        assert_eq!(
+            records.iter().map(Spill::mem_size).sum::<usize>(),
+            expected_heap
+        );
+        let one = parse_batch(records[0].data.bytes().to_vec(), 100, 1).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].seq, 100);
+        assert_eq!(one[0].end, records[0].end);
+        assert_eq!(one[0].data.bytes(), records[0].data.bytes());
+        assert!(parse_batch(Vec::new(), 0, 0).unwrap().is_empty());
+        let mut expected = Vec::new();
+        for (i, row) in records.iter().enumerate() {
+            let RecordData::Shared(owner, _) = &row.data else {
+                panic!("a parsed batch shares its input");
+            };
+            assert!(Arc::ptr_eq(first, owner));
+            let d = row.data.bytes();
+            let rec = Record::parse(&d[4..], 1).unwrap();
+            assert_eq!(row.seq, 7 + i as u64);
+            assert_eq!(row.end, i as i64 % 11 + 1);
+            assert_eq!(
+                u16::from_le_bytes(d[14..16].try_into().unwrap()),
+                reg2bin(rec.pos as i64, rec.end())
+            );
+            let mut encoded = Vec::new();
+            row.encode(&mut encoded);
+            let restored = Sorted::decode(&mut encoded.as_slice()).unwrap().unwrap();
+            assert_eq!(restored.key(), row.key());
+            assert_eq!(restored.end, row.end);
+            assert_eq!(restored.data.bytes(), d);
+            expected.push((row.key(), row.end, d.to_vec()));
+        }
+        expected.sort_unstable_by_key(|row| row.0);
+        let dir = tempfile::tempdir().unwrap();
+        let pool = omicsweave_core::exec::Pool::new(1);
+        let mut sorter = Sorter::new(&pool, 256, dir.path());
+        sorter.extend(records).unwrap();
+        assert!(sorter.spilled() > 0);
+        let mut merged = sorter.finish().unwrap();
+        for (key, end, data) in expected {
+            let row = merged.next_record().unwrap().unwrap();
+            assert_eq!(row.key(), key);
+            assert_eq!(row.end, end);
+            assert_eq!(row.data.bytes(), data);
+        }
+        assert!(merged.next_record().unwrap().is_none());
+        drop(merged);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

@@ -196,10 +196,21 @@ pub struct LineBatches<R> {
 
 impl<R: BufRead> LineBatches<R> {
     pub fn new(input: R, target: usize, first_line: u64) -> LineBatches<R> {
+        Self::with_prefix(input, target, first_line, Vec::new())
+    }
+
+    /// Starts with bytes already read while inspecting the header. They
+    /// become the first batch's owned buffer, without a replay copy.
+    pub fn with_prefix(
+        input: R,
+        target: usize,
+        first_line: u64,
+        prefix: Vec<u8>,
+    ) -> LineBatches<R> {
         LineBatches {
             input,
             target: target.max(1),
-            carry: Vec::new(),
+            carry: prefix,
             next_line: first_line,
             done: false,
         }
