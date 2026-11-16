@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Formatting and workflow checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Check Python formatting and lint
+        run: |
+          uvx --from ruff==0.17.4 ruff check src .github/scripts
+          uvx --from ruff==0.17.4 ruff format --check src .github/scripts
+      - name: Check Rust formatting
+        run: |
+          rustup component add rustfmt
+          cargo fmt --all -- --check
+      - name: Check workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v1.7.12 --repo rhysd/actionlint \
+            --pattern actionlint_1.7.12_linux_amd64.tar.gz \
+            --pattern actionlint_1.7.12_checksums.txt --dir "$RUNNER_TEMP/actionlint"
+          cd "$RUNNER_TEMP/actionlint"
+          sha256sum --check --ignore-missing actionlint_1.7.12_checksums.txt
+          tar -xzf actionlint_1.7.12_linux_amd64.tar.gz actionlint
+          cd "$GITHUB_WORKSPACE"
+          "$RUNNER_TEMP/actionlint/actionlint" -color
+      - name: Check package versions
+        run: uv run --no-project --python 3.12 .github/scripts/check-release.py
+
+  rust:
+    name: Rust (${{ matrix.toolchain }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ['1.89.0', stable]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y cmake pkg-config libbz2-dev liblzma-dev zlib1g-dev
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: rust-${{ matrix.toolchain }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Check all targets at the minimum supported Rust version
+        if: matrix.toolchain != 'stable'
+        run: cargo check --workspace --all-targets --locked
+      - name: Clippy
+        if: matrix.toolchain == 'stable'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Rust tests and reference-tool comparisons
+        if: matrix.toolchain == 'stable'
+        run: cargo test --workspace --locked
+
+  distributions:
+    name: Distributions
+    uses: ./.github/workflows/wheels.yml
+
+  complete:
+    name: CI passed
+    if: always()
+    needs: [lint, rust, distributions]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require all checks
+        env:
+          RESULTS: ${{ join(needs.*.result, ',') }}
+        run: |
+          test "$RESULTS" = success,success,success

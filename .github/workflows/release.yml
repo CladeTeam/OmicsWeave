@@ -1,0 +1,63 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Validate release version
+    if: github.repository == 'CladeTeam/OmicsWeave' && !github.event.release.prerelease
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Match the release tag to both manifests
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: python .github/scripts/check-release.py --tag "$RELEASE_TAG"
+
+  checks:
+    name: Release checks
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Upload verified distributions
+    needs: [version, checks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/omicsweave/
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sdist
+          path: dist
+      - name: Require the complete distribution set
+        run: |
+          test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 4
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          attestations: false
