@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="OmicsWeave logo" width="160">
+<img src="https://raw.githubusercontent.com/CladeTeam/OmicsWeave/main/assets/logo.svg" alt="OmicsWeave logo" width="160">
 
 # OmicsWeave
 
@@ -10,9 +10,9 @@
 [![PyPI](https://img.shields.io/pypi/v/omicsweave.svg)](https://pypi.org/project/omicsweave/)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://pypi.org/project/omicsweave/)
 [![Platform](https://img.shields.io/badge/platform-linux%20x86__64%20%7C%20aarch64-lightgrey.svg)](#installation)
-[![Engine](https://img.shields.io/badge/engine-Rust-orange.svg)](crates)
+[![Engine](https://img.shields.io/badge/engine-Rust-orange.svg)](https://github.com/CladeTeam/OmicsWeave/tree/main/crates)
 
-[Quick start](#quick-start) · [Support matrix](#support-matrix) · [Documentation](#documentation) · [Examples](examples)
+[Quick start](#quick-start) · [Support matrix](#support-matrix) · [Documentation](#documentation) · [Examples](https://github.com/CladeTeam/OmicsWeave/tree/main/examples)
 
 </div>
 
@@ -78,29 +78,29 @@ ow quant cells.bam -o results --gtf genes.gtf --genes single-cell --velocity --m
 
 | Data | Format | Read by region | Convert from it | Convert into it | Write from Python | Index | In `ow quant` |
 |---|---|:---:|---|---|---|---|---|
-| **Sequence** | [FASTA](docs/formats/fasta.md) | ✅ bases | bgzip FASTA, 2bit | — | `FastaWriter` | `.fai` | reference |
-| | [bgzip FASTA](docs/formats/fasta.md) | ✅ bases | bgzip FASTA, 2bit | from FASTA | `FastaWriter` | `.fai` + `.gzi` | reference |
-| | [gzip FASTA](docs/formats/fasta.md) | ➜ | bgzip FASTA, 2bit | — | — | — | — |
-| | [2bit](docs/formats/2bit.md) | ✅ bases, soft mask | — | from FASTA | `TwoBitWriter` | built in | reference |
-| **Signal** | [bigWig](docs/formats/bigwig.md) | ✅ per base, bins, runs | — | from bedGraph, wig, bedMethyl | `BigWigWriter` | built in | output: coverage, methylation |
-| | [bedGraph](docs/formats/bedgraph.md) | ➜ | bigWig, bigBed | — | — | — | — |
-| | [wig](docs/formats/wig.md) | ➜ | bigWig | — | — | — | — |
-| **Intervals** | [bigBed](docs/formats/bigbed.md) | ✅ overlapping records | — | from BED, bedGraph, bedMethyl | `BigBedWriter` | built in | peaks as features |
-| | [BED](docs/formats/bed.md) | ➜ | bigBed | — | — | — | — |
-| | [bedMethyl](docs/formats/bedmethyl.md) | ➜ | bigBed (all columns), bigWig (one column) | — | — | — | — |
-| **Alignments** | [BAM](docs/formats/bam.md) | ✅ records, chosen fields | coordinate-sorted BAM | from SAM, CRAM, BAM | — | `.bai` / `.csi` | **input** |
-| | [CRAM 3.0 / 3.1](docs/formats/cram.md) | ✅ records, chosen fields | BAM | — | — | `.crai` | ➜ BAM |
-| | [SAM](docs/formats/sam.md) | ➜ | BAM | — | — | — | ➜ BAM |
-| **Variants** | [BCF](docs/formats/bcf.md) | ✅ genotypes, INFO / FORMAT, filters, consensus | — | from VCF | — | `.csi` | known sites, allele sites |
-| | [VCF](docs/formats/vcf.md) | ➜ | BCF | — | — | — | ➜ BCF |
-| **Contacts** | [.hic v8 / v9](docs/formats/hic.md) | ✅ dense tiles, pixels | — | from cool, mcool, pairs, Juicer short | `HicWriter`, `HicBuilder` | built in | output |
-| | [cool](docs/formats/cool.md) / [mcool](docs/formats/mcool.md) | ➜ | .hic | — | — | — | — |
-| | [4DN pairs](docs/formats/pairs.md) | ➜ | .hic | — | — | — | output |
-| | [Juicer short](docs/formats/juicer-short.md) | ➜ | .hic | — | — | — | — |
-| **Annotation** | [GTF](docs/formats/gtf.md) / [GFF3](docs/formats/gff3.md) | ✅ loaded in memory | — | — | `write_gtf`, `write_bed12` | not needed | genes, promoters, gene activity, ... |
-| **Loader metadata** | [Sidecar](docs/formats/sidecar.md) | — | — | — | `sidecar=True` on writers | — | — |
+| **Sequence** | [FASTA](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/fasta.md) | ✅ bases | bgzip FASTA, 2bit | — | `FastaWriter` | `.fai` | reference |
+| | [bgzip FASTA](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/fasta.md) | ✅ bases | bgzip FASTA, 2bit | from FASTA | `FastaWriter` | `.fai` + `.gzi` | reference |
+| | [gzip FASTA](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/fasta.md) | ➜ | bgzip FASTA, 2bit | — | — | — | — |
+| | [2bit](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/2bit.md) | ✅ bases, soft mask | — | from FASTA | `TwoBitWriter` | built in | reference |
+| **Signal** | [bigWig](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/bigwig.md) | ✅ per base, bins, runs | — | from bedGraph, wig, bedMethyl | `BigWigWriter` | built in | output: coverage, methylation |
+| | [bedGraph](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/bedgraph.md) | ➜ | bigWig, bigBed | — | — | — | — |
+| | [wig](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/wig.md) | ➜ | bigWig | — | — | — | — |
+| **Intervals** | [bigBed](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/bigbed.md) | ✅ overlapping records | — | from BED, bedGraph, bedMethyl | `BigBedWriter` | built in | peaks as features |
+| | [BED](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/bed.md) | ➜ | bigBed | — | — | — | — |
+| | [bedMethyl](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/bedmethyl.md) | ➜ | bigBed (all columns), bigWig (one column) | — | — | — | — |
+| **Alignments** | [BAM](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/bam.md) | ✅ records, chosen fields | coordinate-sorted BAM | from SAM, CRAM, BAM | — | `.bai` / `.csi` | **input** |
+| | [CRAM 3.0 / 3.1](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/cram.md) | ✅ records, chosen fields | BAM | — | — | `.crai` | ➜ BAM |
+| | [SAM](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/sam.md) | ➜ | BAM | — | — | — | ➜ BAM |
+| **Variants** | [BCF](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/bcf.md) | ✅ genotypes, INFO / FORMAT, filters, consensus | — | from VCF | — | `.csi` | known sites, allele sites |
+| | [VCF](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/vcf.md) | ➜ | BCF | — | — | — | ➜ BCF |
+| **Contacts** | [.hic v8 / v9](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/hic.md) | ✅ dense tiles, pixels | — | from cool, mcool, pairs, Juicer short | `HicWriter`, `HicBuilder` | built in | output |
+| | [cool](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/cool.md) / [mcool](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/mcool.md) | ➜ | .hic | — | — | — | — |
+| | [4DN pairs](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/pairs.md) | ➜ | .hic | — | — | — | output |
+| | [Juicer short](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/juicer-short.md) | ➜ | .hic | — | — | — | — |
+| **Annotation** | [GTF](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/gtf.md) / [GFF3](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/gff3.md) | ✅ loaded in memory | — | — | `write_gtf`, `write_bed12` | not needed | genes, promoters, gene activity, ... |
+| **Loader metadata** | [Sidecar](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/sidecar.md) | — | — | — | `sidecar=True` on writers | — | — |
 
-Indexes are never built behind your back: call `build_index()` on the format object, or pass `--index` to `ow convert`. See the [format overview](docs/formats/README.md) for coordinates, compression and indexes across formats.
+Indexes are never built behind your back: call `build_index()` on the format object, or pass `--index` to `ow convert`. See the [format overview](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/README.md) for coordinates, compression and indexes across formats.
 
 ### Query results at a glance
 
@@ -147,11 +147,11 @@ This installs the `omicsweave` package and the `ow` command. NumPy is the only r
 
 | Guide | What it covers |
 |---|---|
-| [Query by region](docs/query.md) | keys, readers, result shapes, strands, caching, concurrency, DataLoader use |
-| [Convert formats](docs/convert.md) | supported routes, indexes, sorting, resource budgets, dry runs |
-| [Quantify alignments](docs/quant.md) | products, counting rules, matrix storage, assay-specific options |
-| [Format guides](docs/formats/README.md) | every format: what it stores, how it is laid out, how OmicsWeave supports it |
-| [Examples](examples) | PyTorch data loaders for sequence-to-function and multi-modal models |
+| [Query by region](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/query.md) | keys, readers, result shapes, strands, caching, concurrency, DataLoader use |
+| [Convert formats](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/convert.md) | supported routes, indexes, sorting, resource budgets, dry runs |
+| [Quantify alignments](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/quant.md) | products, counting rules, matrix storage, assay-specific options |
+| [Format guides](https://github.com/CladeTeam/OmicsWeave/blob/main/docs/formats/README.md) | every format: what it stores, how it is laid out, how OmicsWeave supports it |
+| [Examples](https://github.com/CladeTeam/OmicsWeave/tree/main/examples) | PyTorch data loaders for sequence-to-function and multi-modal models |
 
 The guides are written in Chinese.
 

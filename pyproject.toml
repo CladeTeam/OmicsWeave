@@ -12,6 +12,11 @@ dependencies = [
     "numpy>=1.26.0",
 ]
 
+[project.urls]
+Repository = "https://github.com/CladeTeam/OmicsWeave"
+Documentation = "https://github.com/CladeTeam/OmicsWeave/tree/main/docs"
+Issues = "https://github.com/CladeTeam/OmicsWeave/issues"
+
 [project.scripts]
 ow = "omicsweave.cli.app:main"
 
