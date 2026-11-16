@@ -2,6 +2,7 @@
 
 use omicsweave_core::{Error, Result};
 
+use crate::fields::{FormatField, Typed};
 use crate::header::{Header, VCF44, ValueType};
 use crate::record::{
     GT_MISSING_VALUE, GT_VECTOR_END, Record, SpanFields, has_gvcf_allele, has_svlen_allele, rlen,
@@ -170,20 +171,18 @@ pub(crate) fn parse_record(
     indiv: &[u8],
     rec: &mut Record,
 ) -> Result<()> {
-    parse_record_fields(h, fixed, shared, indiv, rec, true)
+    parse_record_fields::<true>(h, fixed, shared, indiv, rec).map(|_| ())
 }
 
-/// Indexed genotype matrices consume selected typed sample rows directly,
-/// avoiding a second, all-sample widened GT staging buffer. Public records
-/// still unpack the complete genotype vector.
-pub(crate) fn parse_record_fields(
+/// Matrix queries borrow the validated GT encoding and materialize only the
+/// selected rows. Complete records own every field and normalize GT phasing.
+pub(crate) fn parse_record_fields<'a, const UNPACK_FIELDS: bool>(
     h: &Header,
     fixed: &Fixed,
     shared: &[u8],
-    indiv: &[u8],
+    indiv: &'a [u8],
     rec: &mut Record,
-    unpack_genotypes: bool,
-) -> Result<()> {
+) -> Result<Option<FormatField<'a>>> {
     rec.clear();
     if fixed.rid < 0
         || fixed.rid as usize >= h.contigs.len()
@@ -234,7 +233,10 @@ pub(crate) fn parse_record_fields(
         for value in bytes.chunks_exact(width(ty)?) {
             match int_at(ty, value) {
                 Int::Value(id) => {
-                    rec.data.filters.push(checked_key(h, id)? as i32);
+                    let key = checked_key(h, id)?;
+                    if UNPACK_FIELDS {
+                        rec.data.filters.push(key as i32);
+                    }
                 }
                 _ => return Err(bad("missing FILTER id")),
             }
@@ -254,7 +256,9 @@ pub(crate) fn parse_record_fields(
     for _ in 0..fixed.n_info {
         let key = checked_key(h, c.int()?)?;
         let (ty, n, bytes) = c.vector()?;
-        rec.data.push_info(key, ty, n, bytes);
+        if UNPACK_FIELDS {
+            rec.data.push_info(key, ty, n, bytes);
+        }
         if Some(key) == end_id && !end_seen {
             end_seen = true;
             if n == 1 && matches!(ty, INT8 | INT16 | INT32 | INT64) {
@@ -282,6 +286,11 @@ pub(crate) fn parse_record_fields(
         )));
     }
     let gt_name = h.key_id("GT");
+    let gt_id = gt_name.filter(|&id| {
+        h.key(id)
+            .is_some_and(|key| key.format == Some(ValueType::String))
+    });
+    let mut borrowed_gt = None;
     let mut c = Cursor { buf: indiv, at: 0 };
     for _ in 0..n_fmt {
         let key = checked_key(h, c.int()?)?;
@@ -307,22 +316,29 @@ pub(crate) fn parse_record_fields(
                 Err(())
             });
         }
-        let start = rec.data.fmt_bytes.len();
-        rec.data.push_format(key, ty, n, bytes);
-        if Some(key) == gt_name && h.version < VCF44 && n > 0 {
-            update_phasing(&mut rec.data.fmt_bytes[start..], n, w.max(1));
+        if UNPACK_FIELDS {
+            let start = rec.data.fmt_bytes.len();
+            rec.data.push_format(key, ty, n, bytes);
+            if Some(key) == gt_name && h.version < VCF44 && n > 0 {
+                update_phasing(&mut rec.data.fmt_bytes[start..], n, w.max(1));
+            }
+        } else if Some(key) == gt_id && borrowed_gt.is_none() {
+            if !matches!(ty, INT8 | INT16 | INT32) {
+                return Err(bad("GT is not an integer vector"));
+            }
+            borrowed_gt = Some(FormatField {
+                key,
+                n,
+                values: Typed { ty, bytes },
+            });
         }
     }
-    let gt_id = gt_name.filter(|&id| {
-        h.key(id)
-            .is_some_and(|key| key.format == Some(ValueType::String))
-    });
     if let Some(gt) = gt_id.and_then(|id| rec.data.fmt.iter().find(|s| s.key == id).copied()) {
         if !matches!(gt.ty, INT8 | INT16 | INT32) {
             return Err(bad("GT is not an integer vector"));
         }
-        if unpack_genotypes {
-            let (out, data) = rec.gt_and_data(gt.n as usize);
+        if UNPACK_FIELDS {
+            let (out, data) = rec.gt_and_data(gt.n as usize, gt.ty);
             let bytes = &data.fmt_bytes[gt.start..gt.end];
             decode_gt(gt.ty, gt.n as usize, bytes, n_sample, out);
         }
@@ -333,7 +349,7 @@ pub(crate) fn parse_record_fields(
     if repair_span {
         rec.rlen = rlen(rec.pos, span_alleles.as_ref().unwrap(), &spans)?;
     }
-    Ok(())
+    Ok(borrowed_gt)
 }
 
 /// htslib reads genotypes of files before VCF 4.4 with the first allele's
@@ -405,4 +421,73 @@ pub(crate) fn span_values(ty: u8, bytes: &[u8]) -> std::result::Result<Vec<Optio
         .chunks_exact(width(ty).map_err(|_| ())?)
         .map(|b| span_int(ty, b))
         .collect())
+}
+
+#[cfg(test)]
+mod selected_tests {
+    use super::*;
+    use crate::{BcfEncoder, BcfScratch};
+
+    #[test]
+    fn selected_view_borrows_gt_and_preserves_repaired_end_svlen_and_len_spans() {
+        let header = Header::from_vcf_text(
+            b"##fileformat=VCFv4.5\n\
+            ##contig=<ID=chr1,length=100000>\n\
+            ##INFO=<ID=END,Number=1,Type=Integer>\n\
+            ##INFO=<ID=SVLEN,Number=A,Type=Integer>\n\
+            ##FORMAT=<ID=GT,Number=1,Type=String>\n\
+            ##FORMAT=<ID=LEN,Number=1,Type=Integer>\n\
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts0\ts1\n",
+        )
+        .unwrap();
+        let encoder = BcfEncoder::new(&header);
+        let mut scratch = BcfScratch::default();
+        for (line, span) in [
+            (
+                b"chr1\t10\tv\tA\tC\t.\tPASS\tEND=25\tGT:LEN\t0|1:3\t1:7".as_slice(),
+                16,
+            ),
+            (
+                b"chr1\t10\tv\tA\t<DEL>\t.\tPASS\tEND=11;SVLEN=100\tGT:LEN\t0|1:3\t1:7",
+                101,
+            ),
+            (
+                b"chr1\t10\tv\tA\t<NON_REF>\t.\tPASS\tEND=11\tGT:LEN\t0|1:3\t1:70",
+                70,
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            encoder
+                .encode_line(&mut scratch, line, 1, &mut bytes)
+                .unwrap();
+            let l_shared = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            let mut fixed = Fixed::parse(bytes[8..32].try_into().unwrap());
+            fixed.rlen = -1;
+            let shared = &bytes[32..8 + l_shared];
+            let indiv = &bytes[8 + l_shared..];
+            let (mut full, mut selected) = (Record::default(), Record::default());
+            parse_record(&header, &fixed, shared, indiv, &mut full).unwrap();
+            let gt = parse_record_fields::<false>(&header, &fixed, shared, indiv, &mut selected)
+                .unwrap()
+                .unwrap();
+            assert_eq!(full.rlen, span);
+            assert_eq!(
+                (selected.pos, selected.rlen, selected.end),
+                (full.pos, full.rlen, full.end)
+            );
+            assert_eq!(
+                selected.alleles().collect::<Vec<_>>(),
+                full.alleles().collect::<Vec<_>>()
+            );
+            assert_eq!(selected.id(), full.id());
+            assert_eq!(gt, full.format_field(header.key_id("GT").unwrap()).unwrap());
+            assert!(gt.values.bytes.as_ptr() >= indiv.as_ptr());
+            assert!(gt.values.bytes.as_ptr_range().end <= indiv.as_ptr_range().end);
+            assert_eq!(selected.data.info_bytes.capacity(), 0);
+            assert_eq!(selected.data.fmt_bytes.capacity(), 0);
+            assert_eq!(selected.data.info.capacity(), 0);
+            assert_eq!(selected.data.fmt.capacity(), 0);
+            assert!(selected.genotypes().is_none());
+        }
+    }
 }

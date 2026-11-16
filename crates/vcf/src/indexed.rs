@@ -9,8 +9,8 @@ use omicsweave_core::cache::{BlockCache, BlockKey, SourceToken};
 use omicsweave_core::{Error, FileSource, ReadAt, Region, Result};
 
 use crate::bcf::{Fixed, parse_record_fields};
-use crate::fields::{FormatField, Value};
-use crate::header::{Header, ValueType};
+use crate::fields::{FormatField, Typed, Value, type_width};
+use crate::header::{Header, VCF44};
 use crate::record::{GT_MISSING_VALUE, GT_VECTOR_END, Record, gt_allele, gt_is_phased};
 
 /// A BCF file and its CSI index. Opening reads the header; each query reads
@@ -143,22 +143,28 @@ impl<S: ReadAt> BcfReader<S> {
     /// records htslib's `bcf_itr_queryi` iterator returns. The span is the
     /// stored `rlen`, as htslib's iterator reads it; `rec.rlen` holds the
     /// span htslib decodes. Reading stops at the first record of another
-    /// contig or starting at or after the region's end.
+    /// contig or starting at or after the region's end. `rec` is cleared
+    /// on an error or when the query yields no records.
     pub fn visit(
         &mut self,
         region: Region<'_>,
         rec: &mut Record,
         visit: impl FnMut(&Record) -> Result<()>,
     ) -> Result<()> {
-        self.visit_fields(region, rec, true, visit)
+        rec.clear();
+        let mut visit = visit;
+        let result = self.visit_fields::<true>(region, rec, |rec, _| visit(rec));
+        if result.is_err() {
+            rec.clear();
+        }
+        result
     }
 
-    fn visit_fields(
+    fn visit_fields<const UNPACK_FIELDS: bool>(
         &mut self,
         region: Region<'_>,
         rec: &mut Record,
-        unpack_genotypes: bool,
-        mut visit: impl FnMut(&Record) -> Result<()>,
+        mut visit: impl FnMut(&Record, Option<FormatField<'_>>) -> Result<()>,
     ) -> Result<()> {
         self.stream.reset_query();
         region.check()?;
@@ -204,8 +210,8 @@ impl<S: ReadAt> BcfReader<S> {
             }
             if pos + fixed.rlen as i64 > beg && end > pos {
                 let (shared, indiv) = body[24..].split_at(l_shared - 24);
-                parse_record_fields(header, &fixed, shared, indiv, rec, unpack_genotypes)?;
-                visit(rec)?;
+                let gt = parse_record_fields::<UNPACK_FIELDS>(header, &fixed, shared, indiv, rec)?;
+                visit(rec, gt)?;
             }
         }
         Ok(())
@@ -223,13 +229,9 @@ impl<S: ReadAt> BcfReader<S> {
         }
         let mut builder = Builder::new(samples);
         let mut rec = Record::default();
-        let gt_key = self.header.key_id("GT").filter(|&id| {
-            self.header
-                .key(id)
-                .is_some_and(|key| key.format == Some(ValueType::String))
-        });
-        self.visit_fields(region, &mut rec, false, |rec| {
-            builder.push(rec, gt_key.and_then(|id| rec.format_field(id)))
+        let update_phase = self.header.version < VCF44;
+        self.visit_fields::<false>(region, &mut rec, |rec, gt| {
+            builder.push(rec, gt, update_phase)
         })?;
         builder.finish()
     }
@@ -354,7 +356,12 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn push(&mut self, rec: &Record, gt: Option<FormatField<'_>>) -> Result<()> {
+    fn push(
+        &mut self,
+        rec: &Record,
+        gt: Option<FormatField<'_>>,
+        update_phase: bool,
+    ) -> Result<()> {
         let m = &mut self.m;
         m.start.push(rec.pos);
         m.end.push(
@@ -384,6 +391,33 @@ impl<'a> Builder<'a> {
         m.ploidy = m.ploidy.max(width);
         for &s in self.samples {
             let values = gts.sample(s);
+            // Pre-4.4 normalization changes the first stored byte, including
+            // sentinels; apply it before interpreting that selected value.
+            let first = if update_phase && width > 0 && values.bytes[0] & 1 == 0 {
+                let w = type_width(values.ty);
+                let phase = if width == 1 {
+                    u8::from(values.bytes[0] != 0)
+                } else {
+                    values
+                        .bytes
+                        .chunks_exact(w)
+                        .skip(1)
+                        .fold(1, |all, v| all & v[0])
+                        & 1
+                };
+                let mut bytes = [0; 4];
+                bytes[..w].copy_from_slice(&values.bytes[..w]);
+                bytes[0] |= phase;
+                Some(
+                    Typed {
+                        ty: values.ty,
+                        bytes: &bytes[..w],
+                    }
+                    .value(0),
+                )
+            } else {
+                None
+            };
             let mut alleles = 0;
             let mut first_phased = false;
             let mut rest_phased = true;
@@ -392,7 +426,7 @@ impl<'a> Builder<'a> {
                 let v = if ended {
                     GT_VECTOR_END
                 } else {
-                    match values.value(j) {
+                    match first.filter(|_| j == 0).unwrap_or_else(|| values.value(j)) {
                         Value::Missing => GT_MISSING_VALUE,
                         Value::VectorEnd => {
                             ended = true;

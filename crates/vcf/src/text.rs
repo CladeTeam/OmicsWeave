@@ -599,7 +599,7 @@ fn parse_format<D: Dictionary>(
     if !D::STRICT && h.has_gt_field() {
         let gt_id = h.key_id("GT");
         if let Some(gt) = gt_id.and_then(|id| rec.data.fmt.iter().find(|s| s.key == id).copied()) {
-            let (out, data) = rec.gt_and_data(gt.n as usize);
+            let (out, data) = rec.gt_and_data(gt.n as usize, gt.ty);
             let bytes = &data.fmt_bytes[gt.start..gt.end];
             if gt.ty == BT_NULL {
                 out.clear();

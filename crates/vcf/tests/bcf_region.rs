@@ -499,14 +499,18 @@ fn file_context_clone_zero_budget_and_empty_dependencies_are_safe() {
 }
 
 fn typed_gt_fixture(ty: u8) -> Fixture {
+    typed_gt_fixture_layout(ty, "4.4", 3)
+}
+
+fn typed_gt_fixture_layout(ty: u8, version: &str, ploidy: usize) -> Fixture {
     use omicsweave_bgzf::Writer;
     use omicsweave_core::exec::Inline;
     use omicsweave_vcf::{Header, bcf_header_bytes};
 
-    let mut text = "##fileformat=VCFv4.4\n##contig=<ID=chr1,length=2000000>\n\
+    let mut text = "##fileformat=VCFvVERSION\n##contig=<ID=chr1,length=2000000>\n\
         ##FORMAT=<ID=GT,Number=1,Type=String>\n\
         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT"
-        .to_owned();
+        .replace("VERSION", version);
     for i in 0..SAMPLES {
         text.push_str(&format!("\ts{i}"));
     }
@@ -522,7 +526,7 @@ fn typed_gt_fixture(ty: u8) -> Fixture {
     shared.extend_from_slice(&3u16.to_le_bytes());
     shared.extend_from_slice(&((1u32 << 24) | SAMPLES as u32).to_le_bytes());
     shared.extend_from_slice(&[0x17, b'.', 0x17, b'A', 0x17, b'C', 0x17, b'G', 0]);
-    let mut indiv = vec![0x11, key as u8, 0x30 | ty];
+    let mut indiv = vec![0x11, key as u8, ((ploidy as u8) << 4) | ty];
     for row in [
         [2, 5, VECTOR_END],
         [MISSING, 2, 7],
@@ -531,7 +535,7 @@ fn typed_gt_fixture(ty: u8) -> Fixture {
         [0, 1, VECTOR_END],
         [7, 4, 3],
     ] {
-        for value in row {
+        for value in row.into_iter().take(ploidy) {
             match ty {
                 1 => indiv.push(match value {
                     MISSING => i8::MIN as u8,
@@ -580,17 +584,28 @@ fn typed_gt_fixture(ty: u8) -> Fixture {
 
 #[test]
 fn selected_genotypes_match_all_typed_widths_sentinels_and_duplicate_samples() {
-    for ty in [1, 2, 3] {
-        let fixture = typed_gt_fixture(ty);
+    for (version, ty, ploidy) in ["4.2", "4.4"].into_iter().flat_map(|v| {
+        [1, 2, 3]
+            .into_iter()
+            .flat_map(move |ty| [1, 2, 3].map(|p| (v, ty, p)))
+    }) {
+        let fixture = typed_gt_fixture_layout(ty, version, ploidy);
         let mut reader = open(&fixture);
         let wanted = htslib_query(&fixture, "chr1", 0, 1000);
         assert_eq!(wanted.len(), 1);
         assert_eq!(ours_query(&mut reader, "chr1", 0, 1000), wanted);
+        let mut record = Record::default();
+        reader
+            .visit(Region::new("chr1", 0, 1000), &mut record, |rec| {
+                assert_eq!(rec.genotype_type(), Some(ty));
+                Ok(())
+            })
+            .unwrap();
         let samples = [5, 0, 2, 0];
         let matrix = reader
             .genotypes(Region::new("chr1", 0, 1000), &samples)
             .unwrap();
-        assert_eq!(matrix.ploidy, 3);
+        assert_eq!(matrix.ploidy, ploidy);
         let (width, gt) = wanted[0].gt.as_ref().unwrap();
         for (i, &sample) in samples.iter().enumerate() {
             let row = &gt[sample * width..(sample + 1) * width];
@@ -679,5 +694,40 @@ fn invalid_csi_and_oversized_record_lengths_fail_without_trusting_allocations() 
     assert!(
         matches!(error, Error::Invalid { .. } | Error::Truncated { .. }),
         "{error:?}"
+    );
+}
+
+#[test]
+fn visit_clears_record_on_empty_queries_and_failed_callbacks() {
+    let fixture = typed_gt_fixture(1);
+    let mut reader = open(&fixture);
+    let mut rec = Record::default();
+    let region = Region::new("chr1", 0, 1000);
+    reader.visit(region, &mut rec, |_| Ok(())).unwrap();
+    assert!(rec.n_alleles() > 0);
+    reader
+        .visit(Region::new("chr1", 1, 1), &mut rec, |_| {
+            panic!("empty query")
+        })
+        .unwrap();
+    assert_eq!(rec, Record::default());
+    reader.visit(region, &mut rec, |_| Ok(())).unwrap();
+    assert!(
+        reader
+            .visit(region, &mut rec, |_| Err(Error::invalid(
+                "callback", "stop"
+            )))
+            .is_err()
+    );
+    assert_eq!(rec, Record::default());
+    assert!(
+        reader
+            .visit(Region::new("missing", 0, 1), &mut rec, |_| Ok(()))
+            .is_err()
+    );
+    assert_eq!(rec, Record::default());
+    assert_eq!(
+        ours_query(&mut reader, "chr1", 0, 1000),
+        htslib_query(&fixture, "chr1", 0, 1000)
     );
 }

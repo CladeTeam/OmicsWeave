@@ -209,7 +209,8 @@ pub enum GetError {
     WrongType,
     /// -3: the record does not have the tag.
     Absent,
-    /// A stored type htslib's FORMAT getter does not handle (it exits).
+    /// A stored type htslib's FORMAT getter does not handle (it exits), or
+    /// a header/record sample-count mismatch with no initialized C result.
     Unsupported,
 }
 
@@ -461,7 +462,11 @@ impl Record {
         if declared != Some(expected) {
             return Err(GetError::WrongType);
         }
-        self.format_field(id).ok_or(GetError::Absent)
+        let field = self.format_field(id).ok_or(GetError::Absent)?;
+        if h.samples.len() != self.n_sample() {
+            return Err(GetError::Unsupported);
+        }
+        Ok(field)
     }
 
     /// `bcf_get_format_char` (`BCF_HT_STR`): the raw bytes of all samples,
@@ -495,10 +500,10 @@ impl Record {
         } else {
             (INT32_MISSING as u32, INT32_VECTOR_END as u32)
         };
-        let nsmpl = h.samples.len();
+        let nsmpl = self.n_sample();
         let stored_missing = missing_of(f.values.ty);
         let stored_end = vector_end_of(f.values.ty);
-        for s in 0..nsmpl.min(self.n_sample()) {
+        for s in 0..nsmpl {
             let row = f.sample(s);
             let mut j = 0;
             for raw in numeric_values(row.ty, row.bytes) {

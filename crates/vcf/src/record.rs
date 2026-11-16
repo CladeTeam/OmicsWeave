@@ -37,6 +37,7 @@ pub struct Record {
     /// Genotype values, `gt_width` per sample; empty without genotypes.
     gt: Vec<i32>,
     gt_width: usize,
+    gt_type: Option<u8>,
     has_gt: bool,
     /// ID, QUAL, FILTER and all INFO and FORMAT values (see `fields`).
     pub(crate) data: crate::fields::RecordData,
@@ -84,6 +85,7 @@ impl Record {
         self.allele_ends.clear();
         self.gt.clear();
         self.gt_width = 0;
+        self.gt_type = None;
         self.has_gt = false;
         self.data.clear();
     }
@@ -98,9 +100,11 @@ impl Record {
     pub(crate) fn gt_and_data(
         &mut self,
         width: usize,
+        ty: u8,
     ) -> (&mut Vec<i32>, &crate::fields::RecordData) {
         self.has_gt = true;
         self.gt_width = width;
+        self.gt_type = Some(ty);
         (&mut self.gt, &self.data)
     }
 
@@ -124,6 +128,13 @@ impl Record {
             values: &self.gt,
             width: self.gt_width,
         })
+    }
+
+    /// The GT field's stored BCF integer type (`BT_INT8`, `BT_INT16` or
+    /// `BT_INT32`), when genotypes are present. Text VCF records report the
+    /// typed encoding produced while parsing, including its chosen width.
+    pub fn genotype_type(&self) -> Option<u8> {
+        self.gt_type
     }
 
     /// The union of the alternate alleles' types, restricted to the bits

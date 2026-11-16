@@ -342,3 +342,39 @@ fn dictionary_kind_completion_matches_htslib() {
         text,
     );
 }
+
+#[test]
+fn format_getters_reject_mismatched_header_sample_counts() {
+    let text = b"##fileformat=VCFv4.4\n##contig=<ID=chr1>\n\
+        ##FORMAT=<ID=GT,Number=1,Type=String>\n\
+        ##FORMAT=<ID=DP,Number=1,Type=Integer>\n\
+        ##FORMAT=<ID=S,Number=1,Type=String>\n\
+        #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts0\ts1\n\
+        chr1\t1\t.\tA\tC\t.\t.\t.\tGT:DP:S\t0|1:5:a\t1:7:bc\n";
+    let mut reader = VariantReader::new(&text[..]).unwrap();
+    let mut rec = Record::default();
+    assert!(reader.read(&mut rec).unwrap());
+    let good = reader.header().clone();
+    let mut ints = Vec::new();
+    assert_eq!(rec.genotype_values(&good, &mut ints).unwrap(), ints.len());
+    for samples in [
+        vec!["s0".to_owned()],
+        vec!["s0".to_owned(), "s1".to_owned(), "s2".to_owned()],
+    ] {
+        let mut mismatched = good.clone();
+        mismatched.samples = samples;
+        assert_eq!(
+            rec.genotype_values(&mismatched, &mut ints),
+            Err(GetError::Unsupported)
+        );
+        assert!(ints.is_empty());
+        assert_eq!(
+            rec.format_int32(&mismatched, "DP", &mut ints),
+            Err(GetError::Unsupported)
+        );
+        assert_eq!(
+            rec.format_char(&mismatched, "S", &mut Vec::new()),
+            Err(GetError::Unsupported)
+        );
+    }
+}
