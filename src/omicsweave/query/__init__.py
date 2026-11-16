@@ -5,16 +5,18 @@
 - :class:`TrackReader`: bigWig -> :class:`~omicsweave.types.Signal`,
   :class:`~omicsweave.types.SignalBins`, :class:`~omicsweave.types.SignalIntervals`;
   :class:`StrandedTrackReader` reads a plus / minus pair by the key's strand
-- :class:`IntervalReader`: bigBed, BED -> :class:`~omicsweave.types.Intervals`
+- :class:`IntervalReader`: bigBed -> :class:`~omicsweave.types.Intervals`
 - :class:`ContactReader`: ``.hic`` -> :class:`~omicsweave.types.ContactMatrix`,
   :class:`~omicsweave.types.ContactPixels`
-- :class:`ConsensusReader`: VCF/BCF over a reference ->
+- :class:`ConsensusReader`: BCF (+ CSI) over a reference ->
   :class:`~omicsweave.types.ConsensusSequence`, :class:`~omicsweave.types.ConsensusBatch`
 - :class:`AlignmentReader`: BAM (+ BAI / CSI) -> :class:`~omicsweave.types.Alignments`
 - :class:`VariantReader`: BCF (+ CSI) -> :class:`~omicsweave.types.Genotypes`
 
 Each takes a :mod:`omicsweave.formats` file, or a path whose format is
-detected; :func:`open` picks the reader for a file. Dense reads (bases,
+detected; :func:`open` picks the reader for a file. Text formats (BED,
+signal text, VCF, SAM, ...) are not read by region: :func:`open` refuses
+them, naming the ``ow convert`` command that makes them readable. Dense reads (bases,
 signal, bins, contact tiles) take a :data:`~omicsweave.types.Locus` and run
 5' to 3' of its strand; sparse reads take a region and keep genomic order.
 """
