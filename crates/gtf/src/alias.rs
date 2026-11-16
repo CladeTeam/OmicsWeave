@@ -55,6 +55,11 @@ impl Aliases {
         Ok(a)
     }
 
+    /// Every `(from, to)` pair, in no particular order.
+    pub fn pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.to.iter().map(|(a, b)| (a.as_str(), b.as_str()))
+    }
+
     /// The name `name` is read as.
     pub fn rename<'a>(&'a self, name: &'a str) -> &'a str {
         self.to.get(name).map_or(name, String::as_str)

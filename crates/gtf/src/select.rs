@@ -12,6 +12,36 @@ pub struct Selection {
     pub transcripts: Vec<u32>,
 }
 
+impl Selection {
+    /// Checks ascending, distinct rows of `ann` and each transcript's gene.
+    pub fn check(&self, ann: &Annotation) -> omicsweave_core::Result<()> {
+        let ok = |v: &[u32], n: usize| {
+            v.windows(2).all(|w| w[0] < w[1]) && v.iter().all(|&x| (x as usize) < n)
+        };
+        if !ok(&self.genes, ann.genes().len()) || !ok(&self.transcripts, ann.transcripts().len()) {
+            return Err(omicsweave_core::Error::invalid(
+                "selection",
+                "rows must be ascending, distinct and rows of the annotation",
+            ));
+        }
+        // Transcript rows are grouped by ascending gene, so both lists advance once.
+        let mut genes = self.genes.iter().copied().peekable();
+        for &tx in &self.transcripts {
+            let parent = ann.transcripts().gene[tx as usize];
+            while genes.peek().is_some_and(|&gene| gene < parent) {
+                genes.next();
+            }
+            if genes.peek() != Some(&parent) {
+                return Err(omicsweave_core::Error::invalid(
+                    "selection",
+                    "every selected transcript's gene must also be selected",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Filters for [`Annotation::select`]; filters combine with "and", values
 /// within one filter with "or".
 #[derive(Debug, Clone, Default)]
@@ -143,5 +173,56 @@ impl Annotation {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ReadOptions;
+
+    #[test]
+    fn selections_require_valid_rows_and_their_transcripts_parents() {
+        let ann = Annotation::parse(
+            b"c\t.\texon\t1\t5\t.\t+\t.\tgene_id \"a\"; transcript_id \"a1\";\n\
+              c\t.\texon\t20\t25\t.\t+\t.\tgene_id \"b\"; transcript_id \"b1\";\n",
+            &ReadOptions {
+                threads: 1,
+                ..ReadOptions::default()
+            },
+        )
+        .unwrap();
+        ann.select(&Select::new()).check(&ann).unwrap();
+        for selection in [
+            Selection {
+                genes: vec![1],
+                transcripts: vec![0],
+            },
+            Selection {
+                genes: vec![],
+                transcripts: vec![0],
+            },
+            Selection {
+                genes: vec![0, 0],
+                transcripts: vec![],
+            },
+            Selection {
+                genes: vec![2],
+                transcripts: vec![],
+            },
+            Selection {
+                genes: vec![0],
+                transcripts: vec![2],
+            },
+        ] {
+            assert!(selection.check(&ann).is_err());
+        }
+        Selection {
+            genes: vec![0, 1],
+            transcripts: vec![1],
+        }
+        .check(&ann)
+        .unwrap();
+        Selection::default().check(&ann).unwrap();
     }
 }
