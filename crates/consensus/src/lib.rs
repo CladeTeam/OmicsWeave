@@ -5,8 +5,10 @@
 //! ([`omicsweave_vcf::BcfReader`]). Loading a region reads its reference,
 //! through any [`omicsweave_core::SequenceRead`], and decodes the records
 //! it takes, each once; it then builds sequences of it, one per query: a
-//! sample's haplotype, IUPAC codes of samples, or every ALT. Loading once
-//! and querying many samples or haplotypes is the batch path. Every
+//! sample's haplotype, IUPAC codes of samples, or every ALT, each applying
+//! all the records it chooses; or one record with one of its ALTs, the
+//! others left out, for scoring that variant alone. Loading once and
+//! querying many samples, haplotypes or records is the batch path. Every
 //! `bcftools consensus` option applies: haplotypes (`-H`), IUPAC codes
 //! (`-I`), missing and absent characters (`-M`, `-a`), masks (`-m`,
 //! `--mask-with`), marks (`--mark-*`), chains (`-c`), `--regions-overlap`
@@ -22,7 +24,7 @@ mod mask;
 mod records;
 mod select;
 
-pub use consensus::{Alleles, Consensus, ConsensusOptions, Mark};
+pub use consensus::{Alleles, Consensus, ConsensusOptions, LoadedRecord, Mark};
 pub use mask::{Mask, MaskWith};
 pub use records::{Overlap, RecordFilter};
 pub use select::is_haplotype;

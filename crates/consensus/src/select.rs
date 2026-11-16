@@ -72,6 +72,9 @@ pub(crate) enum Mode {
         haplotype: Haplotype,
         iupac: bool,
     },
+    /// One record of the loaded region with one of its ALTs; the query
+    /// leaves every other record out.
+    Single { index: usize, alt: usize },
 }
 
 /// The choice for one record.
@@ -126,6 +129,7 @@ pub(crate) fn choose(
     let allele = |i: usize| records.allele(site, i);
     let ialt = match mode {
         Mode::AllAlt => 1,
+        Mode::Single { alt, .. } => *alt as i64,
         Mode::IupacRefAlt if n_allele > 1 => {
             iupac::mix_ref_alt(n_allele, allele, &mut scratch.allele);
             return Ok(Choice::Allele(1));

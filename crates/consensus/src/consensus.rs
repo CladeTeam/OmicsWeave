@@ -14,7 +14,7 @@ use omicsweave_vcf::{BcfReader, Filter, Header, Record};
 use crate::chain::Chain;
 use crate::edit::{Edit, Marks};
 use crate::mask::Mask;
-use crate::records::{Overlap, RecordFilter, Records};
+use crate::records::{Overlap, RecordFilter, Records, Site};
 use crate::select::{Haplotype, Mode, Scratch, choose};
 
 /// IUPAC selection is a union: inspect each sample only once per record,
@@ -88,7 +88,13 @@ pub enum Mark {
     Char(u8),
 }
 
-/// Which alleles a sequence takes (`-s`, `-H`).
+/// Which alleles a sequence takes. The first three are `bcftools
+/// consensus` selections (`-s`, `-H`) and apply every record of the loaded
+/// region they choose an allele for: one genome's view of the region. The
+/// last two apply one record and leave every other out: one variant's
+/// effect on the region, as variant effect prediction scores it. A single
+/// record takes its ALT as written ([`ConsensusOptions::iupac_codes`] does
+/// not apply), and a masked record is left out as in every selection.
 #[derive(Debug, Clone, Copy)]
 pub enum Alleles<'a> {
     /// The first ALT of every record, samples ignored (`-s -`); IUPAC codes
@@ -99,6 +105,60 @@ pub enum Alleles<'a> {
     /// One haplotype of one sample: `-s x -H` with `1`, `2`, ..., `R`, `A`,
     /// `LR`, `LA`, `SR`, `SA`, `I` or `<N>pIu`.
     Haplotype { sample: &'a str, haplotype: &'a str },
+    /// Record `index` of the loaded region, counted in the order
+    /// [`Consensus::records`] lists them, with its ALT `alt` (1 is the
+    /// first ALT).
+    Record { index: usize, alt: usize },
+    /// The record of the loaded region at 0-based `start` whose REF is
+    /// `reference` and one of whose ALTs is `alt`, compared ignoring ASCII
+    /// case; the first in file order when several match. An error when
+    /// none does.
+    Variant {
+        start: i64,
+        reference: &'a [u8],
+        alt: &'a [u8],
+    },
+}
+
+/// One record a loaded region takes, from [`Consensus::records`].
+pub struct LoadedRecord<'a> {
+    records: &'a Records,
+    site: &'a Site,
+    /// Left out by the mask.
+    pub masked: bool,
+}
+
+impl<'a> LoadedRecord<'a> {
+    /// 0-based position of the first REF base.
+    pub fn start(&self) -> i64 {
+        self.site.pos
+    }
+
+    /// The reference span: REF, or INFO/END for a block.
+    pub fn len(&self) -> i64 {
+        self.site.rlen
+    }
+
+    /// Whether the record spans no reference base.
+    pub fn is_empty(&self) -> bool {
+        self.site.rlen == 0
+    }
+
+    /// REF and the ALTs.
+    pub fn n_alleles(&self) -> usize {
+        self.site.n_allele as usize
+    }
+
+    /// Allele `i`: 0 is REF, 1 the first ALT.
+    ///
+    /// Panics when `i` is outside this record's alleles.
+    pub fn allele(&self, i: usize) -> &'a [u8] {
+        assert!(
+            i < self.n_alleles(),
+            "allele index outside the loaded record"
+        );
+        self.records.allele(self.site, i)
+    }
 }
 
 /// What every context of one variant file shares: sample lookup and the
@@ -299,6 +359,72 @@ impl<S: ReadAt> Consensus<S> {
         })
     }
 
+    /// The records the loaded region takes, in file order: the order
+    /// [`Alleles::Record`] counts them in.
+    pub fn records(&self) -> Result<impl ExactSizeIterator<Item = LoadedRecord<'_>>> {
+        let loaded = self.loaded()?;
+        Ok(loaded
+            .records
+            .sites
+            .iter()
+            .zip(&loaded.masked)
+            .map(|(site, &masked)| LoadedRecord {
+                records: &loaded.records,
+                site,
+                masked,
+            }))
+    }
+
+    fn loaded(&self) -> Result<&Loaded> {
+        self.loaded
+            .as_ref()
+            .ok_or_else(|| Error::invalid("consensus", "query before load"))
+    }
+
+    /// The single-record mode of record `index` with ALT `alt`.
+    fn single(&self, index: usize, alt: usize) -> Result<Mode> {
+        let sites = &self.loaded()?.records.sites;
+        let site = sites.get(index).ok_or_else(|| {
+            Error::invalid(
+                "consensus",
+                format!("no record {index}: the region takes {}", sites.len()),
+            )
+        })?;
+        if alt == 0 || alt >= site.n_allele as usize {
+            return Err(Error::invalid(
+                "consensus",
+                format!(
+                    "record {index} has no ALT {alt}: ALTs are numbered 1 to {}",
+                    site.n_allele.saturating_sub(1)
+                ),
+            ));
+        }
+        Ok(Mode::Single { index, alt })
+    }
+
+    /// The single-record mode of the first record at `start` with these
+    /// REF and ALT.
+    fn find(&self, start: i64, reference: &[u8], alt: &[u8]) -> Result<Mode> {
+        let records = &self.loaded()?.records;
+        for (index, site) in records.sites.iter().enumerate() {
+            if site.pos != start || !records.allele(site, 0).eq_ignore_ascii_case(reference) {
+                continue;
+            }
+            let n = site.n_allele as usize;
+            if let Some(alt) = (1..n).find(|&i| records.allele(site, i).eq_ignore_ascii_case(alt)) {
+                return Ok(Mode::Single { index, alt });
+            }
+        }
+        Err(Error::invalid(
+            "consensus",
+            format!(
+                "no record at 0-based {start} with REF {} and ALT {} in the region",
+                String::from_utf8_lossy(reference),
+                String::from_utf8_lossy(alt)
+            ),
+        ))
+    }
+
     fn mode(&self, alleles: Alleles<'_>) -> Result<Mode> {
         let sample = |name: &str| {
             self.sample_index(name)
@@ -319,6 +445,12 @@ impl<S: ReadAt> Consensus<S> {
                 })?,
                 iupac: self.options.iupac_codes,
             },
+            Alleles::Record { index, alt } => self.single(index, alt)?,
+            Alleles::Variant {
+                start,
+                reference,
+                alt,
+            } => self.find(start, reference, alt)?,
         })
     }
 
@@ -353,8 +485,17 @@ impl<S: ReadAt> Consensus<S> {
         if let Some(chain) = &mut chain {
             chain.reset(loaded.start, loaded.reference.len() as i64);
         }
+        let range = match &mode {
+            Mode::Single { index, .. } => *index..index + 1,
+            _ => 0..records.sites.len(),
+        };
         let mut edit = Edit::new(&loaded.reference, loaded.start, std::mem::take(seq));
-        for (site, &masked) in records.sites.iter().zip(&loaded.masked) {
+        // Single-record mode touches only its selected record. Other records
+        // establish no reference claim, including with absent-base filling.
+        for (site, &masked) in records.sites[range.clone()]
+            .iter()
+            .zip(&loaded.masked[range])
+        {
             if let Some(e) = records.error(site) {
                 *seq = edit.abandon();
                 return Err(e.clone());
