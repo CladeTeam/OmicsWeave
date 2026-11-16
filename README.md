@@ -25,6 +25,9 @@ thin, typed layer over it.
   with indexes, streaming and in parallel; the output does not depend on
   the thread count.
 
+See the [documentation](docs/README.md) for installation, query, conversion,
+annotation and quantification guides, and [scripts/](scripts/README.md) for benchmarks.
+
 ## Install
 
 OmicsWeave builds from source and needs Python 3.12+, a Rust toolchain
@@ -239,7 +242,9 @@ with AlignmentReader("reads.cram", reference=genome) as reads:  # finds .crai be
 ```
 
 Records come as htslib decodes them, MD and NM generated where it
-generates them, and each slice's reference is checked against its MD5.
+generates them, and each slice's reference is checked against its MD5
+(`verify_checksums=False`, `decode_md=False` and `name_prefix=` change
+that, as htslib's options do).
 Only the blocks a query needs are decompressed: fixed fields, CIGARs,
 names and qualities read without a reference (`AlignmentReader("reads.cram")`);
 CRAMs with an embedded reference or none need no reference at all.
@@ -247,18 +252,28 @@ CRAMs with an embedded reference or none need no reference at all.
 ### Genotypes
 
 ```python
+from omicsweave.formats import Bcf
 from omicsweave.query import VariantReader
 
 ow.convert.run("cohort.vcf.gz", "cohort.bcf", index=True)  # once: BCF + .csi
+Bcf("other.bcf").build_index()  # a sorted BCF from elsewhere: .csi, as bcftools index
 
 with VariantReader("cohort.bcf") as cohort:  # finds cohort.bcf.csi
     g = cohort.genotypes(region, ["NA12878", "NA12891"])  # default: every sample
     g.start, g.end, g.ref.to_list(), g.alt.to_list()  # one entry per record
     g.gt  # int8 [records, samples, ploidy]: allele index, -1 missing, -2 absent
     g.phased  # bool [records, samples]
+
+    v = cohort.fetch(region, info=["DP", "AF"], format=["AD"], include="QUAL>30")
+    v.genotypes.gt, v.qual, v.filters.to_list()  # the records the expression keeps
+    v.info["AF"]  # float32 [records, width]; v.format["AD"]: int32 [records, samples, width]
 ```
 
-The records of a region are those htslib's `bcf_itr_queryi` returns. VCF
+The records of a region are those htslib's `bcf_itr_queryi` returns.
+`genotypes` decodes only the fixed fields and `GT`; `fetch` also decodes
+QUAL, FILTER and the INFO / FORMAT fields asked for, in their declared
+types, padded to the widest record with htslib's missing and vector-end
+values, and filters with bcftools expressions (`include` / `exclude`). VCF
 text is not read by region: it is converted to BCF first.
 
 ### Personal sequences
@@ -271,7 +286,7 @@ memory. VCF text is converted to BCF first.
 from omicsweave.query import ConsensusOptions, ConsensusReader
 from omicsweave.types import Haplotype, Samples
 
-with ConsensusReader("cohort.bcf", genome, ConsensusOptions(include="QUAL>20")) as cohort:
+with ConsensusReader("cohort.bcf", genome, options=ConsensusOptions(include="QUAL>20")) as cohort:
     cohort.fetch(region, Haplotype("NA12878", "1")).text
     cohort.fetch(region.with_strand("-"), Haplotype("NA12878", "1"))  # reverse complement
     cohort.fetch(region, Samples(["NA12878", "NA12891"]))  # IUPAC codes
@@ -289,7 +304,7 @@ complement (IUPAC codes complemented); chains stay on the forward strand.
 plain, gzip or BGZF, whole and in parallel, into columnar tables.
 
 ```python
-from omicsweave.annotation import Annotation
+from omicsweave.annotation import Annotation, read_aliases
 
 ann = Annotation.read("gencode.v44.annotation.gtf.gz")  # attributes="all" | [keys] | None
 ann.genes.id, ann.genes.start, ann.transcripts.gene  # numpy / StringVector columns
@@ -302,6 +317,9 @@ ann.introns(coding), ann.junctions(), ann.exon_bins(aggregate=True)
 ann.promoters(2000, 200, chrom_lengths=lengths)      # IntervalSet, owner = transcript
 ann.gene_bodies(upstream=2000)                       # Signac-style gene activity
 ann.match_chroms(bam_reference_names)                # chr1 <-> 1, chrM <-> MT
+ann.exonic_regions().overlaps(region, mode="within")  # also "overlaps", "containing"
+ann.others.type.to_list()                            # GFF3 regions and other records
+read_aliases("chromAlias.txt")                       # {"1": "chr1", ...} for aliases=
 ann.write_gtf("copy.gtf")                            # byte-identical for GTF + all attributes
 ```
 
@@ -313,12 +331,15 @@ overlap index; `IntervalSet.from_arrays` builds one from peaks or bins.
 ## Writing
 
 ```python
-from omicsweave.formats import BigBedSchema, BigBedWriter, BigWigWriter, FastaWriter
+from omicsweave.formats import BigBedSchema, BigBedWriter, BigWigWriter, FastaWriter, TwoBitWriter
 
 with FastaWriter("out.fa.gz") as fasta:  # bgzip; saves .fai and .gzi
     fasta.add("chr1", "ACGT...")
 
-with BigWigWriter("out.bw", {"chr1": 248_956_422}) as bw:
+with TwoBitWriter("out.2bit", ["chr1"]) as twobit:  # names first, then each in order
+    twobit.add("chr1", "ACGTNNacgt")  # N and lowercase runs become blocks
+
+with BigWigWriter("out.bw", {"chr1": 248_956_422}, threads=8) as bw:  # compress on 8 workers
     bw.add("chr1", starts, ends, values)  # columns or scalars
 
 with BigBedWriter("out.bb", chroms, BigBedSchema(field_count=6)) as bb:
@@ -326,8 +347,11 @@ with BigBedWriter("out.bb", chroms, BigBedSchema(field_count=6)) as bb:
 ```
 
 `HicWriter` writes binned maps and `HicBuilder` bins contact pairs at
-every resolution, as Juicer's `pre` does. Writers finish on leaving the
-`with` block and return the companion files they wrote.
+every resolution, as Juicer's `pre` does; `blocks=HicBlocks(...)` sets the
+bins per block. Writers compress on the calling thread unless given
+`threads`; the file is the same either way. They finish on leaving the
+`with` block and return the companion files they wrote;
+`read_sidecar(path)` reads back what a sidecar records of a file.
 
 ## Converting
 
@@ -386,10 +410,15 @@ The same from Python:
 ```python
 report = ow.convert.run("cohort.vcf.gz", "cohort.bcf", index=True, threads=16, memory="8G")
 report.target, report.companions  # Bcf('cohort.bcf'), (Csi('cohort.bcf.csi'),)
-ow.convert.plan("hg38.fa.gz", "hg38.2bit", memory="1G").memory
+plan = ow.convert.plan("hg38.fa.gz", "hg38.2bit", memory="1G")  # every option checked
+plan.memory, plan.budget  # nothing read yet
+plan.run()
 ow.convert.run("pileup.bed", "5hmC.bw", mod="h", value="coverage")
 ow.convert.run("k562.pairs.gz", "k562.hic").warnings  # also issued as ConvertWarning
 ```
+
+`threads` defaults to every core the process may run on (CPU affinity and
+cgroup limits included), `memory` to 4 GiB.
 
 Sorts that outgrow the memory budget spill to disk beside the target (or
 to `tmp_dir`); the output is the same either way.
@@ -457,15 +486,19 @@ from omicsweave.annotation import Annotation
 task = quant.Task(
     ["possorted.bam"],
     "out",
-    [quant.Coverage(strands="split", library=1), quant.Genes("single-cell"), quant.Atac(peaks="peaks.bb")],
+    [
+        quant.Coverage(strands="split", strand="forward"),
+        quant.Counts.rna_single_cell(),  # presets: rna_bulk, atac, chip
+        quant.Atac(peaks="peaks.bb"),
+    ],
     annotation=Annotation.read("genes.gtf", attributes=None),
 )
 splicing = quant.Task(
     ["possorted.bam"],
     "splicing",
     [
-        quant.Genes("single-cell", velocity=True, labeled=quant.Labeled(min_conversions=2)),
-        quant.Junctions(matrix=quant.JunctionMatrix()),
+        quant.Counts.rna_single_cell(velocity=True, labeled=quant.Labeled(min_conversions=2)),
+        quant.Junctions(matrix=quant.JunctionMatrix.single_cell()),
         quant.Labeling(),
     ],
     annotation=Annotation.read("genes.gtf", attributes=None),
@@ -475,7 +508,7 @@ splicing = quant.Task(
 epigenome = quant.Task(
     ["bs.bam"],
     "meth",
-    [quant.Methylation(contexts=("CpG",), matrices=[quant.MethylMatrix("bins", "bins", bin_size=100_000, rows="CB")])],
+    [quant.Methylation(matrices=[quant.MethylMatrix("bins", quant.Bins(100_000), rows="CB")])],
     reference="genome.fa.gz",
 )
 contacts = quant.Task(["hic.bam"], "hic", [quant.Contacts(barcode_tag="CB", min_distance=1000)])
@@ -485,10 +518,19 @@ snvs = quant.Task(
     [quant.Alleles("snps.bcf", genes=quant.AlleleGenes(sample="NA12878"))],
     annotation=Annotation.read("genes.gtf", attributes=None),
 )
-quant.plan(task, threads=16, memory="16G").memory  # fixed, pipeline, buffer
-report = quant.run(task, threads=16, memory="16G")
+genes = Annotation.read("genes.gtf", attributes=None)
+introns = genes.introns(genes.subset(biotypes=["protein_coding"]))
+custom = quant.Counts.rna_bulk(quant.Regions(introns), name="introns")  # any IntervalSet
+basic = quant.Counts.rna_bulk(subset=genes.subset(tags=["basic"]))  # genes of a subset
+plan = quant.plan(task, threads=16, memory="16G")  # headers read, feature spaces built
+plan.memory, plan.inputs  # fixed, pipeline, buffer; each BAM's references
+report = plan.run()  # or quant.run(task, ...)
 report.files, report.summary["products"]
 ```
+
+Every product is a frozen dataclass whose defaults and presets come from
+the Rust layer; the Rust layer also checks every option when the task is
+planned.
 
 Coverage of aligned bases matches `samtools depth`; bulk gene counts match
 featureCounts (single-end and read pairs, every strandedness, `-O`); the
@@ -499,7 +541,7 @@ per-barcode TSS counts, junction overhangs and motifs, velocity classes, T>C
 conversions, methylation calls and contexts, contact ends and filters,
 allele units) and the differences from STARsolo, velocyto, featureCounts,
 Bismark / MethylDackel, pairtools and cellsnp-lite are in
-[`docs/design.md`](docs/design.md) §4.9.
+[the quantification guide](docs/quantification.md).
 
 ## Training with PyTorch
 
@@ -548,8 +590,8 @@ bp and coarse tracks, Hi-C tiles and expression read with CellPack).
 - Readers release the GIL while decoding, so threads may share one; they
   pickle as the files and options they were opened with.
 - Sidecars (`.sidecar`) describe a file's data blocks for loaders; reading
-  by region does not need them. Build one with `build_sidecar()` or
-  `sidecar=True` on a writer.
+  by region does not need them. Build one with `build_sidecar()`, or
+  `sidecar=True` on a writer or a conversion; `read_sidecar()` reads it.
 
 ## Fidelity
 
@@ -557,8 +599,9 @@ Every format is tested against the tool it replaces, built from source in
 `refs/` and called in process: `samtools faidx` / `bgzip` indexes, htslib
 BCF and BAM encoding and their `.csi` / `.bai` indexes, BCF, BAM and CRAM
 region queries and `samtools index` (`.crai` included), CRAM to BAM, `bcftools consensus` 1.23, libBigWig, lib2bit and
-straw. [`docs/design.md`](docs/design.md)
-records the design and the few deliberate differences.
+straw. [The architecture](docs/design.md), [format semantics](docs/rust-api.md),
+[conversion](docs/conversion.md) and [quantification](docs/quantification.md)
+document the design and deliberate differences.
 
 ## Building from source
 
@@ -576,4 +619,4 @@ uv run pytest
 | `src/omicsweave/` | the Python package (`types`, `formats`, `query`, `convert`, `cli`) |
 | `refs/` | reference implementations for differential tests |
 | `examples/` | DataLoader examples |
-| `docs/` | design notes |
+| `docs/` | [user guides, API semantics and development documentation](docs/README.md) |

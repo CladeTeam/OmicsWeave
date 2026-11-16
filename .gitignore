@@ -50,3 +50,6 @@ Thumbs.db
 /docs/optimization-round*/
 /docs/optimization-guide.md
 /docs/crate-performance-audit.md
+
+# Archived local optimization reports and evidence
+/docs/internal/

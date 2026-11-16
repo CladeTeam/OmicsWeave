@@ -1,6 +1,6 @@
 # Examples
 
-Training-data loaders for the two starting use cases (`docs/design.md` §3),
+Training-data loaders for the two starting use cases ([design background](../docs/development/loader-design.md)),
 built on a plain PyTorch `DataLoader`. They are illustrative: paths and
 manifests are placeholders. Every file is read by region in a format built
 for it (bgzip FASTA, bigWig, bigBed, `.hic`; expression as a CellPack
