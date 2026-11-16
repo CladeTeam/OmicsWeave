@@ -1,4 +1,5 @@
 import gzip
+import os
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from omicsweave.cli.app import main
 from omicsweave.query import SequenceReader
 
 FASTA = b">a\nACGTNacgt\n>b\nGGGG\n"
+RUN = "import sys; from omicsweave.cli.app import main; sys.exit(main(sys.argv[1:]))"
 
 
 def test_convert_detects_source_and_names_target(tmp_path, capsys):
@@ -133,11 +135,17 @@ def test_invalid_budgets_are_usage_errors(tmp_path, capsys, option, value):
     assert not target.exists()
 
 
-@pytest.mark.parametrize("cores", [None, 3])
-def test_default_threads_use_available_cores(tmp_path, capsys, monkeypatch, cores):
-    monkeypatch.setattr("omicsweave.cli._convert.os.cpu_count", lambda: cores)
+@pytest.mark.skipif(not hasattr(os, "sched_setaffinity"), reason="needs CPU affinity")
+def test_default_threads_follow_cpu_affinity(tmp_path):
     src, dst = tmp_path / "a.fa", tmp_path / "a.2bit"
     src.write_bytes(FASTA)
-    assert main(["convert", str(src), str(dst), "--dry-run"]) == 0
-    assert f"{cores or 1} threads)" in capsys.readouterr().out
+    cores = sorted(os.sched_getaffinity(0))[:2]
+    out = subprocess.run(
+        [sys.executable, "-c", RUN, "convert", str(src), str(dst), "--dry-run"],
+        preexec_fn=lambda: os.sched_setaffinity(0, cores),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert f"{len(cores)} threads)" in out
     assert not dst.exists()

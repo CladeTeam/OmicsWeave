@@ -82,6 +82,7 @@ def test_bed_to_bigbed_reads_back(tmp_path):
         threads=2,
         memory="32M",
         chrom_sizes=tmp_path / "sizes",
+        sidecar=True,
     )
     assert report.records == len(rows)
     assert (tmp_path / "a.bb.sidecar").exists()
@@ -113,7 +114,12 @@ def test_bedgraph_and_wig_to_bigwig_read_back(tmp_path, compressed):
     assert detect(src) == (GzipBedGraph(src) if compressed else BedGraph(src))
 
     report = ow.convert.run(
-        src, tmp_path / "a.bw", threads=2, memory="32M", chrom_sizes=tmp_path / "sizes"
+        src,
+        tmp_path / "a.bw",
+        threads=2,
+        memory="32M",
+        chrom_sizes=tmp_path / "sizes",
+        sidecar=True,
     )
     assert report.records == len(rows)
     assert report.target == BigWig(tmp_path / "a.bw")
@@ -136,7 +142,7 @@ def test_bedgraph_and_wig_to_bigwig_read_back(tmp_path, compressed):
         "variableStep chrom=chr2 span=2\n101 -1\n51 3\nchr1 1000 1010 4\n"
     )
     assert detect(wig) == Wig(wig)
-    report = ow.convert.run(wig, tmp_path / "w.bw", threads=1, sidecar=False)
+    report = ow.convert.run(wig, tmp_path / "w.bw", threads=1)
     assert report.companions == ()
     with TrackReader(report.target) as f:
         assert dict(f.chroms) == {"chr1": 1010, "chr2": 102}

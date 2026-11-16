@@ -7,39 +7,16 @@ conversion itself, formats included, is :mod:`omicsweave.convert`.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import warnings
 from collections import defaultdict
-from typing import Any, TextIO
+from typing import Any
 
-from .. import _native, convert
-from ..errors import OmicsWeaveError
-from ..formats import FORMATS, File
+from .. import convert
+from ..formats import FORMATS, BbiOptions, File
+from ._common import add_budget, budget_of, human, print_budget, progress_for
 
 __all__ = ["register"]
-
-human = _native.human_size
-
-
-def _size(text: str) -> str:
-    try:
-        size = _native.parse_size(text)
-    except OmicsWeaveError:
-        size = 0
-    if size == 0:
-        raise argparse.ArgumentTypeError(f"not a memory budget: {text!r} (e.g. 512M, 8G)")
-    return text
-
-
-def _threads(text: str) -> int:
-    try:
-        n = int(text)
-    except ValueError:
-        n = 0
-    if not 1 <= n <= sys.maxsize:
-        raise argparse.ArgumentTypeError(f"not a thread count: {text!r} (at least 1)")
-    return n
 
 
 def _resolutions(text: str) -> list[int]:
@@ -93,27 +70,7 @@ def register(commands: Any) -> None:
         help="the format of TARGET: %(choices)s",
     )
 
-    budget = p.add_argument_group("budget")
-    budget.add_argument(
-        "-t",
-        "--threads",
-        type=_threads,
-        metavar="N",
-        help="threads for the parallel stages (default: every core)",
-    )
-    budget.add_argument(
-        "-m",
-        "--memory",
-        type=_size,
-        default="4G",
-        metavar="SIZE",
-        help="memory for buffers, e.g. 512M, 8G (default: %(default)s)",
-    )
-    budget.add_argument(
-        "--tmp-dir",
-        metavar="DIR",
-        help="where sorts spill when they outgrow the budget (default: beside TARGET)",
-    )
+    add_budget(p, "beside TARGET")
 
     output = p.add_argument_group("output")
     output.add_argument(
@@ -129,6 +86,12 @@ def register(commands: Any) -> None:
         const="auto",
         choices=("auto", "bai", "csi"),
         help="also index a sorted BCF (csi) or BAM (auto: bai when every reference fits, else csi)",
+    )
+    output.add_argument(
+        "--min-shift",
+        type=int,
+        metavar="N",
+        help="BAM --index csi: bins of 2^N bases (default: 14)",
     )
     output.add_argument(
         "--chrom-sizes",
@@ -163,10 +126,27 @@ def register(commands: Any) -> None:
         help="the items of this strand (default: all; overlapping strands are an error)",
     )
     output.add_argument(
-        "--no-sidecar",
-        dest="sidecar",
-        action="store_false",
-        help="do not write the bigBed / bigWig / hic .sidecar",
+        "--sidecar",
+        action="store_true",
+        help="also write the bigBed / bigWig / hic .sidecar (for data loaders)",
+    )
+    output.add_argument(
+        "--block-size",
+        type=int,
+        metavar="N",
+        help="bigBed / bigWig: children per index node (default: 256)",
+    )
+    output.add_argument(
+        "--items-per-slot",
+        type=int,
+        metavar="N",
+        help="bigBed / bigWig: items per data block (default: 512 bigBed, 1024 bigWig)",
+    )
+    output.add_argument(
+        "--zoom-levels",
+        type=int,
+        metavar="N",
+        help="bigBed / bigWig: most zoom levels derived (default: 10)",
     )
     output.add_argument(
         "--add-contigs",
@@ -183,6 +163,12 @@ def register(commands: Any) -> None:
         metavar="FASTA",
         help="CRAM to BAM: the reference the CRAM was compressed against "
         "(FASTA + .fai, bgzip FASTA + .fai/.gzi, or 2bit)",
+    )
+    output.add_argument(
+        "--no-verify",
+        dest="verify_checksums",
+        action="store_false",
+        help="CRAM to BAM: skip the block CRC32 and slice reference MD5 checks",
     )
 
     p.add_argument(
@@ -205,74 +191,50 @@ def _file(path: str, name: str | None) -> File | str:
     return path if name is None else FORMATS[name](path)
 
 
-class _Progress:
-    """One line on ``stream``, rewritten as the conversion goes."""
-
-    def __init__(self, stream: TextIO) -> None:
-        self.stream = stream
-        self.shown = False
-
-    def __call__(self, phase: str, read: int, total: int) -> None:
-        share = f" {100 * read / total:5.1f}%" if total else ""
-        self.stream.write(f"\r{phase:<8} {human(read)} / {human(total)}{share}\x1b[K")
-        self.stream.flush()
-        self.shown = True
-
-    def clear(self) -> None:
-        if self.shown:
-            self.stream.write("\r\x1b[K")
-            self.stream.flush()
+def _bbi(args: argparse.Namespace) -> BbiOptions | None:
+    given = {
+        k: v
+        for k, v in (
+            ("block_size", args.block_size),
+            ("items_per_slot", args.items_per_slot),
+            ("zoom_levels", args.zoom_levels),
+        )
+        if v is not None
+    }
+    return BbiOptions(**given) if given else None
 
 
 def run(args: argparse.Namespace) -> int:
-    source = _file(args.source, args.source_format)
-    target = _file(args.target, args.target_format)
-    threads = args.threads or os.cpu_count() or 1
+    plan = convert.plan(
+        _file(args.source, args.source_format),
+        _file(args.target, args.target_format),
+        **budget_of(args),
+        level=args.level,
+        index=args.index or False,
+        min_shift=args.min_shift,
+        chrom_sizes=args.chrom_sizes,
+        resolutions=args.resolutions,
+        value=args.value,
+        mod=args.mod,
+        strand=args.strand,
+        sidecar=args.sidecar,
+        add_contigs=args.add_contigs,
+        sort=args.sort,
+        reference=args.reference,
+        verify_checksums=args.verify_checksums,
+        bbi=_bbi(args),
+    )
     if args.dry_run:
-        plan = convert.plan(
-            source,
-            target,
-            threads=threads,
-            memory=args.memory,
-            chrom_sizes=args.chrom_sizes,
-            resolutions=args.resolutions,
-            value=args.value,
-            mod=args.mod,
-            strand=args.strand,
-            sort=args.sort,
-        )
-        b, m = plan.budget, plan.memory
         print(f"source  {plan.source.path}  ({plan.source.format})")
         print(f"target  {plan.target.path}  ({plan.target.format})")
-        print(
-            f"memory  fixed {human(m.fixed)}, pipeline {human(m.pipeline)}, "
-            f"sort buffer {human(m.buffer)} (budget {human(b.memory)}, {b.threads} threads)"
-        )
+        print_budget(plan.budget, plan.memory, "sort buffer")
         return 0
-    progress = None if args.quiet or not sys.stderr.isatty() else _Progress(sys.stderr)
+    progress = progress_for(args)
     try:
         # Warnings are printed below, after the progress line is gone.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", convert.ConvertWarning)
-            done = convert.run(
-                source,
-                target,
-                threads=threads,
-                memory=args.memory,
-                tmp_dir=args.tmp_dir,
-                level=args.level,
-                index=args.index or False,
-                chrom_sizes=args.chrom_sizes,
-                resolutions=args.resolutions,
-                value=args.value,
-                mod=args.mod,
-                strand=args.strand,
-                sidecar=args.sidecar,
-                add_contigs=args.add_contigs,
-                sort=args.sort,
-                reference=args.reference,
-                progress=progress,
-            )
+            done = plan.run(progress=progress)
     finally:
         if progress is not None:
             progress.clear()

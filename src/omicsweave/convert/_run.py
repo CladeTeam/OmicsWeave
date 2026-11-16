@@ -1,16 +1,22 @@
-"""Running a conversion."""
+"""Planning and running a conversion."""
 
 from __future__ import annotations
 
-import os
 import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
-from .. import _native
-from ..formats import File, PathLike
+from .. import _budget, _native
+from .._budget import Budget, MemoryPlan
+from ..formats import BbiOptions, File, PathLike
+from ..formats._bbi import native_options
 from ._files import file_of, native_files
+
+__all__ = ["ConvertWarning", "Plan", "Report", "plan", "run"]
+
+Progress = Callable[[str, int, int], None]
+"""Called now and then with (phase, bytes read, bytes total)."""
 
 
 class ConvertWarning(UserWarning):
@@ -43,42 +49,85 @@ class Report:
         return (self.target, *self.companions)
 
 
-def run(
+class Plan:
+    """A conversion configured and checked against its budget; nothing has
+    been read. :meth:`run` converts."""
+
+    __slots__ = ("_native", "source", "target")
+
+    def __init__(self, native: Any) -> None:
+        self._native = native
+        (src_format, dst_format), (src, dst) = native.formats, native.paths
+        self.source: File = file_of(src_format, src)
+        self.target: File = file_of(dst_format, dst)
+
+    @property
+    def budget(self) -> Budget:
+        return _budget.budget(self._native.budget)
+
+    @property
+    def memory(self) -> MemoryPlan:
+        return _budget.memory_plan(self._native.memory)
+
+    def run(self, *, progress: Progress | None = None) -> Report:
+        """Converts; the target and its companions appear only once the
+        whole conversion succeeded. What it passed over is issued as
+        :class:`ConvertWarning`."""
+        written, records, read, spilled, seconds, notes = self._native.run(progress)
+        target, *companions = (file_of(name, path) for name, path in written)
+        for note in notes:
+            warnings.warn(note, ConvertWarning, stacklevel=2)
+        return Report(
+            self.source, target, tuple(companions), records, read, spilled, seconds, tuple(notes)
+        )
+
+    def __reduce__(self) -> Any:
+        raise TypeError("a conversion plan is process-local; plan the conversion again")
+
+    def __repr__(self) -> str:
+        return f"<convert.Plan {self.source!r} -> {self.target!r}>"
+
+
+def plan(
     source: File | PathLike,
     target: File | PathLike,
     *,
     threads: int | None = None,
-    memory: int | str = "4G",
+    memory: int | str | None = None,
     tmp_dir: PathLike | None = None,
     level: int | None = None,
     index: bool | Literal["auto", "bai", "csi"] = False,
+    min_shift: int | None = None,
     chrom_sizes: PathLike | None = None,
     resolutions: Sequence[int] | None = None,
     value: str | None = None,
     mod: str | None = None,
     strand: Literal["+", "-", "."] | None = None,
-    sidecar: bool = True,
+    sidecar: bool = False,
     add_contigs: bool = False,
     sort: bool = False,
     reference: PathLike | None = None,
-    progress: Callable[[str, int, int], None] | None = None,
-) -> Report:
-    """Converts ``source`` into ``target``.
+    verify_checksums: bool = True,
+    bbi: BbiOptions | None = None,
+) -> Plan:
+    """Configures the conversion of ``source`` into ``target`` and checks it
+    against its budget without reading any data.
 
     A path's format is told by content for the source and by name for the
     target; a file object (:mod:`omicsweave.formats`) states it.
 
-    ``threads`` (default: every core) run the parallel stages; ``memory``
-    (bytes, or a size such as ``"8G"``) bounds the buffers. Memory that is
-    not buffers (allocator slack, stacks) can take the process a little
-    over. Sorts that outgrow the budget spill to ``tmp_dir`` (default: the
-    target's directory).
+    ``threads`` (default: every core the process may run on) run the
+    parallel stages; ``memory`` (bytes, or a size such as ``"8G"``; default
+    4 GiB) bounds the buffers. Memory that is not buffers (allocator slack,
+    stacks) can take the process a little over. Sorts that outgrow the
+    budget spill to ``tmp_dir`` (default: the target's directory).
 
     - ``level``: compression level (bgzip, BCF, BAM: 0-12; bigBed, bigWig,
       hic: zlib 1-9).
     - ``index``: index a sorted BCF (``True``: ``.csi``) or BAM (``True`` /
       ``"auto"``: ``.bai`` when every reference fits, else ``.csi``;
-      ``"bai"``; ``"csi"``).
+      ``"bai"``; ``"csi"``, with bins of ``2 ** min_shift`` bases, default
+      14).
     - ``chrom_sizes``: bigBed / bigWig chromosome lengths (``chrom.sizes``,
       ``.fai`` or ``.2bit``); by default each chromosome's largest interval
       end. Pairs to hic: the chromosomes and their order, instead of the
@@ -105,23 +154,23 @@ def run(
     - ``reference``: CRAM to BAM: the reference the CRAM was compressed
       against (FASTA with ``.fai``, bgzip FASTA with ``.fai`` and ``.gzi``,
       or 2bit); not needed for CRAMs with embedded or no reference.
-    - ``progress``: called now and then with (phase, bytes read, bytes
-      total).
+      ``verify_checksums=False`` skips the block CRC32 and slice MD5 checks.
+    - ``bbi``: bigBed / bigWig block, index and zoom layout
+      (:class:`~omicsweave.formats.BbiOptions`); ``level`` still sets the
+      compression level when given.
 
     An option the conversion does not have raises
-    :class:`~omicsweave.errors.InvalidError`. What the conversion passed
-    over is issued as :class:`ConvertWarning` and listed in
-    :attr:`Report.warnings`.
+    :class:`~omicsweave.errors.InvalidError`.
     """
-    files = native_files(source, target)
-    src, written, records, read, spilled, seconds, notes = _native.convert(
-        **files,
-        threads=threads,
-        memory=str(memory),
-        tmp_dir=None if tmp_dir is None else os.fspath(tmp_dir),
+    native = _native.ConvertPlan(
+        **native_files(source, target),
+        threads=_budget.threads(threads),
+        memory=_budget.memory(memory),
+        tmp_dir=_budget.path(tmp_dir),
         level=level,
         index="auto" if index is True else (index or None),
-        chrom_sizes=None if chrom_sizes is None else os.fspath(chrom_sizes),
+        min_shift=min_shift,
+        chrom_sizes=_budget.path(chrom_sizes),
         resolutions=None if resolutions is None else list(resolutions),
         value=value,
         mod=mod,
@@ -129,19 +178,20 @@ def run(
         sidecar=sidecar,
         add_contigs=add_contigs,
         sort=sort,
-        reference=None if reference is None else os.fspath(reference),
-        progress=progress,
+        reference=_budget.path(reference),
+        verify_checksums=verify_checksums,
+        bbi=None if bbi is None else native_options(bbi),
     )
-    target_file, *companions = (file_of(name, path) for name, path in written)
-    for note in notes:
-        warnings.warn(note, ConvertWarning, stacklevel=2)
-    return Report(
-        file_of(src, files["src"]),
-        target_file,
-        tuple(companions),
-        records,
-        read,
-        spilled,
-        seconds,
-        tuple(notes),
-    )
+    return Plan(native)
+
+
+def run(
+    source: File | PathLike,
+    target: File | PathLike,
+    *,
+    progress: Progress | None = None,
+    **options: Any,
+) -> Report:
+    """Converts ``source`` into ``target``: :func:`plan` with ``options``,
+    then :meth:`Plan.run`."""
+    return plan(source, target, **options).run(progress=progress)
