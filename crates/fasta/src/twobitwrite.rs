@@ -203,8 +203,9 @@ impl TwoBitRecord {
     }
 }
 
-/// Size of a 2bit file of `seqs` (name, bases) with no N or mask blocks; a
-/// lower bound that decides whether 32-bit offsets can address the file.
+/// Size of a version-1 2bit file of `seqs` (name, bases) with no N or mask
+/// blocks. Run metadata adds space, so this alone does not determine
+/// whether version-0 record offsets suffice.
 pub fn twobit_base_size<'a>(seqs: impl IntoIterator<Item = (&'a str, u64)>) -> u64 {
     let mut size = HEADER_LEN as u64;
     for (name, len) in seqs {
@@ -228,7 +229,8 @@ pub struct TwoBitWriter<W: Write + Seek> {
 impl<W: Write + Seek> TwoBitWriter<W> {
     /// Writes the header and a directory placeholder to `out`, which must
     /// start empty at position 0. `version` 1 stores 64-bit offsets, needed
-    /// for files of 4 GiB or more ([`twobit_base_size`]).
+    /// when any record starts beyond `u32::MAX`. In version 0 the final
+    /// record may end beyond that boundary.
     pub fn create(mut out: W, names: Vec<String>, version: u32) -> Result<TwoBitWriter<W>> {
         if version > 1 {
             return Err(invalid("2bit writer", format!("unknown version {version}")));

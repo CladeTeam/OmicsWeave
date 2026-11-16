@@ -9,7 +9,6 @@ use omicsweave_core::exec::Ordered;
 use omicsweave_core::{Error, Result};
 use omicsweave_fasta::{
     BgzfWriter, Fai, FaiBuilder, TwoBitPiece, TwoBitRecord, TwoBitWriter, fai_path, gzi_path,
-    twobit_base_size,
 };
 
 use crate::budget::{Budget, MemoryPlan, WRITE_BUF, sizing, text_batch};
@@ -136,22 +135,32 @@ impl FastaToTwoBit {
         })
     }
 
-    /// Names and lengths of the sequences, from a usable `.fai` or a pass
-    /// over the input.
-    fn names(&self, ctx: &Context<'_>) -> Result<(Vec<(String, u64)>, bool)> {
+    /// Names, lengths and offset width. An ambiguous FAI layout needs a
+    /// text pass because N and soft-mask runs occupy record header space.
+    fn names(&self, ctx: &Context<'_>) -> Result<(Vec<(String, u64)>, bool, u32)> {
         let fai = fai_path(&self.src);
         if fai.exists() && detect(&self.src)? != Compression::Gzip {
             let fai = Fai::load(&self.src)?;
-            let names = fai
+            let names: Vec<_> = fai
                 .entries()
                 .iter()
                 .map(|e| (e.name.clone(), e.len as u64))
                 .collect();
-            return Ok((names, true));
+            let version = match bounded_twobit_version(&names, u32::MAX as u64) {
+                Some(version) => version,
+                None => self.scan(ctx)?.version(u32::MAX as u64),
+            };
+            return Ok((names, true, version));
         }
+        let scan = self.scan(ctx)?;
+        let version = scan.version(u32::MAX as u64);
+        Ok((scan.names, false, version))
+    }
+
+    fn scan(&self, ctx: &Context<'_>) -> Result<TwoBitScan> {
         let s = Self::piece_sizing(ctx.budget);
         let mut input = open_text(&self.src, &ctx.pool, s.limit)?;
-        let mut names = Vec::new();
+        let mut scan = TwoBitScan::default();
         let mut parser = Parser::new();
         let mut chunk = vec![0u8; READ_CHUNK];
         loop {
@@ -159,34 +168,19 @@ impl FastaToTwoBit {
             if n == 0 {
                 break;
             }
-            parser.feed(&chunk[..n], &mut |ev| {
-                match ev {
-                    Event::Start(name) => names.push((name, 0)),
-                    Event::Bases(b) => {
-                        names.last_mut().expect("bases follow a name").1 += b.len() as u64
-                    }
-                    Event::End => {}
-                }
-                Ok(())
-            })?;
+            parser.feed(&chunk[..n], &mut |event| scan.take(event))?;
             ctx.progress(
                 "scan",
                 input.read.load(std::sync::atomic::Ordering::Relaxed),
                 input.file_len,
             );
         }
-        parser.finish(&mut |_| Ok(()))?;
-        Ok((names, false))
+        parser.finish(&mut |event| scan.take(event))?;
+        Ok(scan)
     }
 
     pub(crate) fn run(&self, ctx: &Context<'_>) -> Result<Report> {
-        let (names, from_fai) = self.names(ctx)?;
-        let version =
-            if twobit_base_size(names.iter().map(|(n, l)| (n.as_str(), *l))) > u32::MAX as u64 {
-                1
-            } else {
-                0
-            };
+        let (names, from_fai, version) = self.names(ctx)?;
         let mut outputs = Outputs::new();
         let file = outputs.create(&self.dst, Format::TwoBit)?;
         let writer = TwoBitWriter::create(
@@ -308,6 +302,82 @@ impl FastaToTwoBit {
             elapsed: Default::default(),
             warnings: Vec::new(),
         })
+    }
+}
+
+fn twobit_directory_len(names: &[(String, u64)]) -> u64 {
+    names.iter().fold(16, |size, (name, _)| {
+        size.saturating_add(1 + name.len() as u64 + 4)
+    })
+}
+
+/// Bounds on the last record's start, including the narrow directory.
+/// Each N/mask run takes eight bytes; either kind has at most ceil(n/2)
+/// runs. The final record's end does not constrain directory offsets.
+fn bounded_twobit_version(names: &[(String, u64)], max_offset: u64) -> Option<u32> {
+    let directory = twobit_directory_len(names);
+    let (mut low, mut high) = (directory, directory);
+    for (_, len) in names.iter().take(names.len().saturating_sub(1)) {
+        let base = 16u64.saturating_add(len.div_ceil(4));
+        low = low.saturating_add(base);
+        high = high
+            .saturating_add(base)
+            .saturating_add(len.div_ceil(2).saturating_mul(16));
+    }
+    if low > max_offset {
+        Some(1)
+    } else if high <= max_offset {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// Counts exact record sizes without retaining bases or run lists.
+#[derive(Default)]
+struct TwoBitScan {
+    names: Vec<(String, u64)>,
+    payload: u64,
+    last_start: u64,
+    runs: u64,
+    in_n: bool,
+    in_mask: bool,
+}
+
+impl TwoBitScan {
+    fn take(&mut self, event: Event<'_>) -> Result<()> {
+        match event {
+            Event::Start(name) => {
+                self.names.push((name, 0));
+                self.runs = 0;
+                self.in_n = false;
+                self.in_mask = false;
+            }
+            Event::Bases(bases) => {
+                self.names.last_mut().expect("bases follow a name").1 += bases.len() as u64;
+                for &base in bases {
+                    let n = !matches!(base, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't');
+                    let mask = base.is_ascii_lowercase();
+                    self.runs += u64::from(n && !self.in_n) + u64::from(mask && !self.in_mask);
+                    self.in_n = n;
+                    self.in_mask = mask;
+                }
+            }
+            Event::End => {
+                let len = self.names.last().expect("end follows a name").1;
+                self.last_start = self.payload;
+                self.payload = self
+                    .payload
+                    .saturating_add(16)
+                    .saturating_add(len.div_ceil(4))
+                    .saturating_add(self.runs.saturating_mul(8));
+            }
+        }
+        Ok(())
+    }
+
+    fn version(&self, max_offset: u64) -> u32 {
+        u32::from(twobit_directory_len(&self.names).saturating_add(self.last_start) > max_offset)
     }
 }
 
@@ -564,6 +634,63 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout(text: &[u8], chunk: usize) -> TwoBitScan {
+        let mut parser = Parser::new();
+        let mut scan = TwoBitScan::default();
+        for bytes in text.chunks(chunk) {
+            parser.feed(bytes, &mut |event| scan.take(event)).unwrap();
+        }
+        parser.finish(&mut |event| scan.take(event)).unwrap();
+        scan
+    }
+
+    #[test]
+    fn twobit_offset_width_counts_mask_and_n_metadata() {
+        for chunk in [1, 2, 3, 5, 100] {
+            let scan = layout(b">a\nAaNnAa\n>b\nACGTACGT", chunk);
+            // Narrow directory: 16 + 6 + 6 = 28. First record: 16 fixed,
+            // two packed bytes, one N run and three lowercase runs = 50.
+            assert_eq!(scan.last_start, 50);
+            assert_eq!(scan.payload, 68);
+            assert_eq!(scan.version(77), 1);
+            assert_eq!(scan.version(78), 0);
+            assert_eq!(bounded_twobit_version(&scan.names, 77), None);
+            assert!(
+                omicsweave_fasta::twobit_base_size(
+                    scan.names.iter().map(|(name, len)| (name.as_str(), *len))
+                ) <= 77
+            );
+        }
+    }
+
+    #[test]
+    fn twobit_run_count_survives_chunks_lines_and_an_unterminated_header() {
+        for chunk in [1, 2, 3, 7, 100] {
+            let scan = layout(b">a\nNNn\nnnAAA\n>b", chunk);
+            // The first record has eight bases, one N run and one mask
+            // run across line boundaries: 16 + 2 + 8 + 8 = 34 bytes.
+            assert_eq!(scan.names, vec![("a".into(), 8), ("b".into(), 0)]);
+            assert_eq!(scan.last_start, 34);
+            assert_eq!(scan.payload, 50);
+            assert_eq!(scan.version(61), 1);
+            assert_eq!(scan.version(62), 0);
+        }
+    }
+
+    #[test]
+    fn twobit_bounds_cover_record_starts_and_allow_the_final_record_to_cross() {
+        let scan = layout(b">a\nAaNnAa\n>b\nACGTACGT", 2);
+        assert_eq!(bounded_twobit_version(&scan.names, 45), Some(1));
+        assert_eq!(bounded_twobit_version(&scan.names, 94), Some(0));
+        assert_eq!(bounded_twobit_version(&scan.names, 93), None);
+        let single = vec![("a".into(), u32::MAX as u64)];
+        assert_eq!(bounded_twobit_version(&single, 21), Some(1));
+        assert_eq!(bounded_twobit_version(&single, 22), Some(0));
+        let scan = layout(b">a\nNNnnACGT", 1);
+        assert_eq!(scan.version(22), 0);
+        assert!(22 + scan.payload > 22);
+    }
 
     fn parse(text: &[u8], chunk: usize) -> Vec<(String, Vec<u8>)> {
         let mut p = Parser::new();
