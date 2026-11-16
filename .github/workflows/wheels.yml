@@ -49,6 +49,10 @@ jobs:
         run: uvx --from 'twine>=6,<7' twine check --strict dist/*
       - name: Test installed wheel on supported Python versions
         run: bash .github/scripts/test-wheel.sh dist 3.12 3.13 3.14 3.15
+      - name: Test the minimum NumPy version
+        env:
+          NUMPY_SPEC: numpy==1.26.0
+        run: bash .github/scripts/test-wheel.sh dist 3.12
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheel-${{ matrix.platform }}

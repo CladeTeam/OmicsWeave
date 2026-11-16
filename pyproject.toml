@@ -9,7 +9,7 @@ description = "A unified framework for loading multi-omics data into model train
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "numpy>=2.5.4",
+    "numpy>=1.26.0",
 ]
 
 [project.scripts]

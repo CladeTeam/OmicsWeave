@@ -17,6 +17,9 @@ The `CI passed` job is the aggregate status for branch protection.
   CPython 3.12 stable ABI, so one wheel serves these Python versions.
   Platform-specific tests skip where appropriate; optional `pysam`
   comparisons skip when it is not installed.
+- Both platform wheels are also tested on Python 3.12 with NumPy 1.26.0,
+  the minimum supported dependency. Newer Python versions use compatible
+  current NumPy releases.
 - The source distribution is rebuilt into a wheel and tested separately.
   Wheel and source metadata are checked with Twine. Successful builds are
   retained as Actions artifacts for 14 days.
@@ -44,7 +47,7 @@ To validate the pipeline without publishing:
 gh workflow run ci.yml --ref main
 gh run list --workflow ci.yml
 gh run view <run-id> --log-failed
-gh run download <run-id> --pattern 'wheel-*' --dir downloaded-wheels
+gh run download <run-id> --name wheel-linux-x86_64 --name wheel-linux-aarch64 --dir downloaded-wheels
 ```
 
 The publishing job downloads artifacts from its own run; it does not build
