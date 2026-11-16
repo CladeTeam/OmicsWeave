@@ -1,0 +1,23 @@
+[package]
+name = "omicsweave-ffm"
+description = "FFM (Factor Frequency Model) motif collections: alphabets, factor models, a block writer and a random-access reader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omicsweave-core = { path = "../core" }
+pco.workspace = true
+zstd.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "access"
+harness = false
