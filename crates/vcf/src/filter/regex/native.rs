@@ -23,7 +23,7 @@ impl Drop for Locale {
     fn drop(&mut self) {
         // SAFETY: this handle came from successful newlocale, is not the
         // global-locale sentinel, and has no outstanding LocaleScope borrow.
-        unsafe { libc::freelocale(self.0) }
+        unsafe { libc::freelocale(self.0) };
     }
 }
 

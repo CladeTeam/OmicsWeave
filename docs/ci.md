@@ -5,7 +5,8 @@ The `CI passed` job is the aggregate status for branch protection.
 
 - Ruff, rustfmt and actionlint check Python, Rust and workflow files.
 - Cargo checks all workspace targets on the declared minimum Rust version,
-  then runs Clippy and the Rust tests on stable, including the vendored
+  runs Clippy and rustfmt with Rust 1.95.0, and runs the Rust tests on the
+  latest stable compiler, including the vendored
   reference-tool comparisons. Tests marked `ignore` need external datasets
   or are manual benchmarks and are not part of CI.
 - Release wheels are built for Linux x86_64 / AArch64 (manylinux_2_28) and

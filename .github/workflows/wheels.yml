@@ -50,7 +50,9 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           args: --release --locked --strip --out dist --interpreter python3.12
           before-script-linux: |
-            python3 -m pip install 'cmake>=3.26,<5' ninja
+            export PATH="/opt/python/cp312-cp312/bin:$PATH"
+            python -m pip install uv
+            uv pip install --python python3.12 'cmake>=3.26,<5' ninja
             cmake --version
       - name: Validate distribution metadata
         run: uvx --from 'twine>=6,<7' twine check --strict dist/*

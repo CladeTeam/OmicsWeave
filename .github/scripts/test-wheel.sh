@@ -10,6 +10,7 @@ cp -R "$PROJECT_DIR/src/tests" "$TEST_DIR/tests"
 cd "$TEST_DIR"
 
 for version in "$@"; do
+    uv python install "$version"
     uv venv --python "$version" "env-$version"
     PYTHON="$TEST_DIR/env-$version/bin/python"
     uv pip install --python "$PYTHON" "$WHEEL_DIR"/*.whl 'pytest>=8'
