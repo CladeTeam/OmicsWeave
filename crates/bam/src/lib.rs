@@ -24,7 +24,8 @@ mod scan;
 mod stream;
 
 pub use header::{BAM_MAGIC, BamHeader, Reference};
+pub use omicsweave_bgzf::inflate_queue;
 pub use omicsweave_bgzf::{BinIndex, Chunk, IndexKind, locate_index};
 pub use reader::BamReader;
 pub use record::{NT16, Record, consumes_query, consumes_reference, flag, op, unpack_seq};
-pub use scan::{IndexChoice, Scanner, build_index, build_index_file, inflate_queue};
+pub use scan::{IndexChoice, Scanner, build_index, build_index_file};
