@@ -10,8 +10,9 @@ use omicsweave_core::{Error, FileSource, ReadAt, Region, Result};
 
 use crate::bcf::{Fixed, parse_record_fields};
 use crate::fields::{FormatField, Typed, Value, type_width};
-use crate::header::{Header, VCF44};
+use crate::header::{Header, VCF44, ValueType};
 use crate::record::{GT_MISSING_VALUE, GT_VECTOR_END, Record, gt_allele, gt_is_phased};
+use crate::table::{RecordFilter, RecordQuery, TableBuilder, VariantTable};
 
 /// A BCF file and its CSI index. Opening reads the header; each query reads
 /// only the chunks the index gives for its region.
@@ -217,9 +218,7 @@ impl<S: ReadAt> BcfReader<S> {
         Ok(())
     }
 
-    /// The genotypes of `samples` (header sample indexes, in the order
-    /// given) at every record `visit` returns for `region`.
-    pub fn genotypes(&mut self, region: Region<'_>, samples: &[usize]) -> Result<GenotypeMatrix> {
+    fn check_samples(&self, samples: &[usize]) -> Result<()> {
         let n_sample = self.header.samples.len();
         if let Some(&bad) = samples.iter().find(|&&s| s >= n_sample) {
             return Err(Error::invalid(
@@ -227,6 +226,50 @@ impl<S: ReadAt> BcfReader<S> {
                 format!("sample index {bad} is not below the {n_sample} samples"),
             ));
         }
+        Ok(())
+    }
+
+    /// The records `visit` returns for `region` that `filter` keeps, as
+    /// columns: the genotypes of `samples` (header sample indexes, in the
+    /// order given), QUAL, FILTER and the fields of `query`; one pass,
+    /// each record decoded once.
+    pub fn records(
+        &mut self,
+        region: Region<'_>,
+        samples: &[usize],
+        query: &RecordQuery,
+        mut filter: Option<&mut RecordFilter>,
+    ) -> Result<VariantTable> {
+        self.check_samples(samples)?;
+        let header = Arc::clone(&self.header);
+        let mut genotypes = Builder::new(samples);
+        let mut table = TableBuilder::new(&header, query, samples)?;
+        let mut rec = Record::default();
+        // Unpacked records hold GT among their FORMAT fields, its phasing
+        // already brought up to VCF 4.4 as htslib reads older files.
+        let gt_key = header.key_id("GT").filter(|&id| {
+            header
+                .key(id)
+                .is_some_and(|key| key.format == Some(ValueType::String))
+        });
+        let result = self.visit_fields::<true>(region, &mut rec, |rec, _| {
+            if let Some(f) = filter.as_deref_mut()
+                && !f.keeps(&header, rec)?
+            {
+                return Ok(());
+            }
+            genotypes.push(rec, gt_key.and_then(|k| rec.format_field(k)), false)?;
+            table.push(&header, rec)
+        });
+        rec.clear();
+        result?;
+        table.finish(genotypes.finish()?)
+    }
+
+    /// The genotypes of `samples` (header sample indexes, in the order
+    /// given) at every record `visit` returns for `region`.
+    pub fn genotypes(&mut self, region: Region<'_>, samples: &[usize]) -> Result<GenotypeMatrix> {
+        self.check_samples(samples)?;
         let mut builder = Builder::new(samples);
         let mut rec = Record::default();
         let update_phase = self.header.version < VCF44;
@@ -272,7 +315,7 @@ impl Strings {
         }
     }
 
-    fn end(&mut self) {
+    pub(crate) fn end(&mut self) {
         self.offsets.push(self.data.len() as i64);
     }
 

@@ -155,6 +155,25 @@ pub struct InfoField<'a> {
 }
 
 impl InfoField<'_> {
+    /// Numeric getter patterns after the dictionary lookup has been resolved.
+    pub(crate) fn numeric(&self, mut emit: impl FnMut(u32)) -> Result<usize, GetError> {
+        if !matches!(self.values.ty, BT_INT8 | BT_INT16 | BT_INT32 | BT_FLOAT) {
+            return Err(GetError::WrongType);
+        }
+        let missing = missing_of(self.values.ty);
+        let end = vector_end_of(self.values.ty);
+        let mut n = 0;
+        for raw in numeric_values(self.values.ty, self.values.bytes) {
+            match raw {
+                raw if raw == end => break,
+                raw if raw == missing && self.values.ty != BT_FLOAT => emit(INT32_MISSING as u32),
+                raw => emit(raw as u32),
+            }
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// htslib's `info->v1.i`: the single value of a one-value field,
     /// otherwise 0. Like the C union, a float's bits read as an integer.
     pub fn v1_int(&self) -> i64 {
@@ -181,6 +200,45 @@ pub struct FormatField<'a> {
 }
 
 impl<'a> FormatField<'a> {
+    /// Getter patterns for only the selected samples, in their requested order.
+    pub(crate) fn numeric(
+        &self,
+        samples: impl Iterator<Item = usize>,
+        mut emit: impl FnMut(u32),
+    ) -> Result<usize, GetError> {
+        if !matches!(self.values.ty, BT_INT8 | BT_INT16 | BT_INT32 | BT_FLOAT) {
+            return Err(GetError::Unsupported);
+        }
+        let (missing, end) = if self.values.ty == BT_FLOAT {
+            (FLOAT_MISSING, FLOAT_VECTOR_END)
+        } else {
+            (INT32_MISSING as u32, INT32_VECTOR_END as u32)
+        };
+        let stored_missing = missing_of(self.values.ty);
+        let stored_end = vector_end_of(self.values.ty);
+        let mut count = 0;
+        for s in samples {
+            let row = self.sample(s);
+            let mut j = 0;
+            for raw in numeric_values(row.ty, row.bytes) {
+                j += 1;
+                match raw {
+                    raw if raw == stored_end => {
+                        emit(end);
+                        break;
+                    }
+                    raw if raw == stored_missing => emit(missing),
+                    raw => emit(raw as u32),
+                }
+            }
+            for _ in j..self.n {
+                emit(end);
+            }
+            count += self.n;
+        }
+        Ok(count)
+    }
+
     /// Bytes per sample (`fmt->size`).
     /// Panics if the stored count cannot be represented as a byte length.
     pub fn size(&self) -> usize {
@@ -297,7 +355,7 @@ impl RecordData {
     }
 }
 
-fn info_view<'a>(d: &'a RecordData, s: &Span) -> InfoField<'a> {
+pub(crate) fn info_view<'a>(d: &'a RecordData, s: &Span) -> InfoField<'a> {
     InfoField {
         key: s.key,
         values: Typed {
@@ -307,7 +365,7 @@ fn info_view<'a>(d: &'a RecordData, s: &Span) -> InfoField<'a> {
     }
 }
 
-fn format_view<'a>(d: &'a RecordData, s: &Span) -> FormatField<'a> {
+pub(crate) fn format_view<'a>(d: &'a RecordData, s: &Span) -> FormatField<'a> {
     FormatField {
         key: s.key,
         n: s.n as usize,
@@ -412,24 +470,10 @@ impl Record {
         h: &Header,
         tag: &str,
         ty: ValueType,
-        mut emit: impl FnMut(u32),
+        emit: impl FnMut(u32),
     ) -> Result<usize, GetError> {
         let f = self.info_lookup(h, tag, ty)?.ok_or(GetError::Absent)?;
-        if !matches!(f.values.ty, BT_INT8 | BT_INT16 | BT_INT32 | BT_FLOAT) {
-            return Err(GetError::WrongType);
-        }
-        let missing = missing_of(f.values.ty);
-        let end = vector_end_of(f.values.ty);
-        let mut n = 0;
-        for raw in numeric_values(f.values.ty, f.values.bytes) {
-            match raw {
-                raw if raw == end => break,
-                raw if raw == missing && f.values.ty != BT_FLOAT => emit(INT32_MISSING as u32),
-                raw => emit(raw as u32),
-            }
-            n += 1;
-        }
-        Ok(n)
+        f.numeric(emit)
     }
 
     /// `bcf_get_info_int32`: values up to the first vector end, missing
@@ -488,40 +532,10 @@ impl Record {
         h: &Header,
         tag: &str,
         ty: ValueType,
-        mut emit: impl FnMut(u32),
+        emit: impl FnMut(u32),
     ) -> Result<usize, GetError> {
         let f = self.format_lookup(h, tag, ty)?;
-        if !matches!(f.values.ty, BT_INT8 | BT_INT16 | BT_INT32 | BT_FLOAT) {
-            return Err(GetError::Unsupported);
-        }
-        let float = f.values.ty == BT_FLOAT;
-        let (missing, end) = if float {
-            (FLOAT_MISSING, FLOAT_VECTOR_END)
-        } else {
-            (INT32_MISSING as u32, INT32_VECTOR_END as u32)
-        };
-        let nsmpl = self.n_sample();
-        let stored_missing = missing_of(f.values.ty);
-        let stored_end = vector_end_of(f.values.ty);
-        for s in 0..nsmpl {
-            let row = f.sample(s);
-            let mut j = 0;
-            for raw in numeric_values(row.ty, row.bytes) {
-                j += 1;
-                match raw {
-                    raw if raw == stored_end => {
-                        emit(end);
-                        break;
-                    }
-                    raw if raw == stored_missing => emit(missing),
-                    raw => emit(raw as u32),
-                }
-            }
-            for _ in j..f.n {
-                emit(end);
-            }
-        }
-        Ok(nsmpl * f.n)
+        f.numeric(0..self.n_sample(), emit)
     }
 
     /// `bcf_get_format_int32`: `n` values per sample.

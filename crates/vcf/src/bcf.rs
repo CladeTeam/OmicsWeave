@@ -20,7 +20,7 @@ const INT64: u8 = 4;
 const FLOAT: u8 = 5;
 const CHAR: u8 = 7;
 
-fn width(ty: u8) -> Result<usize> {
+pub(crate) fn width(ty: u8) -> Result<usize> {
     match ty {
         NULL => Ok(0),
         INT8 | CHAR => Ok(1),
@@ -84,7 +84,7 @@ impl<'a> Cursor<'a> {
     }
 
     /// A type descriptor: (type, count).
-    fn descriptor(&mut self) -> Result<(u8, usize)> {
+    pub(crate) fn descriptor(&mut self) -> Result<(u8, usize)> {
         let d = self.take(1)?[0];
         let (ty, n) = (d & 0xf, (d >> 4) as usize);
         if n != 15 {
@@ -106,7 +106,7 @@ impl<'a> Cursor<'a> {
     }
 
     /// A single typed integer.
-    fn int(&mut self) -> Result<i64> {
+    pub(crate) fn int(&mut self) -> Result<i64> {
         let (ty, n) = self.descriptor()?;
         if ty == NULL && n != 0 {
             return Err(bad("nonempty null vector"));
@@ -393,7 +393,7 @@ pub(crate) fn decode_gt(ty: u8, n: usize, bytes: &[u8], n_sample: usize, out: &m
     }
 }
 
-fn checked_key(h: &Header, key: i64) -> Result<u32> {
+pub(crate) fn checked_key(h: &Header, key: i64) -> Result<u32> {
     let id = u32::try_from(key).map_err(|_| bad("negative dictionary id"))?;
     h.key(id)
         .ok_or_else(|| bad("dictionary id not in the header"))?;

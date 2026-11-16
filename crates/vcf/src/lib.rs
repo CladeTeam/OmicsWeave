@@ -13,6 +13,8 @@
 //! htslib's `bcf_itr_queryi` does, and gives the [`GenotypeMatrix`] of a
 //! region.
 //!
+//! [`build_index_file`] builds a BCF's `.csi` as `bcftools index` does.
+//!
 //! [`read_vcf_header`], [`bcf_header_bytes`] and [`BcfEncoder`] convert VCF
 //! text to the uncompressed BCF bytes htslib writes from it, a line at a
 //! time and from any number of threads.
@@ -20,6 +22,7 @@
 mod bcf;
 mod bcfenc;
 mod cnum;
+mod csi;
 mod fields;
 mod filter;
 mod header;
@@ -27,9 +30,11 @@ mod hrec;
 mod indexed;
 mod reader;
 mod record;
+mod table;
 mod text;
 
 pub use bcfenc::{BcfEncoder, BcfScratch, BcfSpan, bcf_header_bytes, read_vcf_header};
+pub use csi::{CSI_MIN_SHIFT, build_index, build_index_file};
 pub use fields::{
     BT_CHAR, BT_FLOAT, BT_INT8, BT_INT16, BT_INT32, BT_INT64, BT_NULL, FLOAT_MISSING,
     FLOAT_VECTOR_END, FormatField, GetError, INT32_MISSING, INT32_VECTOR_END, InfoField, Typed,
@@ -44,3 +49,4 @@ pub use record::{
     VCF_OVERLAP, VCF_REF, VCF_SNP, gt_allele, gt_is_missing, gt_is_phased, variant, variant_type,
     variant_types,
 };
+pub use table::{Column, RecordFilter, RecordQuery, Values, VariantTable};
