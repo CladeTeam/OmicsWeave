@@ -47,9 +47,12 @@ pub struct Scanner<R: Read> {
     cur: usize,
     #[cfg(test)]
     cursor_steps: usize,
+    #[cfg(test)]
+    peak_loaded: usize,
     pos: usize,
     /// Where every block starts, compressed and in the text.
     blocks: Blocks,
+    keep_blocks: bool,
     text_total: u64,
     /// `bgzf_tell` after the bytes consumed, with block numbers.
     here: Logical,
@@ -58,6 +61,19 @@ pub struct Scanner<R: Read> {
 impl<R: Read> Scanner<R> {
     /// Reads `input` from its start; blocks inflate on `exec`.
     pub fn new(input: R, exec: Box<dyn Ordered<Vec<u8>>>) -> Scanner<R> {
+        Self::with_catalog(input, exec, true)
+    }
+
+    /// Reads records without retaining the file-wide block directory.
+    ///
+    /// Use this for one-pass consumers that need records and input progress,
+    /// but do not build an index. The logical positions returned by `tell`
+    /// are unchanged; this scanner has no directory to resolve them through.
+    pub fn new_streaming(input: R, exec: Box<dyn Ordered<Vec<u8>>>) -> Scanner<R> {
+        Self::with_catalog(input, exec, false)
+    }
+
+    fn with_catalog(input: R, exec: Box<dyn Ordered<Vec<u8>>>, keep_blocks: bool) -> Scanner<R> {
         Scanner {
             input,
             exec,
@@ -71,8 +87,11 @@ impl<R: Read> Scanner<R> {
             cur: 0,
             #[cfg(test)]
             cursor_steps: 0,
+            #[cfg(test)]
+            peak_loaded: 0,
             pos: 0,
             blocks: Blocks::default(),
+            keep_blocks,
             text_total: 0,
             here: Logical::new(0, 0),
         }
@@ -96,7 +115,9 @@ impl<R: Read> Scanner<R> {
             let len = raw.len() as u64;
             self.exec
                 .submit(Box::new(move || inflate_block_owned(&raw)))?;
-            self.blocks.starts.push((self.address, 0));
+            if self.keep_blocks {
+                self.blocks.starts.push((self.address, 0));
+            }
             self.address += len;
         }
         let Some(block) = self.exec.next(true)? else {
@@ -109,9 +130,17 @@ impl<R: Read> Scanner<R> {
         };
         let seq = self.taken;
         self.taken += 1;
-        self.blocks.starts[seq as usize].1 = self.text_total;
+        if self.keep_blocks {
+            self.blocks.starts[seq as usize].1 = self.text_total;
+        }
         self.text_total += block.len() as u64;
-        if self.pos >= KEEP && self.loaded.len() > 1 {
+        // Empty members have no byte that advance can land on. Their file
+        // positions still belong to the optional directory, but retaining
+        // them in the live-text queue would grow with an empty-member run.
+        if block.is_empty() {
+            return Ok(true);
+        }
+        if self.pos >= KEEP && !self.loaded.is_empty() {
             // Drop consumed text, keeping the block holding the position.
             let keep_from = self
                 .loaded
@@ -134,6 +163,10 @@ impl<R: Read> Scanner<R> {
             text: at,
             len: block.len(),
         });
+        #[cfg(test)]
+        {
+            self.peak_loaded = self.peak_loaded.max(self.loaded.len());
+        }
         Ok(true)
     }
 
@@ -174,10 +207,18 @@ impl<R: Read> Scanner<R> {
         } else {
             Logical::new(b.seq, (self.pos - b.text) as u16)
         };
+        if self.cur != 0 {
+            // Slice ranges borrow text, not this directory. Retaining only
+            // the current and unread frames bounds metadata by the active
+            // fill even when each member contributes a single byte.
+            self.loaded.drain(..self.cur);
+            self.cur = 0;
+        }
     }
 
     /// `bgzf_tell` after what has been read, with the block's number in
-    /// place of its address ([`Scanner::blocks`] resolves it).
+    /// place of its address. A retained [`Scanner::blocks`] directory
+    /// resolves it; streaming scanners report the same logical position.
     pub fn tell(&self) -> Logical {
         self.here
     }
@@ -189,8 +230,19 @@ impl<R: Read> Scanner<R> {
 
     /// Where the blocks read so far start; complete once the stream has
     /// ended.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a scanner created with [`Scanner::new_streaming`]. Use
+    /// [`Scanner::try_blocks`] when the scanning mode is not known.
     pub fn blocks(&self) -> &Blocks {
-        &self.blocks
+        self.try_blocks()
+            .expect("streaming BAM scanners do not retain a block directory")
+    }
+
+    /// The retained block directory, or `None` in streaming mode.
+    pub fn try_blocks(&self) -> Option<&Blocks> {
+        self.keep_blocks.then_some(&self.blocks)
     }
 
     /// Reads the header.
@@ -421,17 +473,20 @@ mod tests {
         let compressed = writer.finish().unwrap().out;
         let mut raw = EOF_BLOCK.repeat(EMPTY);
         raw.extend_from_slice(&compressed);
-        let mut scan = Scanner::new(&raw[..], Box::new(Inline::new()));
-        assert!(scan.header().unwrap().references().is_empty());
-        let mut records = 0;
-        while let Some(range) = scan.next_record().unwrap() {
-            assert_eq!(scan.slice(range), record);
-            records += 1;
+        for keep_blocks in [true, false] {
+            let mut scan = Scanner::with_catalog(&raw[..], Box::new(Inline::new()), keep_blocks);
+            assert!(scan.header().unwrap().references().is_empty());
+            let mut records = 0;
+            while let Some(range) = scan.next_record().unwrap() {
+                assert_eq!(scan.slice(range), record);
+                records += 1;
+            }
+            assert_eq!(records, RECORDS);
+            assert!(scan.text.len() < text.len(), "consumed prefix was pruned");
+            assert!(scan.cursor_steps <= scan.taken as usize);
+            assert!(scan.loaded.iter().all(|block| block.len != 0));
+            assert_eq!(scan.try_blocks().is_some(), keep_blocks);
         }
-        assert_eq!(records, RECORDS);
-        assert!(scan.text.len() < text.len(), "consumed prefix was pruned");
-        assert!(scan.cursor_steps <= scan.blocks.starts.len());
-        assert!(scan.cursor_steps >= EMPTY);
     }
 
     #[test]
@@ -442,14 +497,151 @@ mod tests {
         let crc = raw.len() - 8;
         raw[crc] ^= 1;
         raw.extend_from_slice(&EOF_BLOCK);
-        for exec in [
-            Box::new(Inline::new()) as Box<dyn Ordered<Vec<u8>>>,
-            inflate_queue(2),
-        ] {
-            let mut scan = Scanner::new(&raw[..], exec);
-            scan.header().unwrap();
-            let first = scan.next_record().unwrap_err();
-            assert_eq!(scan.next_record().unwrap_err(), first);
+        for streaming in [false, true] {
+            for exec in [
+                Box::new(Inline::new()) as Box<dyn Ordered<Vec<u8>>>,
+                inflate_queue(2),
+            ] {
+                let mut scan = Scanner::with_catalog(&raw[..], exec, !streaming);
+                scan.header().unwrap();
+                let first = scan.next_record().unwrap_err();
+                assert_eq!(scan.next_record().unwrap_err(), first);
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_records_and_positions_match_without_file_wide_metadata() {
+        const EMPTY_PREFIX: usize = 4096;
+        const RECORDS: usize = 8192;
+        const SIZE: usize = 1024;
+        let mut record = vec![b'x'; SIZE];
+        record[..32].fill(0);
+        record[..4].copy_from_slice(&(-1i32).to_le_bytes());
+        record[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        record[8..12].copy_from_slice(&2u32.to_le_bytes());
+        record[12..16].copy_from_slice(&((flag::UNMAPPED as u32) << 16).to_le_bytes());
+        record[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        record[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+        record[32..37].copy_from_slice(b"r\0AAZ");
+        record[SIZE - 1] = 0;
+        let mut framed = (SIZE as i32).to_le_bytes().to_vec();
+        framed.extend_from_slice(&record);
+        let mut member = Vec::new();
+        omicsweave_bgzf::deflate_block_at(1, &framed, &mut member).unwrap();
+        let mut raw = EOF_BLOCK.repeat(EMPTY_PREFIX);
+        omicsweave_bgzf::deflate_block_at(1, b"BAM\x01\0\0\0\0\0\0\0\0", &mut raw).unwrap();
+        for _ in 0..RECORDS {
+            raw.extend_from_slice(&member);
+            raw.extend_from_slice(&EOF_BLOCK);
+        }
+        let mut indexed = Scanner::new(&raw[..], Box::new(Inline::new()));
+        let mut streaming = Scanner::new_streaming(&raw[..], Box::new(Inline::new()));
+        assert_eq!(
+            indexed.header().unwrap().text(),
+            streaming.header().unwrap().text()
+        );
+        let mut peak_loaded = 0;
+        for _ in 0..RECORDS {
+            let a = indexed.next_record().unwrap().unwrap();
+            let b = streaming.next_record().unwrap().unwrap();
+            assert_eq!(indexed.slice(a), record);
+            assert_eq!(streaming.slice(b), record);
+            assert_eq!(streaming.tell(), indexed.tell());
+            assert_eq!(streaming.compressed_read(), indexed.compressed_read());
+            assert_eq!(streaming.blocks.starts.capacity(), 0);
+            peak_loaded = peak_loaded.max(streaming.loaded.len());
+        }
+        assert!(indexed.next_record().unwrap().is_none());
+        assert!(streaming.next_record().unwrap().is_none());
+        assert_eq!(streaming.compressed_read(), raw.len() as u64);
+        assert!(streaming.try_blocks().is_none());
+        assert_eq!(
+            indexed.blocks().starts.len(),
+            EMPTY_PREFIX + 1 + RECORDS * 2
+        );
+        assert!(peak_loaded <= KEEP / framed.len() + 2);
+        assert!(streaming.text.len() < RECORDS * framed.len());
+    }
+
+    #[test]
+    fn empty_prefix_does_not_fill_the_live_block_queue() {
+        const EMPTY: usize = 20_000;
+        let mut raw = EOF_BLOCK.repeat(EMPTY);
+        omicsweave_bgzf::deflate_block_at(1, b"BAM\x01\0\0\0\0\0\0\0\0", &mut raw).unwrap();
+        let mut scanner = Scanner::new_streaming(&raw[..], Box::new(Inline::new()));
+        scanner.header().unwrap();
+        assert_eq!(scanner.loaded.len(), 1);
+        assert_eq!(scanner.blocks.starts.capacity(), 0);
+        assert_eq!(scanner.tell(), Logical::new(EMPTY as u64 + 1, 0));
+        assert!(scanner.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn byte_sized_members_keep_only_the_active_record_metadata() {
+        const RECORDS: usize = 1024;
+        let mut data = vec![b'x'; 64];
+        data[..32].fill(0);
+        data[..4].copy_from_slice(&(-1i32).to_le_bytes());
+        data[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        data[8..12].copy_from_slice(&2u32.to_le_bytes());
+        data[12..16].copy_from_slice(&((flag::UNMAPPED as u32) << 16).to_le_bytes());
+        data[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        data[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+        data[32..37].copy_from_slice(b"r\0AAZ");
+        data[63] = 0;
+        let mut framed = 64i32.to_le_bytes().to_vec();
+        framed.extend_from_slice(&data);
+        let members: Vec<Vec<u8>> = (0..=255)
+            .map(|byte| {
+                let mut encoded = Vec::new();
+                omicsweave_bgzf::deflate_block_at(1, &[byte], &mut encoded).unwrap();
+                encoded
+            })
+            .collect();
+        let mut raw = Vec::new();
+        omicsweave_bgzf::deflate_block_at(1, b"BAM\x01\0\0\0\0\0\0\0\0", &mut raw).unwrap();
+        for _ in 0..RECORDS {
+            for &byte in &framed {
+                raw.extend_from_slice(&members[byte as usize]);
+            }
+        }
+        let mut indexed = Scanner::new(&raw[..], Box::new(Inline::new()));
+        let mut streaming = Scanner::new_streaming(&raw[..], Box::new(Inline::new()));
+        indexed.header().unwrap();
+        streaming.header().unwrap();
+        for _ in 0..RECORDS {
+            let range = indexed.next_record().unwrap().unwrap();
+            assert_eq!(indexed.slice(range), data);
+            let range = streaming.next_record().unwrap().unwrap();
+            assert_eq!(streaming.slice(range), data);
+            assert_eq!(streaming.tell(), indexed.tell());
+            assert_eq!(streaming.loaded.len(), 1);
+        }
+        assert!(indexed.next_record().unwrap().is_none());
+        assert!(streaming.next_record().unwrap().is_none());
+        assert!(streaming.peak_loaded <= framed.len() + 1);
+        assert!(indexed.peak_loaded <= framed.len() + 1);
+        assert_eq!(indexed.blocks().starts.len(), RECORDS * framed.len() + 1);
+        assert!(streaming.try_blocks().is_none());
+    }
+
+    #[test]
+    fn short_takes_after_a_truncated_fill_keep_unread_frame_positions() {
+        let data: Vec<u8> = (0..30).collect();
+        let mut raw = Vec::new();
+        for part in data.chunks(10) {
+            omicsweave_bgzf::deflate_block_at(1, part, &mut raw).unwrap();
+        }
+        for keep_blocks in [false, true] {
+            let mut scan = Scanner::with_catalog(&raw[..], Box::new(Inline::new()), keep_blocks);
+            assert!(scan.take(100, "test input").is_err());
+            assert_eq!(scan.take(4, "test input").unwrap(), &data[..4]);
+            assert_eq!(scan.tell(), Logical::new(0, 4));
+            assert_eq!(scan.take(10, "test input").unwrap(), &data[4..14]);
+            assert_eq!(scan.tell(), Logical::new(1, 4));
+            assert_eq!(scan.take(16, "test input").unwrap(), &data[14..]);
+            assert_eq!(scan.tell(), Logical::new(3, 0));
         }
     }
 }

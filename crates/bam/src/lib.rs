@@ -8,6 +8,9 @@
 //!   a caller-owned block cache can share them across execution contexts.
 //! - [`build_index`]: the BAI or CSI `samtools index` builds for a sorted
 //!   BAM.
+//! - [`Scanner`]: sequential records; [`Scanner::new_streaming`] omits the
+//!   file-wide block directory for bounded one-pass consumers, while
+//!   [`Scanner::new`] retains it for index building.
 //! - [`Record`]: one record read in place, checked as `bam_read1` checks
 //!   it; a long CIGAR held in a `CG` tag replaces its placeholder.
 //!
