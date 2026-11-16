@@ -17,3 +17,7 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "workloads"
+harness = false
