@@ -48,6 +48,7 @@ pub struct CramIndex {
     entries: Vec<CraiEntry>,
     /// By reference id + 1: entries not contained in an earlier one.
     tops: Vec<Vec<Top>>,
+    monotone: Vec<bool>,
 }
 
 fn invalid(detail: impl Into<String>) -> Error {
@@ -60,9 +61,9 @@ fn next_int(text: &[u8], pos: &mut usize) -> Option<i64> {
     while p < text.len() && (text[p] == b' ' || text[p] == b'\t') {
         p += 1;
     }
-    let mut sign = 1i64;
+    let mut negative = false;
     if p < text.len() && text[p] == b'-' {
-        sign = -1;
+        negative = true;
         p += 1;
     }
     if p >= text.len() || !text[p].is_ascii_digit() {
@@ -70,11 +71,17 @@ fn next_int(text: &[u8], pos: &mut usize) -> Option<i64> {
     }
     let mut v: i64 = 0;
     while p < text.len() && text[p].is_ascii_digit() {
-        v = v.wrapping_mul(10).wrapping_add((text[p] - b'0') as i64);
+        v = v.checked_mul(10)?;
+        let digit = (text[p] - b'0') as i64;
+        v = if negative {
+            v.checked_sub(digit)?
+        } else {
+            v.checked_add(digit)?
+        };
         p += 1;
     }
     *pos = p;
-    Some(sign * v)
+    Some(v)
 }
 
 /// The text of index bytes: gzip (one member or several, BGZF included)
@@ -98,9 +105,13 @@ impl CramIndex {
         if text.is_empty() {
             return Err(invalid("empty index"));
         }
+        if n_refs > i32::MAX as usize {
+            return Err(invalid("too many references"));
+        }
         let mut idx = CramIndex {
             entries: Vec::new(),
             tops: vec![Vec::new(); n_refs + 1],
+            monotone: Vec::new(),
         };
         // The containment stack: (refid, start, end); the bottom is the
         // reference's root.
@@ -108,13 +119,18 @@ impl CramIndex {
         let mut pos = 0;
         while pos < text.len() {
             let mut field = || next_int(&text, &mut pos).ok_or_else(|| invalid("malformed line"));
-            let ref_id = field()? as i32;
-            let start = field()? as i32;
-            let span = field()? as i32;
-            let container = field()?;
-            let landmark = field()? as i32;
-            let slice_len = field()? as i32;
-            let end = span.wrapping_add(start).wrapping_sub(1);
+            let fields = [field()?, field()?, field()?, field()?, field()?, field()?];
+            let int32 = |n| i32::try_from(n).map_err(|_| invalid("32-bit field overflow"));
+            let ref_id = int32(fields[0])?;
+            let start = int32(fields[1])?;
+            let span = int32(fields[2])?;
+            let container = fields[3];
+            let landmark = int32(fields[4])?;
+            let slice_len = int32(fields[5])?;
+            if start < 0 || span < 0 || container < 0 || landmark < 0 || slice_len < 0 {
+                return Err(invalid("negative coordinate, offset or extent"));
+            }
+            let end = int32(start as i64 + span as i64 - 1)?;
             if ref_id < -1 || ref_id as i64 >= n_refs as i64 {
                 return Err(invalid(format!("reference id {ref_id}")));
             }
@@ -158,6 +174,14 @@ impl CramIndex {
             }
             pos += 1;
         }
+        idx.monotone = idx
+            .tops
+            .iter()
+            .map(|tops| {
+                tops.windows(2)
+                    .all(|w| w[0].start <= w[1].start && w[0].end <= w[1].end)
+            })
+            .collect();
         Ok(idx)
     }
 
@@ -180,11 +204,20 @@ impl CramIndex {
     /// start a query of `ref_id` at 1-based `pos` from; `None` when the
     /// reference has no entries.
     pub fn query(&self, ref_id: i32, pos: i64) -> Option<i64> {
-        let list = self.tops.get(usize::try_from(ref_id + 1).ok()?)?;
+        let reference = usize::try_from(ref_id.checked_add(1)?).ok()?;
+        let list = self.tops.get(reference)?;
         if list.is_empty() {
             return None;
         }
         let pos = pos.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        if self.monotone[reference] {
+            return Some(
+                list[list
+                    .partition_point(|top| top.end < pos)
+                    .min(list.len() - 1)]
+                .offset,
+            );
+        }
         let (mut i, mut j) = (0usize, list.len() - 1);
         let mut k = j / 2;
         while k != i {
@@ -225,6 +258,63 @@ pub fn locate_index(cram: impl AsRef<Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monotone_and_irregular_tops_match_the_linear_search() {
+        for n in 1usize..100 {
+            for mode in 0..4 {
+                let tops: Vec<_> = (0..n)
+                    .map(|i| Top {
+                        start: if mode == 3 {
+                            (i * 17 % n) as i32
+                        } else {
+                            i as i32 * 3
+                        },
+                        end: match mode {
+                            0 => i as i32 * 3 + 2,
+                            1 => i as i32 + n as i32,
+                            _ => (i * 17 % n) as i32 + n as i32,
+                        },
+                        offset: i as i64 * 80,
+                    })
+                    .collect();
+                let monotone = tops
+                    .windows(2)
+                    .all(|w| w[0].start <= w[1].start && w[0].end <= w[1].end);
+                let idx = CramIndex {
+                    entries: Vec::new(),
+                    tops: vec![Vec::new(), tops],
+                    monotone: vec![true, monotone],
+                };
+                let mut linear = idx.clone();
+                linear.monotone.fill(false);
+                for pos in (-3i64..(n * 4) as i64).chain([i64::MIN, i64::MAX]) {
+                    assert_eq!(idx.query(0, pos), linear.query(0, pos));
+                }
+                assert_eq!(idx.query(i32::MAX, 0), None);
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_overflow_and_negative_extents_are_errors() {
+        for text in [
+            "4294967296\t1\t1\t10\t0\t1\n",
+            "0\t4294967296\t1\t10\t0\t1\n",
+            "0\t1\t4294967296\t10\t0\t1\n",
+            "0\t1\t1\t9223372036854775808\t0\t1\n",
+            "0\t1\t1\t-9223372036854775809\t0\t1\n",
+            "0\t2147483647\t2\t10\t0\t1\n",
+            "0\t1\t-1\t10\t0\t1\n",
+            "0\t1\t1\t-10\t0\t1\n",
+            "0\t1\t1\t10\t0\t-1\n",
+        ] {
+            assert!(CramIndex::parse(text.as_bytes(), 1).is_err(), "{text}");
+        }
+        assert!(CramIndex::parse(b"0\t2147483647\t1\t10\t0\t1\n", 1).is_ok());
+        let mut at = 0;
+        assert_eq!(next_int(b"-9223372036854775808", &mut at), Some(i64::MIN));
+    }
 
     #[test]
     fn nested_entries_are_skipped_by_the_search() {

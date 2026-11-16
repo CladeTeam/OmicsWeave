@@ -29,7 +29,11 @@ pub(crate) struct ByName<'a, R: ?Sized> {
 
 impl<R: SequenceRead + ?Sized> References for ByName<'_, R> {
     fn ref_len(&mut self, tid: usize) -> Result<i64> {
-        Ok(self.reader.chrom_len(&self.refs[tid].name)? as i64)
+        let r = self
+            .refs
+            .get(tid)
+            .ok_or_else(|| Error::invalid("CRAM reference", "reference id out of range"))?;
+        Ok(self.reader.chrom_len(&r.name)? as i64)
     }
 
     fn bases(&mut self, tid: usize, start: i64, end: i64, out: &mut Vec<u8>) -> Result<()> {
@@ -37,8 +41,17 @@ impl<R: SequenceRead + ?Sized> References for ByName<'_, R> {
         if end < start {
             return Ok(());
         }
-        let name = &self.refs[tid].name;
-        let (lo, hi) = (start - 1, end);
+        let name = &self
+            .refs
+            .get(tid)
+            .ok_or_else(|| Error::invalid("CRAM reference", "reference id out of range"))?
+            .name;
+        let (lo, hi) = (
+            start
+                .checked_sub(1)
+                .ok_or_else(|| Error::invalid("CRAM reference", "position out of range"))?,
+            end,
+        );
         let (lo, hi) = (
             u32::try_from(lo)
                 .map_err(|_| Error::invalid("CRAM reference", "position out of range"))?,

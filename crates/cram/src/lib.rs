@@ -19,6 +19,7 @@
 //! bzip2 and lzma from their `-sys` crates. CRAM 2.x and earlier, and
 //! 4.0, are [`omicsweave_core::Error::Unsupported`].
 
+mod cache;
 mod codec;
 mod comp;
 mod container;

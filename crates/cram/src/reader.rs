@@ -1,19 +1,22 @@
 //! [`CramReader`]: a CRAM file with its `.crai`, read by region.
 
+use std::cell::Cell;
 use std::sync::Arc;
+
+use omicsweave_core::cache::{BlockCache, BlockKey, SourceToken};
 
 use omicsweave_core::{
     AlignmentEntry, AlignmentFields, AlignmentRead, AlignmentSize, AlignmentsOut, Error, ReadAt,
     Region, Result, SequenceRead,
 };
 
+use crate::cache::{self, ContainerUse, Meta, PreparedContainer, PreparedSlice, SliceUse};
 use crate::comp::{CompressionHeader, ds};
-use crate::container::{Block, content};
-use crate::header::{CramHeader, read_container_body, read_container_header};
+use crate::header::CramHeader;
 use crate::index::CramIndex;
 use crate::record::{BamFields, Naming};
 use crate::reference::{ByName, NoReference};
-use crate::slice::{Decode, Decoded, References, SliceInput};
+use crate::slice::{Decode, Decoded, References};
 
 /// How records are decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,40 +134,28 @@ impl Staged {
 #[derive(Default)]
 struct Work {
     head: Vec<u8>,
-    /// The last container read: its file offset, bytes after the header
-    /// and compression header, and the slices decoded from it.
-    body_at: Option<u64>,
     body: Vec<u8>,
-    comp: Option<CompressionHeader>,
-    slices: Vec<CachedSlice>,
+    decoded: Decoded,
     scratch: Vec<u8>,
     fields: BamFields,
-}
-
-/// A decoded slice of the last container, kept for following queries.
-struct CachedSlice {
-    index: usize,
-    wanted: u32,
-    bases: bool,
-    /// The query reference a multi-reference slice was decoded for.
-    range_ref: i32,
-    decoded: Decoded,
 }
 
 /// Counters of the work queries did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CramStats {
+    pub read_calls: u64,
     pub containers: u64,
     pub slices_decoded: u64,
     pub records_decoded: u64,
+    pub records_considered: u64,
     pub bytes_read: u64,
 }
 
 /// A CRAM file, its `.crai` index and, when its slices need one, the
 /// reference they were compressed against. Opening reads the header; each
 /// query reads the containers from the one the index gives for its start.
-/// The last container read and the slices decoded from it are kept, so
-/// queries close to each other decode each slice once.
+/// Decoded slices are reused only when a caller explicitly attaches a
+/// BlockCache. Query scratch and staged output are independent per context.
 pub struct CramReader<S, R = NoReference> {
     source: S,
     reference: Option<R>,
@@ -174,6 +165,8 @@ pub struct CramReader<S, R = NoReference> {
     staged: Staged,
     work: Work,
     stats: CramStats,
+    cache: Option<Arc<BlockCache>>,
+    namespace: SourceToken,
 }
 
 /// The range of a query, as htslib's `cram_range`: 1-based start and
@@ -206,6 +199,8 @@ impl<S: ReadAt, R: SequenceRead> CramReader<S, R> {
             staged: Staged::default(),
             work: Work::default(),
             stats: CramStats::default(),
+            cache: None,
+            namespace: SourceToken::new(),
         })
     }
 
@@ -238,8 +233,38 @@ impl<S: ReadAt, R: SequenceRead> CramReader<S, R> {
         self.stats = CramStats::default();
     }
 
-    /// A reader of the same file, index and options with another source
-    /// handle and reference; staged results start empty.
+    /// Attaches caller-managed immutable containers and decoded slices.
+    /// The CRAM, reference, index and options must remain unchanged throughout
+    /// this source session and all contexts cloned from it.
+    pub fn set_cache(&mut self, cache: Option<Arc<BlockCache>>) {
+        self.cache = cache;
+    }
+
+    pub fn cache_namespace(&self) -> SourceToken {
+        self.namespace
+    }
+
+    /// Describes physical container and slice dependencies for these fields,
+    /// without decoding records or constructing alignment output. Reading
+    /// compression and slice headers may require metadata decompression.
+    pub fn describe_cache(
+        &mut self,
+        region: Region<'_>,
+        fields: AlignmentFields,
+        out: &mut Vec<BlockKey>,
+    ) -> Result<()> {
+        self.visit(region, fields, Some(out), false, |_, _| Ok(()))
+    }
+
+    /// Loads the dependencies of the query without constructing its output.
+    /// Without an attached cache the work is performed but not retained.
+    pub fn prefetch_cache(&mut self, region: Region<'_>, fields: AlignmentFields) -> Result<()> {
+        self.visit(region, fields, None, true, |_, _| Ok(()))
+    }
+
+    /// A new source/reference session sharing only immutable header and index.
+    /// These parts must match that metadata. Changed reference contents are
+    /// isolated even when the same external cache remains attached.
     pub fn with_parts<S2: ReadAt, R2: SequenceRead>(
         &self,
         source: S2,
@@ -254,7 +279,35 @@ impl<S: ReadAt, R: SequenceRead> CramReader<S, R> {
             staged: Staged::default(),
             work: Work::default(),
             stats: CramStats::default(),
+            cache: self.cache.clone(),
+            namespace: SourceToken::new(),
         }
+    }
+
+    /// Clones handles of this same immutable source and semantically identical
+    /// reference. The factories must duplicate these handles, not replace their
+    /// contents; use `with_parts` for a new source/reference session.
+    pub fn try_clone_with<C, F>(&self, source: C, reference: F) -> Result<Self>
+    where
+        C: FnOnce(&S) -> Result<S>,
+        F: FnOnce(&R) -> Result<R>,
+    {
+        let mut cloned = self.with_parts(
+            source(&self.source)?,
+            self.reference.as_ref().map(reference).transpose()?,
+        );
+        cloned.namespace = self.namespace;
+        Ok(cloned)
+    }
+
+    /// An independent execution context of a Clone source/reference session.
+    pub fn clone_context(&self) -> Self
+    where
+        S: Clone,
+        R: Clone,
+    {
+        self.try_clone_with(|s| Ok(s.clone()), |r| Ok(r.clone()))
+            .expect("infallible handle clones")
     }
 
     /// Calls `visit` with the decoded slice and record index of every
@@ -265,6 +318,8 @@ impl<S: ReadAt, R: SequenceRead> CramReader<S, R> {
         &mut self,
         region: Region<'_>,
         fields: AlignmentFields,
+        mut keys: Option<&mut Vec<BlockKey>>,
+        prepare: bool,
         mut visit: impl FnMut(&Decoded, usize) -> Result<()>,
     ) -> Result<()> {
         region.check()?;
@@ -280,11 +335,13 @@ impl<S: ReadAt, R: SequenceRead> CramReader<S, R> {
             start: region.start as i64 + 1,
             end: region.end as i64,
         };
-        let Some(mut offset) = self.index.query(range.refid, range.start) else {
+        let Some(offset) = self.index.query(range.refid, range.start) else {
             return Ok(());
         };
-        let offset_u =
-            |o: i64| u64::try_from(o).map_err(|_| Error::invalid("CRAM index", "negative offset"));
+        let mut offset =
+            u64::try_from(offset).map_err(|_| Error::invalid("CRAM index", "negative offset"))?;
+        let calls = Cell::new(0u64);
+        let bytes = Cell::new(0u64);
         let CramReader {
             source,
             reference,
@@ -292,104 +349,105 @@ impl<S: ReadAt, R: SequenceRead> CramReader<S, R> {
             options,
             work,
             stats,
+            cache: attached,
+            namespace,
             ..
         } = self;
-        let mut first = true;
-        loop {
-            let Some(c) = read_container_header(&*source, offset_u(offset)?, &mut work.head)?
-            else {
-                return Ok(());
-            };
-            let next = offset + c.header.header_len as i64 + c.header.length.max(0) as i64;
-            if c.header.length == 0 {
-                offset = next;
-                continue;
-            }
-            let h = &c.header;
-            if first {
-                if h.ref_seq_id != -2
-                    && (h.ref_seq_id < range.refid
-                        || (range.refid >= 0
-                            && h.ref_seq_id == range.refid
-                            && h.ref_seq_end() < range.start))
-                {
+        let source = Counted {
+            source,
+            calls: &calls,
+            bytes: &bytes,
+        };
+        let result = (|| {
+            let mut first = true;
+            loop {
+                let key = cache::meta_key(*namespace, offset);
+                if let Some(keys) = &mut keys {
+                    keys.push(key);
+                }
+                let meta = cache::load(attached, key, || {
+                    Meta::read(&source, offset, &mut work.head)
+                })?;
+                let Some(h) = &meta.header else {
+                    return Ok(());
+                };
+                let next = offset
+                    .checked_add(h.header_len as u64)
+                    .and_then(|n| n.checked_add(h.length as u64))
+                    .ok_or_else(|| Error::invalid("CRAM container", "offset overflow"))?;
+                if h.length == 0 {
                     offset = next;
                     continue;
                 }
-                first = false;
-                if h.ref_seq_id != -2 && h.ref_seq_id != range.refid {
-                    return Ok(());
-                }
-            } else if h.ref_seq_id != -2 {
-                if h.ref_seq_id != range.refid {
-                    return Ok(());
-                }
-                if range.refid != -1 && h.ref_seq_start > range.end {
-                    return Ok(());
-                }
-                if range.refid != -1 && h.ref_seq_end() < range.start {
-                    offset = next;
-                    continue;
-                }
-            }
-            let Work {
-                body_at,
-                body,
-                comp,
-                slices,
-                scratch,
-                ..
-            } = &mut *work;
-            if *body_at != Some(c.offset) {
-                *body_at = None;
-                slices.clear();
-                read_container_body(&*source, &c, body)?;
-                stats.containers += 1;
-                stats.bytes_read += (c.header.header_len + body.len()) as u64;
-                let mut at = 0;
-                let comp_block = Block::parse(body, &mut at)?;
-                if comp_block.content_type != content::COMPRESSION_HEADER {
-                    return Err(Error::invalid("CRAM container", "no compression header"));
-                }
-                *comp = Some(CompressionHeader::parse(
-                    comp_block.uncompress(scratch, options.verify_checksums)?,
-                )?);
-                *body_at = Some(c.offset);
-            }
-            let comp = comp.as_ref().unwrap();
-            if c.header.num_records == 0 {
-                offset = next;
-                continue;
-            }
-            let mut at = 0;
-            Block::parse(body, &mut at)?;
-            let (wanted, bases) = series(fields, comp, options.decode_md);
-            for index in 0..c.header.landmarks.len() {
-                let slice = SliceInput::read(body, &mut at, scratch)?;
-                let sh = &slice.header;
-                if sh.ref_seq_id != -2 {
-                    if sh.ref_seq_id != range.refid {
+                if first {
+                    if h.ref_seq_id != -2
+                        && (h.ref_seq_id < range.refid
+                            || (range.refid >= 0
+                                && h.ref_seq_id == range.refid
+                                && h.ref_seq_end() < range.start))
+                    {
+                        offset = next;
+                        continue;
+                    }
+                    first = false;
+                    if h.ref_seq_id != -2 && h.ref_seq_id != range.refid {
                         return Ok(());
                     }
-                    if range.refid != -1 && sh.ref_seq_start > range.end {
+                } else if h.ref_seq_id != -2 {
+                    if h.ref_seq_id != range.refid
+                        || (range.refid != -1 && h.ref_seq_start > range.end)
+                    {
                         return Ok(());
                     }
-                    if range.refid != -1 && sh.ref_seq_end() < range.start {
+                    if range.refid != -1 && h.ref_seq_end() < range.start {
+                        offset = next;
                         continue;
                     }
                 }
-                let range_ref = if sh.ref_seq_id == -2 { range.refid } else { -3 };
-                let found = slices.iter().position(|k| {
-                    k.index == index
-                        && k.range_ref == range_ref
-                        && k.wanted & wanted == wanted
-                        && (k.bases || !bases)
-                });
-                let at_cache = match found {
-                    Some(i) => i,
-                    None => {
+                let key = cache::body_key(*namespace, offset);
+                if let Some(keys) = &mut keys {
+                    keys.push(key);
+                }
+                let container = cache::load(attached, key, || {
+                    PreparedContainer::read(
+                        &source,
+                        offset,
+                        h,
+                        &mut work.scratch,
+                        options.verify_checksums,
+                        stats,
+                        std::mem::take(&mut work.body),
+                    )
+                })?;
+                let container = ContainerUse {
+                    loaded: container,
+                    spare: &mut work.body,
+                };
+                let (wanted, bases) = series(fields, &container.comp, options.decode_md);
+                for (index, part) in container.parts.iter().enumerate() {
+                    let sh = &part.header;
+                    if sh.ref_seq_id != -2 {
+                        if sh.ref_seq_id != range.refid
+                            || (range.refid != -1 && sh.ref_seq_start > range.end)
+                        {
+                            return Ok(());
+                        }
+                        if range.refid != -1 && sh.ref_seq_end() < range.start {
+                            continue;
+                        }
+                    }
+                    let key =
+                        cache::slice_key(*namespace, offset, index, range.refid, fields, options);
+                    if let Some(keys) = &mut keys {
+                        keys.push(key);
+                    }
+                    if !prepare {
+                        continue;
+                    }
+                    let decoded = cache::load(attached, key, || {
+                        let input = container.slice(part)?;
                         let decode = Decode {
-                            comp,
+                            comp: &container.comp,
                             ref_lens: &header.ref_lens,
                             unknown_rg: header.unknown_rg,
                             wanted,
@@ -411,40 +469,41 @@ impl<S: ReadAt, R: SequenceRead> CramReader<S, R> {
                             }
                             None => None,
                         };
-                        let mut decoded = Decoded::default();
-                        decode.run(&slice, refs, &mut decoded)?;
+                        let mut decoded = std::mem::take(&mut work.decoded);
+                        decode.run(&input, refs, &mut decoded)?;
                         stats.slices_decoded += 1;
                         stats.records_decoded += decoded.recs.len() as u64;
-                        slices.retain(|k| k.index != index || k.range_ref != range_ref);
-                        slices.push(CachedSlice {
-                            index,
-                            wanted,
-                            bases,
-                            range_ref,
-                            decoded,
-                        });
-                        slices.len() - 1
+                        Ok(PreparedSlice::new(decoded, attached))
+                    })?;
+                    let decoded = SliceUse {
+                        loaded: decoded,
+                        spare: &mut work.decoded,
+                    };
+                    let candidates = decoded.candidates(range.refid, range.start, range.end);
+                    for i in candidates.clone() {
+                        stats.records_considered += 1;
+                        let cr = &decoded.decoded.recs[i];
+                        if cr.ref_id < range.refid && cr.ref_id != -1 {
+                            continue;
+                        }
+                        if cr.ref_id != range.refid || (range.refid != -1 && cr.apos > range.end) {
+                            return Ok(());
+                        }
+                        if range.refid != -1 && cr.aend < range.start {
+                            continue;
+                        }
+                        visit(&decoded.decoded, i)?;
                     }
-                };
-                let dec = &slices[at_cache].decoded;
-                for (i, cr) in dec.recs.iter().enumerate() {
-                    if cr.ref_id < range.refid && cr.ref_id != -1 {
-                        continue;
-                    }
-                    if cr.ref_id != range.refid {
+                    if candidates.end < decoded.decoded.recs.len() {
                         return Ok(());
                     }
-                    if range.refid != -1 && cr.apos > range.end {
-                        return Ok(());
-                    }
-                    if range.refid != -1 && cr.aend < range.start {
-                        continue;
-                    }
-                    visit(dec, i)?;
                 }
+                offset = next;
             }
-            offset = next;
-        }
+        })();
+        stats.read_calls += calls.get();
+        stats.bytes_read += bytes.get();
+        result
     }
 }
 
@@ -468,7 +527,7 @@ impl<S: ReadAt, R: SequenceRead> AlignmentRead for CramReader<S, R> {
         let want_seq = fields.contains(AlignmentFields::SEQ);
         let want_qual = fields.contains(AlignmentFields::QUAL);
         let want_cigar = fields.contains(AlignmentFields::CIGAR);
-        let result = self.visit(region, fields, |dec, i| {
+        let result = self.visit(region, fields, None, true, |dec, i| {
             dec.bam_fields(i, &naming, want_name, want_aux || dec.has_aux, &mut f)?;
             staged.entries.push(f.entry);
             if want_name {
@@ -541,5 +600,22 @@ impl<S: ReadAt, R: SequenceRead> AlignmentRead for CramReader<S, R> {
             c.data.copy_from_slice(&s.aux);
         }
         Ok(())
+    }
+}
+
+struct Counted<'a, S> {
+    source: &'a S,
+    calls: &'a Cell<u64>,
+    bytes: &'a Cell<u64>,
+}
+impl<S: ReadAt> ReadAt for Counted<'_, S> {
+    fn len(&self) -> u64 {
+        self.source.len()
+    }
+    fn read_exact_at(&self, out: &mut [u8], offset: u64) -> Result<()> {
+        self.calls.set(self.calls.get().saturating_add(1));
+        self.bytes
+            .set(self.bytes.get().saturating_add(out.len() as u64));
+        self.source.read_exact_at(out, offset)
     }
 }

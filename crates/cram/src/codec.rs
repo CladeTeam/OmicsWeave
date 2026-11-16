@@ -81,9 +81,28 @@ mod encoding {
 }
 
 impl Codec {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Huffman { codes, .. } => std::mem::size_of_val(&**codes),
+            Self::ByteArrayLen { len, val } => {
+                2 * size_of::<Codec>() + len.heap_bytes() + val.heap_bytes()
+            }
+            _ => 0,
+        }
+    }
+
     /// The codec of `encoding` with parameters `data`, for values of type
     /// `ty` (`cram_decoder_init`).
     pub(crate) fn parse(encoding: i32, data: &[u8], ty: ValueType) -> Result<Codec> {
+        Self::parse_inner(encoding, data, ty, 0)
+    }
+
+    fn parse_inner(encoding: i32, data: &[u8], ty: ValueType, depth: u8) -> Result<Codec> {
+        if depth > 32 {
+            return Err(Error::Unsupported(
+                "CRAM byte-array codec nesting exceeds 32",
+            ));
+        }
         let mut cp = data;
         let done = |cp: &[u8]| cp.is_empty();
         match encoding {
@@ -106,7 +125,7 @@ impl Codec {
                         return Err(malformed("BYTE_ARRAY_LEN"));
                     }
                     let (params, rest) = cp.split_at(size as usize);
-                    let codec = Codec::parse(enc, params, ty)?;
+                    let codec = Codec::parse_inner(enc, params, ty, depth + 1)?;
                     cp = rest;
                     Ok(codec)
                 };
@@ -340,6 +359,9 @@ impl<'a> Bits<'a> {
             if b & 1 == 0 {
                 return Some(n - 1);
             }
+            if n == 32 {
+                return None;
+            }
         }
     }
 
@@ -363,6 +385,9 @@ impl<'a> Bits<'a> {
             if b & 1 != 0 {
                 return Some(n - 1);
             }
+            if n == 32 {
+                return None;
+            }
         }
     }
 }
@@ -380,9 +405,11 @@ pub(crate) struct Streams<'a> {
     pub(crate) core: Bits<'a>,
     ext: Vec<External<'a>>,
     /// Content ids below 256: the last external block of that id.
-    small: [u16; 256],
+    small: [usize; 256],
     /// Larger ids by `256 + id % 251`, as htslib's table keys them.
     large: HashMap<u32, usize>,
+    /// First matching block, preserving the collision fallback's file order.
+    large_first: HashMap<i32, usize>,
     crc: bool,
 }
 
@@ -406,6 +433,7 @@ impl<'a> Streams<'a> {
             ext: Vec::new(),
             small: [0; 256],
             large: HashMap::new(),
+            large_first: HashMap::new(),
             crc,
         };
         for b in blocks
@@ -420,9 +448,10 @@ impl<'a> Streams<'a> {
             });
             let v = b.content_id as u32;
             if v < 256 {
-                s.small[v as usize] = at as u16 + 1;
+                s.small[v as usize] = at + 1;
             } else {
                 s.large.insert(256 + v % 251, at);
+                s.large_first.entry(b.content_id).or_insert(at);
             }
         }
         s
@@ -431,14 +460,14 @@ impl<'a> Streams<'a> {
     fn find(&self, id: i32) -> Option<usize> {
         let v = id as u32;
         if v < 256 {
-            return (self.small[v as usize] as usize).checked_sub(1);
+            return self.small[v as usize].checked_sub(1);
         }
         if let Some(&at) = self.large.get(&(256 + v % 251))
             && self.ext[at].block.content_id == id
         {
             return Some(at);
         }
-        self.ext.iter().position(|e| e.block.content_id == id)
+        self.large_first.get(&id).copied()
     }
 
     /// The external block `id`, decompressed; `None` when the slice has
@@ -478,11 +507,12 @@ impl<'a> Streams<'a> {
     fn extract(&mut self, id: i32, n: usize) -> Result<&[u8]> {
         let (data, idx, _) = self.external(id)?.ok_or_else(|| missing(id))?;
         let at = *idx;
-        *idx += n;
-        if *idx > data.len() {
+        let end = at.checked_add(n).filter(|&end| end <= data.len());
+        let Some(end) = end else {
             return Err(exhausted());
-        }
-        Ok(&data[at..at + n])
+        };
+        *idx = end;
+        Ok(&data[at..end])
     }
 }
 
@@ -518,7 +548,7 @@ impl Codec {
                 ty: ValueType::Int,
             } => {
                 let (data, idx, _) = s.external(*id)?.ok_or_else(|| missing(*id))?;
-                let mut cp = &data[*idx..];
+                let mut cp = data.get(*idx..).ok_or_else(exhausted)?;
                 let v = itf8(&mut cp, "CRAM external integer")?;
                 *idx = data.len() - cp.len();
                 Ok(v)
@@ -733,7 +763,7 @@ impl Codec {
                 // The name tokeniser always ends names with NUL.
                 let stop = if tok3 { 0 } else { *stop };
                 let rest = &data[*idx..];
-                let n = memchr::memchr(stop, rest).unwrap_or(rest.len());
+                let n = memchr::memchr(stop, rest).ok_or_else(exhausted)?;
                 out.extend_from_slice(&rest[..n]);
                 *idx += n + 1;
                 Ok(n as i32)
@@ -749,6 +779,97 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_external(out: &mut Vec<u8>, id: u32, value: u8) {
+        out.extend([0, content::EXTERNAL]);
+        if id < 128 {
+            out.push(id as u8);
+        } else if id < 16384 {
+            out.extend([(0x80 | id >> 8) as u8, id as u8]);
+        } else {
+            out.extend([(0xc0 | id >> 16) as u8, (id >> 8) as u8, id as u8]);
+        }
+        out.extend([1, 1, value, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn many_external_blocks_keep_indices_and_collision_order() {
+        let mut data = Vec::new();
+        for i in 0..65_540 {
+            raw_external(&mut data, 7, i as u8);
+        }
+        let mut at = 0;
+        let mut blocks = Vec::new();
+        while at < data.len() {
+            blocks.push(Block::parse(&data, &mut at).unwrap());
+        }
+        let mut streams = Streams::new(&[], &blocks, false);
+        assert_eq!(streams.extract(7, 1).unwrap(), [65_539usize as u8]);
+        let mut data = Vec::new();
+        let ids = [256, 507, 758, 507, 7, 256];
+        for (i, id) in ids.into_iter().enumerate() {
+            raw_external(&mut data, id, i as u8);
+        }
+        let mut at = 0;
+        let mut blocks = Vec::new();
+        while at < data.len() {
+            blocks.push(Block::parse(&data, &mut at).unwrap());
+        }
+        let streams = Streams::new(&[], &blocks, false);
+        assert_eq!(streams.find(256), Some(5));
+        assert_eq!(streams.find(507), Some(1));
+        assert_eq!(streams.find(758), Some(2));
+        assert_eq!(streams.find(7), Some(4));
+        assert_eq!(streams.find(1009), None);
+    }
+
+    #[test]
+    fn failed_byte_extent_and_missing_stop_leave_cursor_valid() {
+        let mut data = Vec::new();
+        raw_external(&mut data, 7, 1);
+        let block = Block::parse(&data, &mut 0).unwrap();
+        let mut streams = Streams::new(&[], &[block], false);
+        assert!(streams.extract(7, usize::MAX).is_err());
+        let stop = Codec::ByteArrayStop {
+            stop: 0,
+            id: 7,
+            ty: ValueType::ByteArrayBlock,
+        };
+        assert!(stop.block(&mut streams, 8, &mut Vec::new()).is_err());
+        assert_eq!(streams.extract(7, 1).unwrap(), [1]);
+    }
+
+    #[test]
+    fn integer_prefixes_stop_at_the_32_bit_value_bound() {
+        let mut zeros = Bits::new(&[0; 1024]);
+        assert_eq!(zeros.zeros(), None);
+        assert!(zeros.byte <= 4);
+        let mut ones = Bits::new(&[255; 1024]);
+        assert_eq!(ones.ones(), None);
+        assert!(ones.byte <= 4);
+        let mut valid = Bits::new(&[0, 0, 0, 1]);
+        assert_eq!(valid.zeros(), Some(31));
+    }
+
+    #[test]
+    fn recursive_codec_parameters_have_a_checked_depth_bound() {
+        let mut params = vec![1, 1, 0, 1, 1, 1];
+        assert!(Codec::parse(encoding::BYTE_ARRAY_LEN, &params, ValueType::ByteArrayBlock).is_ok());
+        for _ in 0..40 {
+            let mut outer = vec![1, 1, 0, 4];
+            if params.len() < 128 {
+                outer.push(params.len() as u8);
+            } else {
+                outer.extend([(0x80 | params.len() >> 8) as u8, params.len() as u8]);
+            }
+            outer.extend(params);
+            params = outer;
+        }
+        assert!(matches!(
+            Codec::parse(encoding::BYTE_ARRAY_LEN, &params, ValueType::ByteArrayBlock),
+            Err(Error::Unsupported(_))
+        ));
+    }
 
     #[test]
     fn huffman_canonical_codes() {

@@ -171,6 +171,24 @@ fn tag_lines(data: &[u8]) -> Vec<Vec<[u8; 3]>> {
 }
 
 impl CompressionHeader {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.tag_lines.capacity() * size_of::<Vec<[u8; 3]>>()
+            + self
+                .tag_lines
+                .iter()
+                .map(|v| v.capacity() * 3)
+                .sum::<usize>()
+            + self.codecs.capacity() * size_of::<Option<Codec>>()
+            + self
+                .codecs
+                .iter()
+                .flatten()
+                .map(Codec::heap_bytes)
+                .sum::<usize>()
+            + self.tags.capacity() * size_of::<(u32, Codec)>()
+            + self.tags.values().map(Codec::heap_bytes).sum::<usize>()
+    }
+
     /// Parses the uncompressed bytes of a compression header block.
     pub(crate) fn parse(data: &[u8]) -> Result<CompressionHeader> {
         let what = "CRAM compression header";
