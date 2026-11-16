@@ -509,9 +509,15 @@ impl Accumulator for FragmentStage {
         if self.spec.fragments {
             let rel = format!("{}/fragments.tsv.gz", self.spec.name);
             let path = d.path(&rel)?;
-            crate::sink::fragments::write(table, &path, d)?;
+            let index = crate::sink::fragments::write(table, &path, d)?;
             files.push(Json::from(rel.clone()));
-            files.push(Json::from(format!("{rel}.tbi")));
+            files.push(Json::from(
+                index
+                    .strip_prefix(d.dir)
+                    .expect("index in output directory")
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
         }
         let rel = format!("{}/barcode_metrics.csv", self.spec.name);
         let path = d.path(&rel)?;

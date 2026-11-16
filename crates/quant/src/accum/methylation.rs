@@ -37,7 +37,7 @@
 //!   sequenced (1-based, hard clips included), before overlapping calls
 //!   are dropped.
 //!
-//! Products: `<name>/cytosines.tsv.gz` (+ `.tbi`; chrom, start, end,
+//! Products: `<name>/cytosines.tsv.gz` (+ `.tbi` / `.csi`; chrom, start, end,
 //! context, strand, methylated, unmethylated, 0-based half-open; with
 //! `merge_cpg` the two cytosines of a CpG are one line `[C, C + 2)` with
 //! strand `.`), `<name>/beta.bw` and `<name>/coverage.bw` over the same
@@ -50,8 +50,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use omicsweave_bam::flag;
+use omicsweave_bam::mods::{ModDecoder, ModSeq, ModTags};
 use omicsweave_convert::stage::{Sorter, Spill, read_or_end};
-use omicsweave_core::{Error, Result};
+use omicsweave_core::{Error, ModificationEntry, Result};
 use omicsweave_gtf::Selection;
 use smallvec::SmallVec;
 use std::io::Read;
@@ -378,6 +379,14 @@ pub struct MethylBatch {
     status: MethylStatus,
     no_row: Vec<u64>,
     calls: Vec<(Call, u32)>,
+    mods: ModScratch,
+}
+
+/// Buffers of `MM` / `ML` decoding, reused from read to read.
+#[derive(Default)]
+struct ModScratch {
+    decoder: ModDecoder,
+    rows: Vec<ModificationEntry>,
 }
 
 pub struct MethylTotal<'p> {
@@ -457,7 +466,12 @@ impl MethylStage {
     }
 
     /// The read's calls into `out` as `(call, query position)`.
-    fn calls(&self, r: &ReadView<'_>, out: &mut Vec<(Call, u32)>) -> Result<Outcome> {
+    fn calls(
+        &self,
+        r: &ReadView<'_>,
+        out: &mut Vec<(Call, u32)>,
+        mods: &mut ModScratch,
+    ) -> Result<Outcome> {
         out.clear();
         let source = match self.spec.source {
             CallSource::Auto => {
@@ -473,7 +487,7 @@ impl MethylStage {
         };
         match source {
             CallSource::Bismark => self.bismark(r, out),
-            CallSource::Modifications => self.modifications(r, out),
+            CallSource::Modifications => self.modifications(r, out, mods),
             _ => self.reference(r, out),
         }
     }
@@ -582,145 +596,102 @@ impl MethylStage {
         Ok(Outcome::Called)
     }
 
-    fn modifications(&self, r: &ReadView<'_>, out: &mut Vec<(Call, u32)>) -> Result<Outcome> {
-        let mm = r.tag_bytes(*b"MM").or_else(|| r.tag_bytes(*b"Mm"));
-        let ml = match r.tag(*b"ML").or_else(|| r.tag(*b"Ml")) {
-            Some(crate::prelude::Aux::Array(b'C', v)) => Some(v),
-            Some(_) => return Ok(Outcome::Malformed),
-            None => None,
-        };
-        let (Some(mm), Some(ml)) = (mm, ml) else {
-            return Ok(Outcome::NoSource);
+    fn modifications(
+        &self,
+        r: &ReadView<'_>,
+        out: &mut Vec<(Call, u32)>,
+        m: &mut ModScratch,
+    ) -> Result<Outcome> {
+        let (a, b) = r.rec.aux();
+        let tags = match ModTags::find(&[a, b]) {
+            Ok(Some(t)) if t.ml().is_some() => t,
+            Ok(_) => return Ok(Outcome::NoSource),
+            Err(_) => return Ok(Outcome::Malformed),
         };
         let l_seq = r.rec.l_seq();
-        if let Some(n) = r.tag(*b"MN").and_then(|a| a.int())
-            && n as usize != l_seq
+        if let Some(n) = tags.mn()
+            && n != l_seq as i64
         {
             return Ok(Outcome::Malformed);
         }
-        if r.hard_clips() != (0, 0) && r.tag(*b"MN").is_none() {
+        if r.hard_clips() != (0, 0) && tags.mn().is_none() {
             return Ok(Outcome::Malformed);
         }
         let reverse = r.is_reverse();
+        m.rows.clear();
+        let seq = ModSeq::Packed {
+            bytes: r.rec.packed_seq(),
+            len: l_seq,
+        };
+        if m.decoder
+            .decode(&tags, seq, reverse, &[b'm' as i32], &mut m.rows)
+            .is_err()
+        {
+            return Ok(Outcome::Malformed);
+        }
+        let mut types = m
+            .decoder
+            .types()
+            .iter()
+            .filter(|t| t.canonical == b'C' && !t.minus && t.code == b'm' as i32);
+        let Some(first) = types.next() else {
+            return Ok(Outcome::Called);
+        };
+        let explicit = first.explicit;
+        // Repeated types have no unique probability or skipped-base mode.
+        if types.next().is_some() {
+            return Ok(Outcome::Malformed);
+        }
+        let mut listed = m
+            .rows
+            .iter()
+            .filter(|e| e.canonical == b'C' && e.flags & ModificationEntry::MINUS == 0);
+        let mut next = if reverse {
+            listed.next_back()
+        } else {
+            listed.next()
+        };
+        let packed = r.rec.packed_seq();
+        let base = |q: usize| -> u8 {
+            // SAFETY: callers pass q < l_seq; Record::parse validates that
+            // packed contains ceil(l_seq / 2) bytes. A nibble is below 16.
+            unsafe {
+                let byte = *packed.get_unchecked(q / 2);
+                *b"=ACMGRSVTWYHKDBN".get_unchecked(((byte >> (4 * (1 - q % 2))) & 15) as usize)
+            }
+        };
         // Bases of the read as sequenced.
         let original = |k: usize| -> u8 {
             if reverse {
-                complement(r.base(l_seq - 1 - k))
+                complement(base(l_seq - 1 - k))
             } else {
-                r.base(k)
+                base(k)
             }
-        };
-        // Probabilities of 5mC per C of the read as sequenced: `Some(v)`
-        // listed with ML value v, `None` unlisted.
-        let mut ml_at = 0usize;
-        let mut found: Option<(Vec<Option<u8>>, bool)> = None;
-        for group in mm.split(|&c| c == b';') {
-            if group.is_empty() {
-                continue;
-            }
-            let mut fields = group.split(|&c| c == b',');
-            let head = fields.next().unwrap_or(&[]);
-            if head.len() < 3 {
-                return Ok(Outcome::Malformed);
-            }
-            let (base, strand) = (head[0], head[1]);
-            let mut codes = &head[2..];
-            let mut explicit = false;
-            if let Some(&last) = codes.last()
-                && (last == b'?' || last == b'.')
-            {
-                explicit = last == b'?';
-                codes = &codes[..codes.len() - 1];
-            }
-            let n_codes = if codes.iter().all(u8::is_ascii_digit) {
-                1
-            } else {
-                codes.len()
-            };
-            let m_index = codes.iter().position(|&c| c == b'm');
-            if !(base == b'C' && strand == b'+' && found.is_none() && m_index.is_some()) {
-                let count = fields.try_fold(0usize, |n, f| {
-                    std::str::from_utf8(f).ok()?.parse::<usize>().ok()?;
-                    n.checked_add(1)
-                });
-                let Some(next_ml) = count
-                    .and_then(|n| n.checked_mul(n_codes))
-                    .and_then(|n| ml_at.checked_add(n))
-                else {
-                    return Ok(Outcome::Malformed);
-                };
-                if next_ml > ml.len() {
-                    return Ok(Outcome::Malformed);
-                }
-                ml_at = next_ml;
-                continue;
-            }
-            let skips: SmallVec<[usize; 8]> = match fields
-                .map(|f| std::str::from_utf8(f).ok()?.parse::<usize>().ok())
-                .collect::<Option<SmallVec<[usize; 8]>>>()
-            {
-                Some(v) => v,
-                None => return Ok(Outcome::Malformed),
-            };
-            let Some(next_ml) = skips
-                .len()
-                .checked_mul(n_codes)
-                .and_then(|n| ml_at.checked_add(n))
-            else {
-                return Ok(Outcome::Malformed);
-            };
-            if next_ml > ml.len() {
-                return Ok(Outcome::Malformed);
-            }
-            if base == b'C'
-                && strand == b'+'
-                && found.is_none()
-                && let Some(mi) = m_index
-            {
-                let mut probs = Vec::new();
-                let mut c_seen = 0usize;
-                let mut listed = skips.iter().enumerate();
-                let mut next = listed.next();
-                let mut skip_left = next.map(|(_, &s)| s);
-                for k in 0..l_seq {
-                    if original(k) != b'C' {
-                        continue;
-                    }
-                    c_seen += 1;
-                    match (next, skip_left) {
-                        (Some((li, _)), Some(0)) => {
-                            probs.push(Some(ml[ml_at + li * n_codes + mi]));
-                            next = listed.next();
-                            skip_left = next.map(|(_, &s)| s);
-                        }
-                        (Some(_), Some(s)) => {
-                            probs.push(None);
-                            skip_left = Some(s - 1);
-                        }
-                        _ => probs.push(None),
-                    }
-                }
-                if next.is_some() || c_seen != probs.len() {
-                    return Ok(Outcome::Malformed);
-                }
-                found = Some((probs, explicit));
-            }
-            ml_at = next_ml;
-        }
-        let Some((probs, explicit)) = found else {
-            return Ok(Outcome::Called);
         };
         let p = self.spec.min_probability;
         let qual = r.rec.qual();
         let mask = r.masked()?;
         let genome = r.has_reference_context()?;
-        let mut c_index = 0usize;
+        let mut segments = r.segments().iter();
+        let mut segment = if reverse {
+            segments.next_back()
+        } else {
+            segments.next()
+        };
+        // Walks the listed cytosines in the order the read was sequenced.
         for k in 0..l_seq {
             if original(k) != b'C' {
                 continue;
             }
-            let prob = probs[c_index];
-            c_index += 1;
+            let q = if reverse { l_seq - 1 - k } else { k } as u32;
+            let prob = next.filter(|e| e.qpos as u32 == q).map(|e| {
+                next = if reverse {
+                    listed.next_back()
+                } else {
+                    listed.next()
+                };
+                e.probability
+            });
             let meth = match prob {
                 Some(v) => {
                     let x = (v as f64 + 0.5) / 256.0;
@@ -735,8 +706,28 @@ impl MethylStage {
                 None if explicit => continue,
                 None => false,
             };
-            let q = if reverse { l_seq - 1 - k } else { k } as u32;
-            let Some(pos) = r.reference_at(q) else {
+            // Query positions are monotone, so each CIGAR segment is
+            // visited once instead of binary-searching for each cytosine.
+            while segment.is_some_and(|&(_, qs, len)| {
+                if reverse {
+                    q < qs
+                } else {
+                    q >= qs && q - qs >= len
+                }
+            }) {
+                segment = if reverse {
+                    segments.next_back()
+                } else {
+                    segments.next()
+                };
+            }
+            let Some(&(rp, qs, len)) = segment else {
+                continue;
+            };
+            let Some(delta) = q.checked_sub(qs).filter(|&d| d < len) else {
+                continue;
+            };
+            let Some(pos) = rp.checked_add(delta) else {
                 continue;
             };
             if !self.quality_ok(qual, q as usize) || mask.binary_search(&pos).is_ok() {
@@ -767,7 +758,7 @@ impl MethylStage {
                     if x < 0 || x as usize >= l_seq {
                         b'N'
                     } else {
-                        r.base(x as usize)
+                        base(x as usize)
                     }
                 };
                 if reverse {
@@ -1052,6 +1043,7 @@ impl Accumulator for MethylStage {
             status: MethylStatus::default(),
             no_row: vec![0; m],
             calls: Vec::new(),
+            mods: ModScratch::default(),
         }
     }
 
@@ -1062,7 +1054,7 @@ impl Accumulator for MethylStage {
             return Ok(());
         }
         let mut calls = std::mem::take(&mut b.calls);
-        let outcome = self.calls(r, &mut calls)?;
+        let outcome = self.calls(r, &mut calls, &mut b.mods)?;
         match outcome {
             Outcome::NoSource => b.status.no_source += 1,
             Outcome::Malformed => b.status.malformed += 1,
@@ -1327,7 +1319,15 @@ impl Accumulator for MethylStage {
         )?;
         if let Some(t) = &table {
             files.push(Json::from(t.clone()));
-            files.push(Json::from(format!("{t}.tbi")));
+        }
+        if let Some(index) = &written.index {
+            files.push(Json::from(
+                index
+                    .strip_prefix(d.dir)
+                    .expect("index in output directory")
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
         }
         if let Some((a, b)) = tracks {
             files.push(Json::from(a));
@@ -1387,6 +1387,46 @@ impl Accumulator for MethylStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_modification_types_are_ambiguous() {
+        use crate::assign::{BatchSpaces, Spaces};
+        use crate::reference::BatchCtx;
+        let spaces = Spaces::default();
+        let ctx = BatchCtx {
+            spaces: BatchSpaces::new(&spaces, 0),
+            reference: None,
+            variants: None,
+        };
+        let stage = MethylStage {
+            spec: Methylation::default(),
+            matrices: vec![],
+            table_bytes: 0,
+        };
+        let mut raw = vec![0u8; 32];
+        raw[8] = 2;
+        raw[9] = 60;
+        raw[12..14].copy_from_slice(&1u16.to_le_bytes());
+        raw[16..20].copy_from_slice(&6i32.to_le_bytes());
+        raw[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        raw[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+        raw.extend_from_slice(b"r\0");
+        raw.extend_from_slice(&(6u32 << 4).to_le_bytes());
+        raw.extend_from_slice(&[0x24, 0x22, 0x42]);
+        raw.extend_from_slice(&[30; 6]);
+        raw.extend_from_slice(b"MMZC+m?,0;C+m.,1;\0MLBC");
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.extend_from_slice(&[255, 0]);
+        let rec = omicsweave_bam::Record::parse(&raw, 1).unwrap();
+        let view = ReadView::new(0, 0, rec, &ctx);
+        let mut calls = Vec::new();
+        let mut mods = ModScratch::default();
+        assert_eq!(
+            stage.modifications(&view, &mut calls, &mut mods).unwrap(),
+            Outcome::Malformed
+        );
+        assert!(calls.is_empty());
+    }
 
     #[test]
     fn repeated_spliced_calls_reuse_actual_fasta_windows() {

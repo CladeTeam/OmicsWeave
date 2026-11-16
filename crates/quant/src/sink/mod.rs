@@ -4,12 +4,12 @@
 //! |---|---|
 //! | [`Track`](crate::model::Track) | bigWig ([`bigwig`]), with an optional `.sidecar` |
 //! | [`CountMatrix`](crate::model::CountMatrix) | a 10x directory: `barcodes.tsv.gz`, `features.tsv.gz`, `matrix.cpk` (CellPack), `matrix.mtx.gz` or `matrix.csv.gz`; optionally a featureCounts-style `counts.tsv` ([`matrix`]) |
-//! | [`FragmentTable`](crate::model::FragmentTable) | 10x `fragments.tsv.gz` with its tabix `.tbi` ([`fragments`]) |
+//! | [`FragmentTable`](crate::model::FragmentTable) | 10x `fragments.tsv.gz` with its tabix `.tbi` / `.csi` ([`fragments`]) |
 //! | [`BarcodeMetrics`](crate::model::BarcodeMetrics) | CSV ([`table`]) |
 //! | [`JunctionTable`](crate::model::JunctionTable) | `junctions.tab`, STAR's `SJ.out.tab` columns ([`junctions`]) |
 //! | [`Histogram`](crate::model::Histogram) | `conversions.tsv.gz` ([`table`]) |
 //! | [`MismatchTable`](crate::model::MismatchTable) | `mismatches.tsv` ([`table`]) |
-//! | [`Cytosine`](crate::model::Cytosine)s | `cytosines.tsv.gz` with its `.tbi`, `beta.bw`, `coverage.bw` ([`methylation`]) |
+//! | [`Cytosine`](crate::model::Cytosine)s | `cytosines.tsv.gz` with its `.tbi` / `.csi`, `beta.bw`, `coverage.bw` ([`methylation`]) |
 //! | [`Mbias`](crate::model::Mbias) | `mbias.tsv` ([`table`]) |
 //! | [`ContactTable`](crate::model::ContactTable) | 4DN `contacts.pairs.gz` ([`pairs`]) and Juicer `contacts.hic` ([`hic`]) |
 //! | [`VariantTable`](crate::model::VariantTable) | `variants.tsv.gz` ([`table`]) |

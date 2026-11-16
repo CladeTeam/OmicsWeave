@@ -5,10 +5,11 @@
 
 use std::fs::File;
 use std::io::BufWriter;
+use std::path::PathBuf;
 
 use omicsweave_bbi::{BigWigWriter, Chrom, WriteOptions};
-use omicsweave_core::Result;
 use omicsweave_core::exec::Exec;
+use omicsweave_core::{Error, Result};
 
 use super::fragments::IndexedBed;
 use super::push_u64;
@@ -23,6 +24,8 @@ pub struct Written {
     pub cytosines: u64,
     /// Lines of the table (CpGs merged).
     pub lines: u64,
+    /// The table's index, when a table was requested.
+    pub index: Option<PathBuf>,
 }
 
 /// One line: `[start, end)` with its strand (`+`, `-` or `.`).
@@ -32,8 +35,8 @@ struct Line {
     end: u32,
     context: usize,
     strand: u8,
-    meth: u32,
-    unmeth: u32,
+    meth: u64,
+    unmeth: u64,
 }
 
 /// Merges the two cytosines of each CpG into one line when `merge`.
@@ -43,55 +46,77 @@ struct Lines {
     pending: Option<Cytosine>,
 }
 
-fn single(c: &Cytosine) -> Line {
-    Line {
+fn single(c: &Cytosine) -> Result<Line> {
+    let end = c
+        .pos
+        .checked_add(1)
+        .ok_or_else(|| Error::invalid("methylation output", "cytosine end exceeds u32"))?;
+    Ok(Line {
         tid: c.tid,
         start: c.pos,
-        end: c.pos + 1,
+        end,
         context: c.context(),
         strand: if c.reverse() { b'-' } else { b'+' },
-        meth: c.meth,
-        unmeth: c.unmeth,
-    }
+        meth: u64::from(c.meth),
+        unmeth: u64::from(c.unmeth),
+    })
 }
 
-fn cpg(start: u32, tid: u32, meth: u32, unmeth: u32) -> Line {
-    Line {
+fn cpg(start: u32, tid: u32, meth: u64, unmeth: u64) -> Result<Line> {
+    let end = start
+        .checked_add(2)
+        .ok_or_else(|| Error::invalid("methylation output", "CpG end exceeds u32"))?;
+    Ok(Line {
         tid,
         start,
-        end: start + 2,
+        end,
         context: 0,
         strand: b'.',
         meth,
         unmeth,
-    }
+    })
 }
 
 impl Lines {
     fn push(&mut self, c: Cytosine, out: &mut impl FnMut(Line) -> Result<()>) -> Result<()> {
         if !self.merge {
-            return out(single(&c));
+            return out(single(&c)?);
         }
         let is_cpg = c.context() == 0;
         if let Some(p) = self.pending.take() {
-            if is_cpg && c.reverse() && c.tid == p.tid && c.pos == p.pos + 1 {
-                return out(cpg(p.pos, p.tid, p.meth + c.meth, p.unmeth + c.unmeth));
+            if is_cpg && c.reverse() && c.tid == p.tid && p.pos.checked_add(1) == Some(c.pos) {
+                return out(cpg(
+                    p.pos,
+                    p.tid,
+                    u64::from(p.meth) + u64::from(c.meth),
+                    u64::from(p.unmeth) + u64::from(c.unmeth),
+                )?);
             }
-            out(cpg(p.pos, p.tid, p.meth, p.unmeth))?;
+            out(cpg(p.pos, p.tid, u64::from(p.meth), u64::from(p.unmeth))?)?;
         }
         match (is_cpg, c.reverse()) {
             (true, false) => {
                 self.pending = Some(c);
                 Ok(())
             }
-            (true, true) => out(cpg(c.pos.saturating_sub(1), c.tid, c.meth, c.unmeth)),
-            _ => out(single(&c)),
+            (true, true) => out(cpg(
+                c.pos.checked_sub(1).ok_or_else(|| {
+                    Error::invalid(
+                        "methylation output",
+                        "reverse CpG has no preceding position",
+                    )
+                })?,
+                c.tid,
+                u64::from(c.meth),
+                u64::from(c.unmeth),
+            )?),
+            _ => out(single(&c)?),
         }
     }
 
     fn finish(&mut self, out: &mut impl FnMut(Line) -> Result<()>) -> Result<()> {
         match self.pending.take() {
-            Some(p) => out(cpg(p.pos, p.tid, p.meth, p.unmeth)),
+            Some(p) => out(cpg(p.pos, p.tid, u64::from(p.meth), u64::from(p.unmeth))?),
             None => Ok(()),
         }
     }
@@ -163,9 +188,9 @@ pub fn write(
             text.push(b'\t');
             text.push(l.strand);
             text.push(b'\t');
-            push_u64(&mut text, l.meth as u64);
+            push_u64(&mut text, l.meth);
             text.push(b'\t');
-            push_u64(&mut text, l.unmeth as u64);
+            push_u64(&mut text, l.unmeth);
             text.push(b'\n');
             b.push(l.tid, l.start, l.end, &text)?;
         }
@@ -174,7 +199,7 @@ pub fn write(
                 Some((t, e)) => t != l.tid || l.start >= e,
                 None => true,
             };
-            let total = l.meth as u64 + l.unmeth as u64;
+            let total = l.meth + l.unmeth;
             if free && total > 0 {
                 beta.add(l.tid, l.start, l.end, (l.meth as f64 / total as f64) as f32)?;
                 cov.add(l.tid, l.start, l.end, total as f32)?;
@@ -189,9 +214,10 @@ pub fn write(
     };
     cytosines.drain(|c| merger.push(c, &mut out))?;
     merger.finish(&mut out)?;
-    if let (Some(b), Some(p)) = (bed, &table_path) {
-        b.finish(p, d)?;
-    }
+    let index = match (bed, &table_path) {
+        (Some(b), Some(p)) => Some(b.finish(p, d)?),
+        _ => None,
+    };
     if let Some(ws) = bigwigs {
         for (w, _) in ws {
             let (file, _) = w.finish()?;
@@ -201,5 +227,80 @@ pub fn write(
     Ok(Written {
         cytosines: n,
         lines,
+        index,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merged_cpg_counts_and_last_representable_end_do_not_wrap() {
+        let forward = Cytosine {
+            tid: 0,
+            pos: u32::MAX - 2,
+            code: 0,
+            meth: u32::MAX,
+            unmeth: u32::MAX,
+        };
+        let reverse = Cytosine {
+            pos: u32::MAX - 1,
+            code: 4,
+            ..forward
+        };
+        let mut merger = Lines {
+            merge: true,
+            pending: None,
+        };
+        let mut rows = Vec::new();
+        let mut output = |line| {
+            rows.push(line);
+            Ok(())
+        };
+        merger.push(forward, &mut output).unwrap();
+        merger.push(reverse, &mut output).unwrap();
+        merger.finish(&mut output).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].start, rows[0].end), (u32::MAX - 2, u32::MAX));
+        assert_eq!(
+            (rows[0].meth, rows[0].unmeth),
+            (u64::from(u32::MAX) * 2, u64::from(u32::MAX) * 2)
+        );
+    }
+
+    #[test]
+    fn unrepresentable_cytosine_and_cpg_ends_are_errors() {
+        let c = Cytosine {
+            tid: 0,
+            pos: u32::MAX,
+            code: 2,
+            meth: 1,
+            unmeth: 0,
+        };
+        assert!(single(&c).is_err());
+        assert!(cpg(u32::MAX - 1, 0, 1, 0).is_err());
+        let last = single(&Cytosine {
+            pos: u32::MAX - 1,
+            ..c
+        })
+        .unwrap();
+        assert_eq!(last.end, u32::MAX);
+        let mut merger = Lines {
+            merge: true,
+            pending: None,
+        };
+        assert!(
+            merger
+                .push(
+                    Cytosine {
+                        pos: 0,
+                        code: 4,
+                        ..c
+                    },
+                    &mut |_| Ok(())
+                )
+                .is_err()
+        );
+    }
 }

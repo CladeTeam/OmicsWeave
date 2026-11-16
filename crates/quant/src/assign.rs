@@ -236,11 +236,14 @@ impl FeatureSpace {
         let mut b = IntervalSetBuilder::new().chroms(chroms.iter().map(|c| c.0.as_str()))?;
         let mut t = FeatureTable::new(kind);
         for (name, len) in &chroms {
-            let size = r.query(Region {
-                chrom: name,
-                start: 0,
-                end: *len,
-            })?;
+            let size = r.query(
+                Region {
+                    chrom: name,
+                    start: 0,
+                    end: *len,
+                },
+                false,
+            )?;
             let mut entries = vec![IntervalEntry::default(); size.entries];
             let mut offsets = vec![0i64; size.entries + 1];
             let mut data = vec![0u8; size.annotation_bytes];
