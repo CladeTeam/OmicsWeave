@@ -111,6 +111,10 @@ fn piece_len(budget: &Budget) -> usize {
     text_batch(budget) & !3
 }
 
+/// Record names and lengths, whether they came from the FAI, and the 2bit
+/// offset width.
+type TwoBitNames = (Vec<(String, u64)>, bool, u32);
+
 impl FastaToTwoBit {
     pub fn new(src: impl Into<PathBuf>, dst: impl Into<PathBuf>) -> FastaToTwoBit {
         FastaToTwoBit {
@@ -137,7 +141,7 @@ impl FastaToTwoBit {
 
     /// Names, lengths and offset width. An ambiguous FAI layout needs a
     /// text pass because N and soft-mask runs occupy record header space.
-    fn names(&self, ctx: &Context<'_>) -> Result<(Vec<(String, u64)>, bool, u32)> {
+    fn names(&self, ctx: &Context<'_>) -> Result<TwoBitNames> {
         let fai = fai_path(&self.src);
         if fai.exists() && detect(&self.src)? != Compression::Gzip {
             let fai = Fai::load(&self.src)?;
