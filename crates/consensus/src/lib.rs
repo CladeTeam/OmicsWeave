@@ -25,3 +25,4 @@ mod select;
 pub use consensus::{Alleles, Consensus, ConsensusOptions, Mark};
 pub use mask::{Mask, MaskWith};
 pub use records::{Overlap, RecordFilter};
+pub use select::is_haplotype;

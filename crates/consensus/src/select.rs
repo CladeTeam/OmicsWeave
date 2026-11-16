@@ -18,6 +18,12 @@ const PICK_IUPAC: u8 = 16;
 // allele numbers require a wide genotype and are rejected before selection.
 const BYTE_GT_ALLELES: usize = 64;
 
+/// Whether `s` is a haplotype `-H` takes: `1`, `2`, ...; `R`, `A`, `L` /
+/// `LR`, `S` / `SR`, `LA`, `SA`, `I`; `<N>pIu` (any case).
+pub fn is_haplotype(s: &str) -> bool {
+    Haplotype::parse(s).is_some()
+}
+
 /// A parsed `-H`: pick rules and a 1-based haplotype (0 for none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Haplotype {
