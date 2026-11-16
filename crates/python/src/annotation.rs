@@ -16,12 +16,21 @@ use omicsweave_gtf::{
     Aliases, AttributePolicy, Dialect, Flank, GtfLayout, Level, NONE, ReadOptions, Row, Select,
     Selection, Strand, StringPool, Tags,
 };
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::error::OrRaise;
-use crate::shared::slice;
+use crate::shared::{process_id, slice};
+
+fn check_process(process: u32) -> PyResult<()> {
+    if process != process_id() {
+        return Err(PyRuntimeError::new_err(
+            "annotation query state cannot be reused after fork; reopen or rebuild it in this process",
+        ));
+    }
+    Ok(())
+}
 
 type PyStrings<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<u8>>);
 
@@ -98,18 +107,21 @@ impl<'py> Columns<'py> {
 #[pyclass(frozen, name = "Annotation", module = "omicsweave._native")]
 pub struct GeneAnnotation {
     inner: Arc<gtf::Annotation>,
+    process: u32,
 }
 
 /// An interval set: derived from an annotation or built from columns.
 #[pyclass(frozen, module = "omicsweave._native")]
 pub struct IntervalSet {
     inner: Arc<gtf::IntervalSet>,
+    process: u32,
 }
 
 impl IntervalSet {
     fn wrap(set: gtf::IntervalSet) -> IntervalSet {
         IntervalSet {
             inner: Arc::new(set),
+            process: std::process::id(),
         }
     }
 }
@@ -212,7 +224,8 @@ impl IntervalSet {
         chrom: &str,
         start: u32,
         end: u32,
-    ) -> Bound<'py, PyArray1<u32>> {
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        check_process(self.process)?;
         let s = Arc::clone(&self.inner);
         let hits = py.detach(|| {
             let mut out = Vec::new();
@@ -221,7 +234,7 @@ impl IntervalSet {
             }
             out
         });
-        hits.into_pyarray(py)
+        Ok(hits.into_pyarray(py))
     }
 
     /// Overlaps of many regions: (offsets, rows), region `i`'s rows being
@@ -233,6 +246,7 @@ impl IntervalSet {
         starts: PyReadonlyArray1<'_, u32>,
         ends: PyReadonlyArray1<'_, u32>,
     ) -> PyResult<BatchHits<'py>> {
+        check_process(self.process)?;
         let starts = slice(&starts, "starts")?;
         let ends = slice(&ends, "ends")?;
         if chroms.len() != starts.len() || ends.len() != starts.len() {
@@ -288,8 +302,9 @@ fn check_selection(ann: &gtf::Annotation, sel: &Option<Selection>) -> Result<()>
 
 impl GeneAnnotation {
     /// The annotation, shared (for quantification).
-    pub(crate) fn shared(&self) -> Arc<gtf::Annotation> {
-        Arc::clone(&self.inner)
+    pub(crate) fn shared(&self) -> PyResult<Arc<gtf::Annotation>> {
+        check_process(self.process)?;
+        Ok(Arc::clone(&self.inner))
     }
 
     fn with<R: Send>(
@@ -297,6 +312,7 @@ impl GeneAnnotation {
         py: Python<'_>,
         f: impl FnOnce(&gtf::Annotation) -> Result<R> + Send,
     ) -> PyResult<R> {
+        check_process(self.process)?;
         let a = Arc::clone(&self.inner);
         py.detach(|| f(&a)).or_raise()
     }
@@ -360,6 +376,7 @@ impl GeneAnnotation {
             .or_raise()?;
         Ok(GeneAnnotation {
             inner: Arc::new(ann),
+            process: std::process::id(),
         })
     }
 
@@ -413,6 +430,7 @@ impl GeneAnnotation {
     }
 
     fn transcripts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        check_process(self.process)?;
         let a = Arc::clone(&self.inner);
         let t = a.transcripts();
         let (id, name, biotype, source, ftype, tags, lengths, cds) = py.detach(|| {
@@ -467,6 +485,7 @@ impl GeneAnnotation {
     /// holds the row numbers.
     #[pyo3(signature = (exons_only=false))]
     fn features<'py>(&self, py: Python<'py>, exons_only: bool) -> PyResult<Bound<'py, PyDict>> {
+        check_process(self.process)?;
         let a = Arc::clone(&self.inner);
         let f = a.features();
         let (rows, ftype, seqid) = py.detach(|| {
@@ -497,9 +516,10 @@ impl GeneAnnotation {
     }
 
     /// Feature rows of exons, ascending.
-    fn exons<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u32>> {
+    fn exons<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        check_process(self.process)?;
         let a = Arc::clone(&self.inner);
-        py.detach(|| a.exons().to_vec()).into_pyarray(py)
+        Ok(py.detach(|| a.exons().to_vec()).into_pyarray(py))
     }
 
     /// Counts, and problems as (kind names, lines, ids).
@@ -525,12 +545,20 @@ impl GeneAnnotation {
     }
 
     /// Gene rows by id (`by="id"`) or name.
-    fn gene_rows<'py>(&self, py: Python<'py>, key: &str, by: &str) -> Bound<'py, PyArray1<u32>> {
-        let rows = match by {
-            "name" => self.inner.genes_by_name(key),
-            _ => self.inner.genes_by_id(key),
-        };
-        rows.to_vec().into_pyarray(py)
+    fn gene_rows<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+        by: &str,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let rows = self.with(py, |a| {
+            Ok(match by {
+                "name" => a.genes_by_name(key),
+                _ => a.genes_by_id(key),
+            }
+            .to_vec())
+        })?;
+        Ok(rows.into_pyarray(py))
     }
 
     fn transcript_rows<'py>(
@@ -538,12 +566,15 @@ impl GeneAnnotation {
         py: Python<'py>,
         key: &str,
         by: &str,
-    ) -> Bound<'py, PyArray1<u32>> {
-        let rows = match by {
-            "name" => self.inner.transcripts_by_name(key),
-            _ => self.inner.transcripts_by_id(key),
-        };
-        rows.to_vec().into_pyarray(py)
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let rows = self.with(py, |a| {
+            Ok(match by {
+                "name" => a.transcripts_by_name(key),
+                _ => a.transcripts_by_id(key),
+            }
+            .to_vec())
+        })?;
+        Ok(rows.into_pyarray(py))
     }
 
     /// The kept attributes of a gene, transcript or feature row.

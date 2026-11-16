@@ -356,7 +356,7 @@ fn task(
     variants: Option<PathBuf>,
 ) -> PyResult<Task> {
     let mut t = Task::new(inputs, out_dir);
-    t.annotation = annotation.map(|a| a.shared());
+    t.annotation = annotation.map(|a| a.shared()).transpose()?;
     t.aliases = aliases.map(Aliases::from_pairs);
     t.matrix = MatrixFormat::from_name(matrix).or_raise()?;
     t.reference = reference;

@@ -1,12 +1,15 @@
 //! Sequences: `.fa` (+ `.fai`), `.fa.gz` (+ `.fai`, `.gzi`) and `.2bit`;
 //! and writing FASTA with its indexes.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use numpy::{PyArray1, PyArrayMethods, PyReadwriteArray1};
+use numpy::{
+    Element, PY_ARRAY_API, PyArray1, PyArrayDescrMethods, PyArrayMethods, PyReadwriteArray1,
+};
 use omicsweave_core::cache::{BlockCache, BlockKey, SourceToken};
 use omicsweave_core::{Error, FileSource, Locus, Result, SequenceRead};
 use omicsweave_fasta::{Fai, FastaReader, Gzi, TWOBIT_MAGIC, TwoBitReader, fai_path, gzi_path};
@@ -149,10 +152,47 @@ fn open_fasta(
     Ok(FastaReader::new(source, found_fai, found_gzi))
 }
 
+fn zeros(py: Python<'_>, length: usize) -> PyResult<Bound<'_, PyArray1<u8>>> {
+    let mut dimension = isize::try_from(length)
+        .map_err(|_| PyValueError::new_err("sequence output exceeds NumPy dimension limit"))?;
+    // SAFETY: the one-element dimension array remains live for this call,
+    // its nonnegative value fits npy_intp, and the dtype is exactly uint8.
+    // PyArray_Zeros steals the owned dtype reference and returns an owned,
+    // fully initialized ndarray or NULL with a Python allocation exception.
+    // The fallible owned-pointer conversion preserves that exception.
+    let array = unsafe {
+        let pointer = PY_ARRAY_API.PyArray_Zeros(
+            py,
+            1,
+            &mut dimension,
+            u8::get_dtype(py).into_dtype_ptr(),
+            0,
+        );
+        Bound::from_owned_ptr_or_err(py, pointer)?
+    };
+    Ok(array.cast_into::<PyArray1<u8>>()?)
+}
+
 #[pyclass(frozen, module = "omicsweave._native")]
 pub struct SequenceReader {
     pub inner: Shared<Sequences>,
-    chroms: Vec<(String, u32)>,
+    chroms: Arc<[(Arc<str>, u32)]>,
+    lengths: Arc<HashMap<Arc<str>, u32>>,
+}
+
+impl SequenceReader {
+    fn checked_length(&self, key: &LocusKey) -> PyResult<usize> {
+        self.inner.ensure_open()?;
+        with_locus(key, |locus| {
+            let length = self
+                .lengths
+                .get(locus.chrom)
+                .ok_or_else(|| Error::UnknownChrom(locus.chrom.to_owned()))?;
+            locus.check_within(*length)?;
+            Ok(locus.len() as usize)
+        })
+        .or_raise()
+    }
 }
 
 #[pymethods]
@@ -184,21 +224,28 @@ impl SequenceReader {
             if cache.is_some() {
                 reader.set_cache(cache)?;
             }
-            let chroms = match &reader {
+            let chroms: Vec<(Arc<str>, u32)> = match &reader {
                 Sequences::Fasta(r) => r
                     .fai()
                     .entries()
                     .iter()
-                    .map(|e| (e.name.clone(), e.len))
+                    .map(|e| (Arc::from(e.name.as_str()), e.len))
                     .collect(),
                 Sequences::TwoBit(r) => r
                     .names()
-                    .map(|n| Ok((n.to_owned(), r.chrom_len(n)?)))
+                    .map(|n| Ok((Arc::from(n), r.chrom_len(n)?)))
                     .collect::<Result<_>>()?,
             };
+            let lengths = Arc::new(
+                chroms
+                    .iter()
+                    .map(|(name, len)| (Arc::clone(name), *len))
+                    .collect(),
+            );
             Ok(SequenceReader {
                 inner: Shared::new(reader),
-                chroms,
+                chroms: chroms.into(),
+                lengths,
             })
         })
         .or_raise()
@@ -206,7 +253,10 @@ impl SequenceReader {
 
     /// (name, length) of every sequence, in file order.
     fn chroms(&self) -> Vec<(String, u32)> {
-        self.chroms.clone()
+        self.chroms
+            .iter()
+            .map(|(name, len)| (name.to_string(), *len))
+            .collect()
     }
 
     fn set_cache(&self, py: Python<'_>, cache: Option<PyRef<'_, PyBlockCache>>) -> PyResult<()> {
@@ -237,6 +287,7 @@ impl SequenceReader {
         Ok(Self {
             inner: Shared::new(r),
             chroms: self.chroms.clone(),
+            lengths: self.lengths.clone(),
         })
     }
 
@@ -257,10 +308,10 @@ impl SequenceReader {
 
     /// The bases of `key` in new NumPy storage.
     fn fetch<'py>(&self, py: Python<'py>, key: LocusKey) -> PyResult<Bound<'py, PyArray1<u8>>> {
-        let length: u64 = key.1.iter().map(|&(s, e)| e.saturating_sub(s) as u64).sum();
+        let length = self.checked_length(&key)?;
         // Initialized, privately allocated storage permits a safe mutable
         // slice and preserves NumPy ownership/resizing of default outputs.
-        let out = PyArray1::zeros(py, [length as usize], false);
+        let out = zeros(py, length)?;
         {
             let mut borrow = out.readwrite();
             let bytes = borrow
@@ -271,6 +322,11 @@ impl SequenceReader {
             })?;
         }
         Ok(out)
+    }
+
+    /// Validates a key before the Python caller allocates a large output.
+    fn sequence_length(&self, key: LocusKey) -> PyResult<usize> {
+        self.checked_length(&key)
     }
 
     fn close(&self, py: Python<'_>) {

@@ -12,6 +12,7 @@ use omicsweave_core::{Error, FileSource, Region, Result, Strand};
 use omicsweave_vcf::BcfReader;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedStr;
 
 use crate::error::{Done, Fail, OrRaise};
 use crate::sequence::SequenceReader;
@@ -21,12 +22,10 @@ use crate::variant::open_index;
 /// One query's choice of alleles, as the Python selector classes encode it:
 /// (`all`, [], None), (`samples`, names, None) or
 /// (`haplotype`, [sample], haplotype).
-type Selector = (String, Vec<String>, Option<String>);
+type Selector = (PyBackedStr, Vec<PyBackedStr>, Option<PyBackedStr>);
 
 struct Builder {
     consensus: Consensus,
-    /// The region `consensus` holds loaded.
-    loaded: Option<(String, u32, u32)>,
 }
 
 impl Builder {
@@ -35,24 +34,22 @@ impl Builder {
         reference: &Shared<crate::sequence::Sequences>,
         region: Region<'_>,
         selector: &Selector,
+        load: bool,
     ) -> Done<usize> {
-        let cached = self.loaded.as_ref().is_some_and(|(chrom, start, end)| {
-            chrom == region.chrom && *start == region.start && *end == region.end
-        });
-        if !cached {
-            self.loaded = None;
-            reference.ensure_process()?;
-            let mut guard = reference.lock();
-            let reader = guard.as_mut().ok_or(Fail::Closed)?;
-            self.consensus.load(reader, region)?;
-            self.loaded = Some((region.chrom.to_owned(), region.start, region.end));
-        }
         let names: Vec<&str>;
-        let alleles = match (selector.0.as_str(), selector.1.as_slice(), &selector.2) {
+        let mut local_names = [""; 4];
+        let alleles = match (&*selector.0, selector.1.as_slice(), &selector.2) {
             ("all", [], None) => Alleles::AllAlt,
             ("samples", samples, None) => {
-                names = samples.iter().map(String::as_str).collect();
-                Alleles::Samples(&names)
+                if samples.len() <= local_names.len() {
+                    for (out, name) in local_names.iter_mut().zip(samples) {
+                        *out = name;
+                    }
+                    Alleles::Samples(&local_names[..samples.len()])
+                } else {
+                    names = samples.iter().map(|s| &**s).collect();
+                    Alleles::Samples(&names)
+                }
             }
             ("haplotype", [sample], Some(haplotype)) => Alleles::Haplotype { sample, haplotype },
             _ => {
@@ -61,6 +58,12 @@ impl Builder {
                 ))));
             }
         };
+        if load {
+            reference.ensure_open()?;
+            let mut guard = reference.lock();
+            let reader = guard.as_mut().ok_or(Fail::Closed)?;
+            self.consensus.load(reader, region)?;
+        }
         Ok(self.consensus.query(alleles)?)
     }
 }
@@ -188,10 +191,7 @@ impl ConsensusBuilder {
         let (consensus, index) = built.or_raise()?;
         Ok(ConsensusBuilder {
             samples: consensus.samples().to_vec(),
-            inner: Shared::new(Builder {
-                consensus,
-                loaded: None,
-            }),
+            inner: Shared::new(Builder { consensus }),
             reference,
             index,
         })
@@ -210,10 +210,7 @@ impl ConsensusBuilder {
         reference.get().inner.ensure_process()?;
         let consensus = self.inner.run(py, |b| Ok(b.consensus.try_clone()?))?;
         Ok(Self {
-            inner: Shared::new(Builder {
-                consensus,
-                loaded: None,
-            }),
+            inner: Shared::new(Builder { consensus }),
             reference,
             samples: self.samples.clone(),
             index: self.index.clone(),
@@ -235,7 +232,7 @@ impl ConsensusBuilder {
         let strand = self::strand(strand)?;
         let reference = &self.reference.get().inner;
         let (bases, chain) = self.inner.run(py, |b| -> Done<_> {
-            let n = b.build(reference, Region::new(chrom, start, end), &selector)?;
+            let n = b.build(reference, Region::new(chrom, start, end), &selector, true)?;
             let mut bases = vec![0u8; n];
             b.consensus.write(strand, &mut bases)?;
             Ok((bases, b.consensus.chain().map(str::to_owned)))
@@ -267,8 +264,9 @@ impl ConsensusBuilder {
             offsets.push(0i64);
             let mut bases = Vec::new();
             let mut chains = Vec::with_capacity(selectors.len());
-            for selector in &selectors {
-                let n = b.build(reference, region, selector)?;
+            for (index, selector) in selectors.iter().enumerate() {
+                // Only selectors in this call share the loaded region.
+                let n = b.build(reference, region, selector, index == 0)?;
                 let at = bases.len();
                 bases.resize(at + n, 0u8);
                 b.consensus.write(strand, &mut bases[at..])?;

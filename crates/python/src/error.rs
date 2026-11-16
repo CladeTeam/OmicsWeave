@@ -4,10 +4,7 @@
 use omicsweave_core::Error;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::sync::PyOnceLock;
 use pyo3::types::PyDict;
-
-static ERRORS: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
 
 /// Why work done with the GIL released failed.
 pub enum Fail {
@@ -63,9 +60,9 @@ pub fn to_py(e: &Error) -> PyErr {
 }
 
 fn build(py: Python<'_>, e: &Error) -> PyResult<PyErr> {
-    let module = ERRORS
-        .get_or_try_init(py, || py.import("omicsweave.errors").map(Bound::unbind))?
-        .bind(py);
+    // Errors are a cold path. Python's module registry already retains this
+    // module; an extra native lazy lock could be inherited mid-initialization.
+    let module = py.import("omicsweave.errors")?;
     let kw = PyDict::new(py);
     let class = match e {
         Error::Truncated { what, need, have } => {

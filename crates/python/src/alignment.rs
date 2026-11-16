@@ -82,10 +82,6 @@ fn open_cram(
     Ok((CramReader::open(source, index, reference, options)?, at))
 }
 
-fn no_cache() -> Error {
-    Error::Unsupported("block caches of CRAM files")
-}
-
 /// A BAM or a CRAM reader.
 #[allow(clippy::large_enum_variant)]
 enum Reads {
@@ -104,13 +100,9 @@ impl Reads {
     fn try_clone(&self) -> Result<Reads> {
         Ok(match self {
             Reads::Bam(r) => Reads::Bam(r.try_clone()?),
-            Reads::Cram(r) => {
-                let reference = match r.reference() {
-                    Some(s) => Some(s.try_clone()?),
-                    None => None,
-                };
-                Reads::Cram(Box::new(r.with_parts(r.source().try_clone()?, reference)))
-            }
+            Reads::Cram(r) => Reads::Cram(Box::new(
+                r.try_clone_with(FileSource::try_clone, Sequences::try_clone)?,
+            )),
         })
     }
 }
@@ -249,15 +241,13 @@ impl AlignmentReader {
                     }),
                 });
             }
-            if cache.is_some() {
-                return Err(no_cache());
-            }
             let reference = match given {
                 None => None,
                 Some(Given::Reader(s)) => Some(s),
                 Some(Given::Path(p)) => Some(open_sequences(&p)?),
             };
-            let (reader, index) = open_cram(&path, index.as_deref(), reference)?;
+            let (mut reader, index) = open_cram(&path, index.as_deref(), reference)?;
+            reader.set_cache(cache);
             let chroms: Vec<(String, u32)> = reader
                 .header()
                 .references()
@@ -300,39 +290,57 @@ impl AlignmentReader {
                 r.set_cache(cache);
                 Ok(())
             }
-            Reads::Cram(_) if cache.is_none() => Ok(()),
-            Reads::Cram(_) => Err(no_cache().into()),
+            Reads::Cram(r) => {
+                r.set_cache(cache);
+                Ok(())
+            }
         })
     }
 
     fn cache_namespace(&self, py: Python<'_>) -> PyResult<CacheNamespace> {
         self.inner.run(py, |a| match &a.reader {
             Reads::Bam(r) => Ok(CacheNamespace::new(r.cache_namespace())),
-            Reads::Cram(_) => Err(no_cache().into()),
+            Reads::Cram(r) => Ok(CacheNamespace::new(r.cache_namespace())),
         })
     }
 
+    #[pyo3(signature = (chrom, start, end, fields=0))]
     fn describe_cache(
         &self,
         py: Python<'_>,
         chrom: &str,
         start: u32,
         end: u32,
+        fields: u8,
     ) -> PyResult<Vec<CacheKey>> {
         self.inner.run(py, |a| {
             let mut keys = Vec::new();
-            let Reads::Bam(r) = &mut a.reader else {
-                return Err(no_cache().into());
-            };
-            r.describe_cache(Region::new(chrom, start, end), &mut keys)?;
+            let fields = AlignmentFields::from_bits(fields)?;
+            let region = Region::new(chrom, start, end);
+            match &mut a.reader {
+                Reads::Bam(r) => r.describe_cache(region, &mut keys)?,
+                Reads::Cram(r) => r.describe_cache(region, fields, &mut keys)?,
+            }
             Ok(keys.into_iter().map(CacheKey::new).collect())
         })
     }
 
-    fn prefetch_cache(&self, py: Python<'_>, chrom: &str, start: u32, end: u32) -> PyResult<()> {
-        self.inner.run(py, |a| match &mut a.reader {
-            Reads::Bam(r) => Ok(r.prefetch_cache(Region::new(chrom, start, end))?),
-            Reads::Cram(_) => Err(no_cache().into()),
+    #[pyo3(signature = (chrom, start, end, fields=0))]
+    fn prefetch_cache(
+        &self,
+        py: Python<'_>,
+        chrom: &str,
+        start: u32,
+        end: u32,
+        fields: u8,
+    ) -> PyResult<()> {
+        self.inner.run(py, |a| {
+            let fields = AlignmentFields::from_bits(fields)?;
+            let region = Region::new(chrom, start, end);
+            match &mut a.reader {
+                Reads::Bam(r) => Ok(r.prefetch_cache(region)?),
+                Reads::Cram(r) => Ok(r.prefetch_cache(region, fields)?),
+            }
         })
     }
 
@@ -368,6 +376,8 @@ impl AlignmentReader {
                 d.set_item("slices_decoded", s.slices_decoded)?;
                 d.set_item("records_decoded", s.records_decoded)?;
                 d.set_item("bytes_read", s.bytes_read)?;
+                d.set_item("read_calls", s.read_calls)?;
+                d.set_item("records_considered", s.records_considered)?;
                 Ok(d)
             }
         }

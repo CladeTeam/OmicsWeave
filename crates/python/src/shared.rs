@@ -1,7 +1,9 @@
 //! State shared between Python threads, and small helpers.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(unix)]
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use numpy::{Element, PyReadonlyArray1};
@@ -10,13 +12,54 @@ use omicsweave_core::sidecar::{self, SourceIdentity};
 use omicsweave_core::{Error, Locus, ReadAt, Result, Span, Strand};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedStr;
 use pyo3::types::PyDict;
 
 use crate::error::{Done, Fail};
 
 static PROCESS_ID: AtomicU32 = AtomicU32::new(0);
 
-/// Python's after-fork hook updates this before child code can access readers.
+#[cfg(unix)]
+unsafe extern "C" {
+    fn getpid() -> std::ffi::c_int;
+    fn pthread_atfork(
+        prepare: Option<unsafe extern "C" fn()>,
+        parent: Option<unsafe extern "C" fn()>,
+        child: Option<unsafe extern "C" fn()>,
+    ) -> std::ffi::c_int;
+}
+
+#[cfg(unix)]
+unsafe extern "C" fn native_after_fork_child() {
+    // SAFETY: POSIX getpid is async-signal-safe and cannot fail. The
+    // lock-free AtomicU32 store allocates nothing and cannot unwind.
+    // No Python API or inherited synchronization primitive is touched.
+    let process = unsafe { getpid() };
+    PROCESS_ID.store(process as u32, Ordering::Relaxed);
+}
+
+/// Registers the process marker before Python's child callbacks can run.
+pub fn initialize_process_guard() -> PyResult<()> {
+    #[cfg(unix)]
+    {
+        static REGISTERED: OnceLock<std::ffi::c_int> = OnceLock::new();
+        let error = *REGISTERED.get_or_init(|| {
+            // SAFETY: the child callback is a static C-ABI function which
+            // only performs async-signal-safe work, takes no arguments and
+            // does not unwind. The libc registration retains its address.
+            unsafe { pthread_atfork(None, None, Some(native_after_fork_child)) }
+        });
+        if error != 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "could not register the fork process guard (error {error})"
+            )));
+        }
+    }
+    PROCESS_ID.store(std::process::id(), Ordering::Relaxed);
+    Ok(())
+}
+
+/// The native at-fork hook updates this before Python child callbacks run.
 /// The hot path needs only an atomic load, without a getpid syscall per query.
 pub fn process_id() -> u32 {
     let process = PROCESS_ID.load(Ordering::Relaxed);
@@ -40,6 +83,7 @@ pub struct Shared<T> {
     value: Mutex<Option<T>>,
     process: u32,
     abandon_inherited_writer: bool,
+    closed: AtomicBool,
 }
 
 impl<T: Send> Shared<T> {
@@ -48,6 +92,7 @@ impl<T: Send> Shared<T> {
             value: Mutex::new(Some(value)),
             process: std::process::id(),
             abandon_inherited_writer: false,
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -58,6 +103,7 @@ impl<T: Send> Shared<T> {
             value: Mutex::new(Some(value)),
             process: std::process::id(),
             abandon_inherited_writer: true,
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -66,6 +112,15 @@ impl<T: Send> Shared<T> {
             return Err(Fail::Py(PyRuntimeError::new_err(
                 "reader/writer cannot be reused after fork; reopen it in this process",
             )));
+        }
+        Ok(())
+    }
+
+    /// Rejects invalid execution state before a caller allocates an output.
+    pub fn ensure_open(&self) -> Done<()> {
+        self.ensure_process()?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Fail::Closed);
         }
         Ok(())
     }
@@ -94,7 +149,11 @@ impl<T: Send> Shared<T> {
         if self.process != process_id() {
             return None;
         }
-        py.detach(|| self.lock().take())
+        py.detach(|| {
+            let value = self.lock().take();
+            self.closed.store(true, Ordering::Release);
+            value
+        })
     }
 }
 
@@ -156,7 +215,7 @@ pub fn seek_stats(py: Python<'_>, stats: SeekStats) -> PyResult<Bound<'_, PyDict
 
 /// A dense-query key as the Python layer passes it: chromosome, ascending
 /// `(start, end)` spans and the strand as `+`, `-`, `.` or `?`.
-pub type LocusKey = (String, Vec<(u32, u32)>, String);
+pub type LocusKey = (PyBackedStr, Vec<(u32, u32)>, PyBackedStr);
 
 /// Runs `f` on the [`Locus`] of `key`.
 pub fn with_locus<R>(key: &LocusKey, f: impl FnOnce(&Locus<'_>) -> Result<R>) -> Result<R> {
@@ -166,6 +225,16 @@ pub fn with_locus<R>(key: &LocusKey, f: impl FnOnce(&Locus<'_>) -> Result<R>) ->
         _ => None,
     }
     .ok_or_else(|| Error::invalid("strand", format!("{strand:?} is not one of + - . ?")))?;
-    let spans: Vec<Span> = spans.iter().map(|&(s, e)| Span::new(s, e)).collect();
-    f(&Locus::new(chrom, &spans, strand)?)
+    // Common loci fit on the stack; the borrowed Python strings stay owned
+    // by key while the decoding callback runs with the GIL released.
+    if spans.len() <= 4 {
+        let mut local = [Span::new(0, 0); 4];
+        for (out, &(s, e)) in local.iter_mut().zip(spans) {
+            *out = Span::new(s, e);
+        }
+        f(&Locus::new(chrom, &local[..spans.len()], strand)?)
+    } else {
+        let spans: Vec<Span> = spans.iter().map(|&(s, e)| Span::new(s, e)).collect();
+        f(&Locus::new(chrom, &spans, strand)?)
+    }
 }

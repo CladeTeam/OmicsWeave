@@ -27,13 +27,14 @@ use pyo3::types::PyDict;
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
-    shared::process_id();
-    let hook = wrap_pyfunction!(shared::_after_fork_child, m)?;
-    let options = PyDict::new(py);
-    options.set_item("after_in_child", hook)?;
-    py.import("os")?
-        .getattr("register_at_fork")?
-        .call((), Some(&options))?;
+    shared::initialize_process_guard()?;
+    let os = py.import("os")?;
+    if os.hasattr("register_at_fork")? {
+        let hook = wrap_pyfunction!(shared::_after_fork_child, m)?;
+        let options = PyDict::new(py);
+        options.set_item("after_in_child", hook)?;
+        os.getattr("register_at_fork")?.call((), Some(&options))?;
+    }
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<cache::PyBlockCache>()?;
     m.add_class::<cache::CacheKey>()?;
