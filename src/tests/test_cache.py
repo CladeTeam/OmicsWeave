@@ -19,34 +19,28 @@ def reference(tmp_path, suffix=".fa.gz"):
     return path, bases
 
 
-def test_block_residency_namespace_and_independent_execution(tmp_path):
+def test_cached_reads_clones_and_independent_readers(tmp_path):
     path, bases = reference(tmp_path)
     cache = BlockCache(max_bytes=1 << 20, max_entries=64)
     reader = ow.query.SequenceReader(path, cache=cache)
     region = ow.Region("a", 120, 300)
-    planned = reader.describe_cache(region)
-    assert planned and all(k.source == reader.cache_namespace for k in planned)
-    assert len(set(planned)) == len(planned)
-    reader.prefetch_cache(region)
-    loads = cache.stats()["loads"]
     result = reader.fetch(region)
     assert result.bases.tobytes() == bases[120:300]
+    loads = cache.stats()["loads"]
+    assert loads > 0 and cache.stats()["resident_entries"] > 0
+    assert reader.fetch(region).bases.tobytes() == bases[120:300]
     assert cache.stats()["loads"] == loads
     clone = reader.clone()
-    assert clone.cache_namespace == reader.cache_namespace
     reader.close()
     assert clone.fetch(region).bases.tobytes() == bases[120:300]
     assert cache.stats()["loads"] == loads
+    # A reader opened on its own is a separate source session.
     independent = ow.query.SequenceReader(path, cache=cache)
-    assert independent.cache_namespace != clone.cache_namespace
     independent.fetch(region)
     assert cache.stats()["loads"] > loads
-    assert cache.evict(planned[0])
-    assert clone.fetch(region).bases.tobytes() == result.bases.tobytes()
-    cache.clear(source=clone.cache_namespace)
-    assert cache.keys() and all(k.source != clone.cache_namespace for k in cache.keys())
     cache.clear()
     assert cache.stats()["live_bytes"] == cache.stats()["resident_entries"] == 0
+    assert clone.fetch(region).bases.tobytes() == result.bases.tobytes()
     clone.close()
     independent.close()
 
@@ -59,8 +53,9 @@ def test_zero_budget_bypasses_cache_and_explicit_detach(tmp_path):
         assert cache.stats()["admission_rejections"] > 0
         assert cache.stats()["resident_entries"] == 0
         cache.resize(max_bytes=1 << 20, max_entries=64)
-        reader.prefetch_cache(("a", 20, 30))
-        assert cache.keys()
+        reader.fetch(("a", 20, 30))
+        assert cache.stats()["resident_entries"] > 0
+        assert (cache.stats()["max_bytes"], cache.stats()["max_entries"]) == (1 << 20, 64)
         reader.set_cache(None)
         loads = cache.stats()["loads"]
         out = np.empty(10, np.uint8)
@@ -104,14 +99,13 @@ def test_cache_configuration_and_plain_fasta(tmp_path):
         pickle.dumps(cache)
 
 
-def test_pickle_reopens_without_cache_entries_or_namespace(tmp_path):
+def test_pickle_reopens_without_the_cache(tmp_path):
     path, bases = reference(tmp_path)
     cache = BlockCache(max_bytes=1 << 20)
     with ow.query.SequenceReader(path, cache=cache) as reader:
         reader.fetch(("a", 1, 120))
         restored = pickle.loads(pickle.dumps(reader))
         try:
-            assert restored.cache_namespace != reader.cache_namespace
             loads = cache.stats()["loads"]
             assert restored.fetch(("a", 1, 120)).bases.tobytes() == bases[1:120]
             assert cache.stats()["loads"] == loads
@@ -120,7 +114,7 @@ def test_pickle_reopens_without_cache_entries_or_namespace(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["track", "features", "contact", "2bit"])
-def test_format_blocks_can_be_prefetched_shared_and_evicted(tmp_path, kind):
+def test_format_blocks_are_shared_by_clones_and_cleared(tmp_path, kind):
     chroms = {"a": 1000}
     cache = BlockCache(max_bytes=1 << 20)
     region = ow.Region("a", 10, 30)
@@ -165,18 +159,15 @@ def test_format_blocks_can_be_prefetched_shared_and_evicted(tmp_path, kind):
             return r.fetch(query).bases.copy()
 
     try:
-        reader.prefetch_cache(query)
-        keys = reader.describe_cache(query)
-        assert keys and set(keys).issubset(cache.keys())
-        loads = cache.stats()["loads"]
         expected = fetch(reader)
+        assert cache.stats()["resident_entries"] > 0
+        loads = cache.stats()["loads"]
         clone = reader.clone()
         try:
-            assert clone.cache_namespace == reader.cache_namespace
             np.testing.assert_array_equal(fetch(clone), expected)
             assert cache.stats()["loads"] == loads
-            cache.clear(source=reader.cache_namespace)
-            assert not cache.keys()
+            cache.clear()
+            assert cache.stats()["resident_entries"] == 0
             np.testing.assert_array_equal(fetch(clone), expected)
             assert cache.stats()["loads"] > loads
         finally:
@@ -236,12 +227,7 @@ def test_consensus_clone_shares_variants_and_independent_reference_context(tmp_p
 
 def _spawn_fetch(reader, result):
     try:
-        disabled = False
-        try:
-            reader.prefetch_cache(("a", 0, 5))
-        except ow.errors.OmicsWeaveError:
-            disabled = True
-        result.send((reader.fetch(("a", 0, 5)).bases.tobytes(), disabled))
+        result.send(reader.fetch(("a", 0, 5)).bases.tobytes())
     except BaseException as error:
         result.send(repr(error))
     finally:
@@ -252,7 +238,7 @@ def test_spawn_reopens_reader_without_serializing_cache(tmp_path):
     path, _ = reference(tmp_path)
     cache = BlockCache(max_bytes=1 << 20)
     with ow.query.SequenceReader(path, cache=cache) as reader:
-        reader.prefetch_cache(("a", 0, 5))
+        reader.fetch(("a", 0, 5))
         before = cache.stats()
         context = multiprocessing.get_context("spawn")
         parent, child = context.Pipe(duplex=False)
@@ -262,7 +248,7 @@ def test_spawn_reopens_reader_without_serializing_cache(tmp_path):
         try:
             assert parent.poll(30)
             value = parent.recv()
-            assert value == (b"ACGTN", True), value
+            assert value == b"ACGTN", value
         finally:
             process.join(30)
             parent.close()

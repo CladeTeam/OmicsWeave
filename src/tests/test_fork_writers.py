@@ -16,6 +16,7 @@ import sys
 import traceback
 
 directory, kind, action = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+threads = int(sys.argv[4])
 w = None
 early_writer = None
 early_cache = None
@@ -42,19 +43,23 @@ if kind in {"fa_plain", "fa_bgzf"}:
     w.add("c", bases)
 elif kind == "bigwig":
     path = directory / "parent.bw"
-    w = ow.formats.BigWigWriter(path, chroms)
+    w = ow.formats.BigWigWriter(path, chroms, threads=threads)
     w.add("c", [0, 4], [4, 8], [1.5, 3.0])
 elif kind == "bigbed":
     path = directory / "parent.bb"
-    w = ow.formats.BigBedWriter(path, chroms, ow.formats.BigBedSchema(4))
+    w = ow.formats.BigBedWriter(path, chroms, ow.formats.BigBedSchema(4), threads=threads)
     w.add("c", [0, 4], [4, 8], ["x", "y"])
 else:
     path = directory / "parent.hic"
     header = ow.formats.HicHeader("test", chroms, (10,))
-    w = ow.formats.HicWriter(path, header)
-    w.write_matrix("c", "c", 10, [1], [2], [7.0])
+    if kind == "hic_builder":
+        w = ow.formats.HicBuilder(path, header, threads=threads)
+        w.add("c", 10, "c", 20, 7.0)
+    else:
+        w = ow.formats.HicWriter(path, header, threads=threads)
+        w.write_matrix("c", "c", 10, [1], [2], [7.0])
 
-before = path.read_bytes()
+before = path.read_bytes() if path.exists() else None
 pid = os.fork()
 if pid == 0:
     try:
@@ -75,8 +80,8 @@ if pid == 0:
 
 _, status = os.waitpid(pid, 0)
 assert os.waitstatus_to_exitcode(status) == 0
-after = path.read_bytes()
-assert after == before, ("child changed the parent's file", kind, action, len(before), len(after))
+after = path.read_bytes() if path.exists() else None
+assert after == before, ("child changed the parent's file", kind, action, before, after)
 w.close()
 with ow.query.SequenceReader(directory / "child.fa") as child_reference:
     assert child_reference.fetch(("child", 0, 4)).bases.tobytes() == b"ACGT"
@@ -101,9 +106,9 @@ else:
 """
 
 
-def exercise_fork_writer(directory: Path, kind: str, action: str) -> None:
+def exercise_fork_writer(directory: Path, kind: str, action: str, threads: int = 1) -> None:
     process = subprocess.Popen(
-        [sys.executable, "-c", WRITER_FORK, str(directory), kind, action],
+        [sys.executable, "-c", WRITER_FORK, str(directory), kind, action, str(threads)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
@@ -131,3 +136,10 @@ def test_forked_writer_close_and_gc_leave_parent_file_unchanged(tmp_path, kind, 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork required")
 def test_buffered_writer_gc_before_native_fork_hook_does_not_flush(tmp_path):
     exercise_fork_writer(tmp_path, "fa_bgzf", "callback_gc")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork required")
+@pytest.mark.parametrize("kind", ["bigwig", "bigbed", "hic", "hic_builder"])
+@pytest.mark.parametrize("action", ["gc", "close", "callback_gc"])
+def test_forked_writer_pool_does_not_join_inherited_threads(tmp_path, kind, action):
+    exercise_fork_writer(tmp_path, kind, action, threads=2)

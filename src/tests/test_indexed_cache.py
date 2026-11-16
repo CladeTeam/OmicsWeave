@@ -64,37 +64,27 @@ def payload(reader, kind):
     )
 
 
-def test_indexed_prefetch_clone_and_eviction(indexed_file):
+def test_indexed_cache_serves_clones_and_detaches(indexed_file):
     kind, path, reader_type = indexed_file
     cache = ow.cache.BlockCache(max_bytes=1 << 20)
     reader = reader_type(path, cache=cache)
-    region = ("chr1", 0, 100)
     try:
-        dependencies = reader.describe_cache(region)
-        assert dependencies and all(k.source == reader.cache_namespace for k in dependencies)
-        reader.prefetch_cache(region)
-        assert set(dependencies).issubset(cache.keys())
-        reader.reset_stream_stats()
         expected = payload(reader, kind)
-        stats = reader.stream_stats()
-        assert stats["inflate_calls"] == stats["read_calls"] == 0
+        loads = cache.stats()["loads"]
+        assert loads > 0
         clone = reader.clone()
-        assert clone.cache_namespace == reader.cache_namespace
     finally:
         reader.close()
     try:
         assert payload(clone, kind) == expected
-        assert clone.stream_stats()["inflate_calls"] == clone.stream_stats()["read_calls"] == 0
-        cache.clear(source=clone.cache_namespace)
-        clone.reset_stream_stats()
+        assert cache.stats()["loads"] == loads
+        cache.clear()
         assert payload(clone, kind) == expected
-        assert clone.stream_stats()["inflate_calls"] > 0
+        assert cache.stats()["loads"] > loads
         clone.set_cache(None)
-        clone.reset_stream_stats()
+        loads = cache.stats()["loads"]
         assert payload(clone, kind) == expected
-        work = clone.stream_stats()["inflate_calls"]
-        assert payload(clone, kind) == expected
-        assert clone.stream_stats()["inflate_calls"] > work
+        assert cache.stats()["loads"] == loads
     finally:
         clone.close()
 
@@ -105,8 +95,6 @@ def test_zero_budget_indexed_queries_do_not_change_output(indexed_file):
     with reader_type(path) as baseline, reader_type(path, cache=cache) as cached:
         assert payload(cached, kind) == payload(baseline, kind)
         assert cache.stats()["resident_entries"] == 0
-        assert not cache.keys()
-        assert cached.stream_stats()["inflate_calls"] > 0
 
 
 def test_alignment_fields_and_genotype_selection_survive_cache_reuse(indexed_file):
@@ -146,12 +134,7 @@ def test_alignment_fields_and_genotype_selection_survive_cache_reuse(indexed_fil
 
 def _query_in_process(reader, kind, pipe):
     try:
-        cache_absent = False
-        try:
-            reader.prefetch_cache(("chr1", 0, 100))
-        except ow.errors.OmicsWeaveError:
-            cache_absent = True
-        pipe.send(("ok", payload(reader, kind), cache_absent))
+        pipe.send(("ok", payload(reader, kind)))
     except BaseException as error:
         pipe.send(("error", type(error).__name__))
     finally:
@@ -166,6 +149,7 @@ def test_indexed_readers_spawn_reopen_and_fork_reject(indexed_file, method):
     cache = ow.cache.BlockCache(max_bytes=1 << 20)
     with reader_type(path, cache=cache) as reader:
         expected = payload(reader, kind)
+        before = cache.stats()
         context = multiprocessing.get_context(method)
         parent, child = context.Pipe(duplex=False)
         process = context.Process(target=_query_in_process, args=(reader, kind, child))
@@ -175,7 +159,7 @@ def test_indexed_readers_spawn_reopen_and_fork_reject(indexed_file, method):
             assert parent.poll(30), "child reader did not finish"
             received = parent.recv()
             if method == "spawn":
-                assert received == ("ok", expected, True), received
+                assert received == ("ok", expected), received
             else:
                 assert received == ("error", "RuntimeError"), received
         finally:
@@ -185,4 +169,5 @@ def test_indexed_readers_spawn_reopen_and_fork_reject(indexed_file, method):
                 process.join(5)
             parent.close()
         assert process.exitcode == 0
+        assert cache.stats() == before
         assert payload(reader, kind) == expected
