@@ -2,7 +2,7 @@
 
 [格式总览](README.md) · [CRAM](cram.md) · [BAI](bai.md) · [查询](../query.md)
 
-`.crai` 是 [CRAM](cram.md) 的**区域索引**：一个 gzip 压缩的文本文件，每行描述一个 slice 覆盖的参考范围及其在 CRAM 文件中的位置。查询区域时，先在 CRAI 中找出与区域重叠的 slice，再只读取、解码这些 slice。与 BAM 的 [BAI](bai.md) 相比，它更简单：不需要 bin 层级，因为 CRAM 本身已经按 slice 组织好了数据。
+`.crai` 是 [CRAM](cram.md) 的**区域索引**：一个 gzip 压缩的文本文件，每行描述一个 slice 覆盖的参考范围及其在 CRAM 文件中的位置。OmicsWeave 查询时，先根据参考编号与起点在 CRAI 中找到一个起始 container，再从该 container 顺序扫描，按 container / slice 的范围跳过不重叠的数据，直到超过查询区域。它不会把所有重叠 slice 的偏移先收集成列表逐个 seek。与 BAM 的 [BAI](bai.md) 相比，它不需要 bin 层级，因为 CRAM 本身已经按 slice 组织好了数据。
 
 在 OmicsWeave 中，`AlignmentReader` 打开 CRAM 时必须有 CRAI；可以用 `Cram.build_index()` 生成，生成过程不需要参考序列。
 
@@ -13,7 +13,7 @@
 | 作用 | 坐标排序 CRAM 的区域定位 |
 | 常见后缀 | `<cram>.crai`（如 `reads.cram.crai`） |
 | 存储 | gzip 压缩的 tab 分隔文本，每行 6 个整数 |
-| 适用范围 | 坐标排序的 CRAM 3.x |
+| 适用范围 | OmicsWeave 支持坐标排序的 CRAM 3.0 / 3.1 |
 | 典型来源 | `samtools index reads.cram`、`Cram.build_index()` |
 | OmicsWeave | 生成、自动查找、显式指定、格式识别 |
 
@@ -64,7 +64,7 @@ CRAI 中的偏移是 CRAM 文件中的字节位置。CRAM 被重写（重新排�
 
 | 功能 | 支持情况 |
 |---|---|
-| 生成 | `Cram.build_index()`，与 `samtools index` 写出的索引相同，不需要参考 |
+| 生成 | `Cram.build_index()`，不需要参考；输出 gzip 压缩的索引行，比较内容时应先解压，不能假定压缩字节与 `samtools index` 相同 |
 | 读取与查询 | 与 htslib 的 `cram_index_load` / `cram_index_query` 相同的加载和查找方式 |
 | 自动查找 | 未指定 `index` 时依次查找 `<cram>.crai`、`<去扩展名>.crai` |
 | 显式指定 | `AlignmentReader(path, index="index/reads.crai")` |
@@ -85,6 +85,18 @@ print(index.path)  # reads.cram.crai
 输入需要按坐标排序。
 
 ## 使用
+
+下例中的 `genome.fa.gz` 必须是 BGZF FASTA，且配有 `.fai` / `.gzi`，普通 gzip FASTA 不能作区域读取参考。可先准备：
+
+```sh
+bgzip -c genome.fa > genome.fa.gz
+```
+
+```python
+from omicsweave.formats import BgzipFasta
+
+BgzipFasta("genome.fa.gz").build_index()
+```
 
 ```python
 from omicsweave.query import AlignmentReader

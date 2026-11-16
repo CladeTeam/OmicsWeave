@@ -113,7 +113,7 @@ GENCODE / Ensembl / RefSeq 用 `tag` 标出代表性转录本，例如 `basic`�
 | 筛选 | 按 biotype、转录本 biotype、标签、基因、染色体 |
 | 染色体名 | 载入时改名；与 BAM header 匹配时内置 `chr1` ↔ `1`、`chrM` ↔ `MT` |
 | 质量检查 | 孤立记录、重复 id、链冲突、超出父区间等写入 `report`，或 `strict=True` 报错 |
-| 导出 | `write_gtf`（原样或按模型）、`write_bed12` |
+| 导出 | `write_gtf`（原始记录顺序或按模型）、`write_bed12` |
 | quant | 基因外显子、基因跨度、启动子、gene activity、velocity、ASE 等特征 |
 
 GTF 不通过 `formats.detect` 或 `query.open` 打开（内容会被当作普通文本表），也不能交给区域 reader；始终使用 `Annotation.read`。
@@ -133,7 +133,7 @@ print(annotation.heap_bytes)   # 注释模型占用的内存
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `attributes` | `"all"` | `"all"` 保留全部属性（原样回写 GTF 需要）；属性名列表只保留这些；`None` 不保留。id、名称、biotype、tag 总会读取 |
+| `attributes` | `"all"` | `"all"` 保留全部属性（`original` 布局需要）；属性名列表只保留这些；`None` 不保留。id、名称、biotype、tag 总会读取 |
 | `aliases` | `None` | 载入时改染色体名，例如 `{"1": "chr1"}`；`read_aliases(path)` 可从两列文件读取 |
 | `strict` | `False` | 遇到第一个结构问题即抛出 `FormatError` |
 | `threads` | 可用核心数，最多 8 | 并行解析线程数 |
@@ -352,11 +352,11 @@ annotation.write_bed12("mane.bed", subset=annotation.subset(tags=["MANE_Select"]
 
 | layout | 输出 |
 |---|---|
-| `original` | 原样写回全部记录和注释行，按文件顺序；要求以 `attributes="all"` 从 GTF 载入 |
+| `original` | 按原文件顺序写出全部记录和注释行；记录由表字段和保留的属性重新序列化，保留属性顺序与引号，属性间距规范化；不保留空行或 CRLF，染色体使用载入后的名称。要求以 `attributes="all"` 从 GTF 载入 |
 | `model` | 从表格写出 gene、transcript 和 feature 行 |
 | `auto`（默认） | 可以时用 `original`，否则 `model` |
 
-BED12 每行一个转录本，blocks 为外显子，thick 区间为 CDS；可再用 `ow convert` 转成 [bigBed](bigbed.md) 按区域查询。这些导出是 `Annotation` 的方法，不属于 `ow convert` 路由。
+BED12 每行一个转录本。blocks 优先取合并后的 exon 区间；缺少 exon 时使用其他外显子级特征（CDS、UTR、密码子等），仍为空则使用整个转录本范围。thick 区间覆盖 CDS 和起止密码子，并裁剪到 blocks 的整体范围；没有编码特征时 `thickStart = thickEnd = chromEnd`。可再用 `ow convert` 转成 [bigBed](bigbed.md) 按区域查询。这些导出是 `Annotation` 的方法，不属于 `ow convert` 路由。
 
 ## 常见问题
 

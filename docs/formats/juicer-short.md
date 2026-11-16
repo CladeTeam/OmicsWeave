@@ -47,7 +47,7 @@ Juicer 还有 medium 和 long 两种更宽的格式（包含读段名、MAPQ、C
 
 | 功能 | 支持情况 |
 |---|---|
-| 格式识别 | `formats.detect`：所有数据行都符合八 / 九列 short 结构时识别为 `JuicerShort` / `GzipJuicerShort` |
+| 格式识别 | `formats.detect` 检查开头最多 64 KiB 中的完整数据行，符合八 / 九列 short 结构时识别为 `JuicerShort` / `GzipJuicerShort`；压缩文本先展开，不检查其余文件内容 |
 | 压缩 | 纯文本、gzip、BGZF |
 | 分隔符 | 空格或 tab |
 | 转换 | Juicer short → `.hic`（v9），一次生成多种 BP 分辨率 |
@@ -81,7 +81,7 @@ convert.run(
 )
 ```
 
-内容符合 short 结构时会被自动识别；文件名没有特征后缀、或者希望明确表达意图时，用 `JuicerShort(...)` / `GzipJuicerShort(...)` 或 CLI 的 `--from juicer-short` 显式指定。
+自动探测依据内容，与文件名或扩展名无关。探测前缀不足、布局有歧义，或希望明确指定解析器时，用 `JuicerShort(...)` / `GzipJuicerShort(...)` 或 CLI 的 `--from juicer-short` 显式指定；实际转换仍逐行解析整个文件。
 
 `resolutions` 默认是 Juicer `pre` 的九档 2.5 Mb 到 5 kb；较粗的每一档必须是最细分辨率的整数倍。转换结果按窗口查询，见 [.hic](hic.md)。
 

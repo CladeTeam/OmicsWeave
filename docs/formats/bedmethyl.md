@@ -100,10 +100,12 @@ modkit 文件可同时包含多种修饰代码，同一位点的 `m` 和 `h` 各
 | 文件对象 | `BedMethyl`（纯文本）、`GzipBedMethyl`（gzip 或 bgzip） |
 | 格式识别 | 每个数据行都是 BED9 加 modkit 的 9 列计数，或 ENCODE 的覆盖度与百分比；文件名不参与 |
 | 方言 | modkit 18 列（含空格分隔计数的旧版写法）、ENCODE 11 列；按列数区分 |
-| 区域查询 | 不直接支持；`query.open` 会报错并给出转换命令 |
+| 区域查询 | 不直接支持；`query.open` 会报错并给出转换命令。转成 bigBed 后用 `IntervalReader` 读取，`schema.columns` 按列名取带类型的数组 |
 | 转为 bigBed | 保留全部列，写入相应方言的 autoSql schema |
 | 转为 bigWig | 选择一个数值列，可按修饰代码和链筛选 |
 | 从 BAM 生成 | 不生成 bedMethyl；BAM 甲基化统计由 quant 输出胞嘧啶表和 bigWig |
+
+quant 的 `cytosines.tsv.gz` 是七列胞嘧啶计数表，不是这里的 11 / 18 列 bedMethyl。该表附带 tabix 索引：输入 BAM header 中所有参考长度均不超过 `2**29` bp 时为 `.tbi`，否则为 `.csi`，见 [CSI 的 quant 表格说明](csi.md#quant-的-tabix-csi)。bedMethyl 转出的 bigBed / bigWig 使用自己的内置索引，不需要这些 tabix 文件。
 
 ## 保留全部字段：转为 bigBed
 
@@ -117,12 +119,19 @@ from omicsweave.query import IntervalReader
 
 with IntervalReader("calls.bb") as calls:
     print(calls.schema.field_count, calls.schema.defined_field_count)  # 18 9（modkit）
-    print(calls.schema.auto_sql)                                       # 各列名称与说明
+    print([f.name for f in calls.schema.fields])                       # autoSql 中的列名
     hits = calls.fetch(("chr1", 10_000, 11_000))
-    fields = [row.split("\t") for row in hits.annotation.to_list()]    # 第 4 列起
+    cols = calls.schema.columns(hits, ["name", "Nvalid_cov", "percent_modified", "Nmod"])
+    cols["Nvalid_cov"]        # uint32 [N]
+    cols["percent_modified"]  # float32 [N]，0–100
+    cols["name"].to_list()    # 修饰代码的 list[str]；cols["name"] 本身是 StringVector
 ```
 
 输出 bigBed 的前 9 列标记为 BED 标准字段，整份 autoSql 描述了每一列的名称、类型和含义，其他工具（如 UCSC 浏览器）也能据此显示各列。旧版 modkit 中空格分隔的计数在 bigBed 中统一以 tab 保存。
+
+bedMethyl 转成的 bigBed 就是带特定 autoSql 的普通 bigBed，没有专门的 reader：`schema.columns` 按 autoSql 的类型把第 4 列起的字段拆成 NumPy 数组（`uint` → `uint32`，`float` → `float32`），字符串列和颜色列返回 `StringVector`。前三列通过 `hits.start`、`hits.end` 及查询的染色体取得，不属于 `columns` 的可选字段。每个 `schema.fields` 元素是 `AutoSqlField`，提供 `name`、`type`、`comment` 和 `dtype`；无 autoSql 时的回退规则见 [bigBed](bigbed.md)。
+
+两种方言的 autoSql 列名不同：modkit 为 `Nvalid_cov`、`percent_modified`、`Nmod` 等，ENCODE 为 `readCount`、`percentMeth`。颜色列在这两套 schema 中都名为 `reserved`，其值仍为 `r,g,b` 字符串。`calls.fetch(region)` 默认保留完整坐标；`clip=True` 只裁剪 `start` / `end`，不改变任何注释字段。只需要一列做逐碱基信号时，可以转成 bigWig。
 
 ## 提取一条数值轨道：转为 bigWig
 

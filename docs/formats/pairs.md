@@ -1,6 +1,6 @@
 # 4DN pairs
 
-[格式总览](README.md) · [转换](../convert.md) · [定量](../quant.md) · [.hic](hic.md) · [Juicer short](juicer-short.md) · [cool](cool.md)
+[格式总览](README.md) · [转换](../convert.md) · [定量](../quant.md) · [.hic](hic.md) · [Juicer short](juicer-short.md) · [HiC-Pro](hicpro-pairs.md) · [cool](cool.md)
 
 4DN pairs（`.pairs`）是 4D Nucleome 项目制定的**接触对文本格式**：Hi-C、Micro-C 等实验比对后，每一对读段的两端位置写成一行。它位于 BAM 与接触矩阵之间：从 BAM 解析出 pairs，再按某个分辨率分箱成 [`.hic`](hic.md) 或 [cool](cool.md) 矩阵。
 
@@ -34,7 +34,7 @@ read2	chr1	20500	chr2	1200	-	+	UU
 
 ### header
 
-header 由 `#` 开头的行组成，第一行必须是 `## pairs format v1.0...`：
+标准 pairs header 由 `#` 开头的行组成，以 `## pairs format v1.0...` 声明格式。OmicsWeave 的自动探测依赖这个前缀；显式指定 `Pairs` / `--from pairs` 后，转换解析器不检查首行声明，也不校验 `#shape:` 的值：
 
 | header 行 | 含义 |
 |---|---|
@@ -59,7 +59,7 @@ header 由 `#` 开头的行组成，第一行必须是 `## pairs format v1.0...`
 
 之后可以有任意附加列，常见的有：
 
-- `pair_type`：pairtools 的分类，如 `UU`（两端唯一比对）、`UR` / `RU`（一端被“救回”）、`NN`、`MM`、`WW`（walks）等。
+- `pair_type`：pairtools 的分类，如 `UU`（在 pairtools 语义下表示两端唯一比对）、`UR` / `RU`（一端被“救回”）、`NN`、`MM`、`WW`（walks）等。OmicsWeave quant 固定写 `UU`，不能仅凭此值推断唯一比对，见下文。
 - `mapq1`、`mapq2`：两端的比对质量。
 - `frag1`、`frag2`：所属酶切片段。
 
@@ -85,6 +85,7 @@ PCR 重复、低 MAPQ、`pair_type` 不合格、同一酶切片段内的自连�
 |---|---|
 | 格式识别 | `formats.detect` 按 `## pairs format` 识别为 `Pairs` / `GzipPairs` |
 | 压缩 | 纯文本、gzip、BGZF |
+| 分隔符 | 一行含 tab 时按 tab 切列；不含 tab 时按任意 ASCII 空白切列 |
 | 转换 | pairs → `.hic`（v9），一次生成多种 BP 分辨率 |
 | 染色体 | 默认取 `#chromsize:`；可用 `chrom_sizes` 覆盖 |
 | 列 | 按 `#columns:` 定位 `chr1`、`pos1`、`chr2`、`pos2`（也接受 `position1` / `position2`）；无该行时按标准七列 |
@@ -94,7 +95,7 @@ PCR 重复、低 MAPQ、`pair_type` 不合格、同一酶切片段内的自连�
 转换的计数规则：
 
 - 每行计一次接触，不读取 MAPQ、`pair_type`、重复或片段字段，不做任何过滤。
-- 位置按文本值直接分箱：`bin = position // resolution`，不先减一；超出染色体长度的位置先截断为染色体长度再分箱（与 Juicer `pre` 相同）。
+- 位置按文本值直接分箱：`bin = position // resolution`，不先减一；超出染色体长度的位置先截断为染色体长度再分箱（与 Juicer `pre` 相同）。位置须为 `u64` 范围内的非负十进制整数，超出整数范围时报错。
 - 两端先按染色体顺序排列，同一染色体内的接触放入上三角，所以 `(a, b)` 和 `(b, a)` 计入同一个格子。
 - 染色体表之外的行被跳过，并按染色体汇总写入转换 warning。
 
@@ -143,7 +144,7 @@ ow quant hic.bam -o hic-results --hic --hic-resolutions 5000,25000
 ow quant hic.bam -o hic-results --hic --hic-resolutions none   # 只输出 pairs
 ```
 
-quant 取两个 mate 的 5′ 位置，做 MAPQ 过滤和精确去重，写出 `pair_type` 为 `UU` 的 pairs，不生成 pairix 索引。它只使用主比对，不解析 walks 或嵌合多段比对，与 pairtools 的完整流程不同。规则见 [quant](../quant.md)。
+quant 取两个 mate 的 5′ 位置，默认对两端做 MAPQ ≥ 30 过滤和精确去重，固定写出 `pair_type=UU`，不生成 pairix 索引。默认过滤器的 `unique=False`，因此这个 `UU` 不保证两端唯一比对；需要唯一性约束时还须配置相应过滤，不能只按输出标签判断。它只使用主比对，不解析 walks 或嵌合多段比对，与 pairtools 的完整流程不同。规则见 [quant](../quant.md)。
 
 ## 常见问题
 
@@ -158,6 +159,7 @@ quant 取两个 mate 的 5′ 位置，做 MAPQ 过滤和精确去重，写出 `
 ## 相关格式
 
 - [Juicer short](juicer-short.md)：Juicer 的另一种接触对文本，没有 header。
+- [HiC-Pro valid pairs](hicpro-pairs.md)：12 / 13 列、没有染色体长度 header 的接触对文本，需提供 `chrom_sizes`。
 - [.hic](hic.md)：转换目标，按窗口查询接触矩阵。
 - [cool](cool.md)、[mcool](mcool.md)：cooler 的接触矩阵，可由 pairs 分箱得到。
 - [BAM](bam.md)：quant 从 Hi-C BAM 生成 pairs。

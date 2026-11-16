@@ -133,7 +133,7 @@ BCF 把字段名编码为 header 字典中的编号，因此 VCF 中用到的 co
 
 ### 排序
 
-建 CSI 索引要求记录按 contig 在 header 中的顺序、再按 POS 排序。OmicsWeave 的 VCF → BCF 转换保留输入顺序，不排序；当前也没有 VCF 排序路由，未排序的 VCF 应先用外部工具（如 `bcftools sort`）排序。
+建 CSI 索引要求每个 contig 的记录连续，且同一 contig 内 POS 不减；contig 块的出现顺序不必与 header 中的声明顺序一致，但离开某个 contig 后不能再次返回。OmicsWeave 的 VCF → BCF 转换保留输入顺序，不排序；当前也没有 VCF 排序路由，未排序的 VCF 应先用外部工具（如 `bcftools sort`）排序。
 
 ## OmicsWeave 中的支持
 
@@ -146,7 +146,7 @@ BCF 把字段名编码为 header 字典中的编号，因此 VCF 中用到的 co
 | 同时建索引 | `index=True` / `--index` 写 `<bcf>.csi`（`min_shift` 固定为 14，与 `bcftools index` 默认相同） |
 | 补 contig | `add_contigs=True` / `--add-contigs`：额外扫描一遍 CHROM 列，按首次出现顺序补 `##contig=<ID=...>` |
 | 压缩等级 | `level` / `--level`，0–12 |
-| 版本 | 读取 `##fileformat`；缺失或无法解析时按 VCFv4.2 处理（与 htslib 相同） |
+| 版本 | 转换要求首行以 `##fileformat=VCF` 开头，缺失时报错；通过此前缀检查后，版本号无法解析时才按 VCFv4.2 处理 |
 | tabix `.tbi` | 不读取，也不需要 |
 
 限制：
@@ -216,7 +216,7 @@ convert.run(GzipVcf("calls.txt.gz"), "calls.bcf", index=True)
 |---|---|
 | `VariantReader` 拒绝 `.vcf.gz` | VCF 文本不做区域查询；先 `ow convert x.vcf.gz x.bcf --index` |
 | `contig ... is not declared in the header` | header 缺 `##contig`；加 `--add-contigs` |
-| `INFO/XX is not declared` 之类报错 | 字段未在 header 声明；先修正源 VCF |
+| `INFO 'XX' is not declared in the header` | 转换遇到 header 未声明的 INFO 字段；先修正源 VCF |
 | 建索引报 `unsorted positions` | 输入未按坐标排序；先排序，或不建索引 |
 | 已有 `.tbi` 却仍需转换 | OmicsWeave 的变异查询基于 BCF + CSI，不使用 tabix |
 | 查询区域返回了起点在区域之前的记录 | 记录与区域按 REF 跨度（或 END）判断重叠，删除和 SV 会跨入区域 |

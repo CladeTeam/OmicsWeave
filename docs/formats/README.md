@@ -14,10 +14,12 @@
 | 数值信号 | [bedGraph](bedgraph.md)、[wig](wig.md) | [bigWig](bigwig.md) | 内置 | `TrackReader`、`StrandedTrackReader` |
 | 区间与 peaks | [BED](bed.md) | [bigBed](bigbed.md) | 内置 | `IntervalReader` |
 | 甲基化调用 | [bedMethyl](bedmethyl.md) | bigBed（全部字段）、bigWig（一个数值列） | 内置 | `IntervalReader`、`TrackReader` |
+| 多序列比对 | [MAF](maf.md) | [bigMaf](bigmaf.md)（bigBed） | 内置 | `MsaReader` |
 | 读段比对 | [SAM](sam.md) | [BAM](bam.md)、[CRAM](cram.md) | [BAI](bai.md) / [CSI](csi.md)、[CRAI](crai.md) | `AlignmentReader` |
 | 变异与基因型 | [VCF](vcf.md) | [BCF](bcf.md) | [CSI](csi.md) | `VariantReader`、`ConsensusReader` |
-| 染色质接触 | [cool](cool.md)、[mcool](mcool.md)、[4DN pairs](pairs.md)、[Juicer short](juicer-short.md) | [.hic](hic.md) | 内置 | `ContactReader` |
+| 染色质接触 | [cool](cool.md)、[mcool](mcool.md)、[4DN pairs](pairs.md)、[Juicer short](juicer-short.md)、[HiC-Pro](hicpro-pairs.md) | [.hic](hic.md) | 内置 | `ContactReader` |
 | 基因注释 | [GTF](gtf.md)、[GFF3](gff3.md) | 载入内存后查询 | 不需要 | `Annotation` |
+| Motif | [MEME、JASPAR、TRANSFAC、HOMER、CIS-BP、HOCOMOCO、Cluster-Buster、BaMM、ProBound、GLAM2](motif-texts.md) | [FFM](ffm.md)（按 motif ID / 序号读取） | 自带 | Python `MotifReader`；Rust `FfmReader` / `MotifSet` |
 | 加载元信息 | — | [Sidecar](sidecar.md)（bigWig / bigBed / .hic 的伴随文件） | — | `read_sidecar` |
 
 OmicsWeave 的原则是：**每类数据选一个能高效随机访问的格式作为查询格式，其他格式通过一次转换进入这个格式。** 这样 reader 只需要做好少数几种二进制格式，转换在数据准备阶段完成一次，训练时不再反复解析文本。
@@ -30,10 +32,14 @@ bedMethyl ┘
 BED ──────┬──► bigBed ──► IntervalReader
 bedMethyl ┘
 
+MAF ─────────► bigMaf（bigBed）──► MsaReader
+
+MEME / JASPAR / TRANSFAC / HOMER / CIS-BP / HOCOMOCO / … ──► FFM
+
 VCF ─────────► BCF + CSI ──► VariantReader / ConsensusReader
 SAM ─────────► BAM + BAI/CSI ──► AlignmentReader ◄── CRAM + CRAI
 CRAM ────────► BAM（需要时）
-cool / mcool / pairs / Juicer short ──► .hic ──► ContactReader
+cool / mcool / pairs / Juicer short / HiC-Pro ──► .hic ──► ContactReader
 普通 gzip FASTA ──► bgzip FASTA + FAI + GZI，或 2bit ──► SequenceReader
 
 坐标排序 BAM ──► ow quant ──► bigWig / 计数矩阵 / .hic / pairs / ...
@@ -50,20 +56,26 @@ cool / mcool / pairs / Juicer short ──► .hic ──► ContactReader
 | [2bit](2bit.md) | 是 | 是 | — | 是 | `TwoBitWriter` | 自带 |
 | [bigWig](bigwig.md) | 是 | 是 | — | 是 | `BigWigWriter` | 自带 |
 | [bigBed](bigbed.md) | 是 | 是 | — | 是 | `BigBedWriter` | 自带 |
+| [bigMaf](bigmaf.md) | 是（识别为 bigBed） | 是（`MsaReader`） | — | 是 | `BigBedWriter`（需提供 bigMaf schema 与块文本） | 自带 |
 | [.hic](hic.md) v8 / v9 | 是 | 是 | — | 是 | `HicWriter`、`HicBuilder` | 自带 |
 | [BAM](bam.md) | 是 | 是 | 是（排序） | 是 | — | `build_index()` |
 | [CRAM](cram.md) 3.0 / 3.1 | 是 | 是 | 是 | — | — | `build_index()` |
 | [BCF](bcf.md) | 是 | 是 | — | 是 | — | `build_index()` |
 | [VCF](vcf.md)、[SAM](sam.md) | 是 | — | 是 | — | — | — |
-| [BED](bed.md)、[bedGraph](bedgraph.md)、[wig](wig.md)、[bedMethyl](bedmethyl.md) | 是 | — | 是 | — | — | — |
+| [BED](bed.md)、[bedGraph](bedgraph.md)、[wig](wig.md)、[bedMethyl](bedmethyl.md) | 是 | — | 是 | — | `Annotation.write_bed12()` 可导出转录本 BED12 | — |
+| [MAF](maf.md) | 是 | — | 是 | — | — | — |
+| [Motif 文本](motif-texts.md)（纯文本 / gzip / BGZF） | 是，部分布局需显式指定 | — | 是，可多个同格式来源 | — | — | — |
+| [FFM](ffm.md) | 是 | 按 motif ID / 序号读取 | 是（合并 / 重打包） | 是 | `FfmWriter` | 自带 |
 | [cool](cool.md)、[mcool](mcool.md) | 是 | — | 是 | — | — | — |
-| [4DN pairs](pairs.md)、[Juicer short](juicer-short.md) | 是 | — | 是 | quant 输出 pairs | — | — |
-| [GTF](gtf.md)、[GFF3](gff3.md) | 由 `Annotation.read` 判断（`detect` 会当作 BED） | 载入后查询 | — | — | `write_gtf`、`write_bed12` | 不需要 |
-| [FAI](fai.md)、[GZI](gzi.md) | 无 magic，不识别 | — | — | 随 FASTA 生成 | 随 `FastaWriter` 生成 | — |
-| [BAI](bai.md)、[CSI](csi.md)、[CRAI](crai.md) | 是 | — | — | 随转换生成 | — | — |
+| [4DN pairs](pairs.md)、[Juicer short](juicer-short.md)、[HiC-Pro](hicpro-pairs.md) | 是 | — | 是 | quant 仅输出 4DN pairs | — | — |
+| [GTF](gtf.md)、[GFF3](gff3.md) | 由 `Annotation.read` 判断（`detect` 会当作 BED） | 载入后查询 | — | — | `write_gtf()` 导出 GTF；不提供 GFF3 writer | 不需要 |
+| [FAI](fai.md)、[GZI](gzi.md) | 无 magic，`detect` 回退为 `Bed`，不识别其索引类型 | — | — | 随 FASTA 生成 | 随 `FastaWriter` 生成 | — |
+| [BAI](bai.md)、[CSI](csi.md)、[CRAI](crai.md) | 是 | — | — | BAM / BCF 转换可生成 BAI / CSI；CRAI 需 `Cram.build_index()` | — | — |
 | [Sidecar](sidecar.md) | 是 | — | — | 可选生成 | writer 的 `sidecar=True` | `build_sidecar()` |
 
 “识别”指 `omicsweave.formats.detect(path)` 能从文件内容判断格式；它不看扩展名。
+
+bigMaf 的内容类型仍为 bigBed，`query.open(...)` 会返回 `IntervalReader`；要把比对块投影为矩阵，应显式使用 `MsaReader`。FFM 保存 motif 模型，不使用基因组区域作为查询键；读取及匹配接口见 [Motif](../motif.md)。
 
 ## 几个贯穿所有格式的概念
 
@@ -73,11 +85,11 @@ cool / mcool / pairs / Juicer short ──► .hic ──► ContactReader
 
 | 约定 | 含义 | 使用它的格式 |
 |---|---|---|
-| 0-based 半开 `[start, end)` | 第一个碱基是 0，右端不包含 | BED、bedGraph、bigWig、bigBed、bedMethyl、BAM 二进制、2bit |
+| 0-based 半开 `[start, end)` | 第一个碱基是 0，右端不包含 | BED、bedGraph、bigWig、bigBed、bedMethyl、MAF、BAM 二进制、2bit |
 | 1-based 闭区间 `[start, end]` | 第一个碱基是 1，两端都包含 | GTF、GFF3、VCF 的 POS、SAM 的 POS、wig 的 start |
-| 1-based 单点位置 | 一个碱基的位置 | 4DN pairs、Juicer short 的 pos |
+| 1-based 单点位置 | 一个碱基的位置 | 4DN pairs、Juicer short、HiC-Pro 的 pos |
 
-**OmicsWeave 的所有查询 key 和返回结果都使用 0-based 半开坐标。** 文本中的 1-based 位置在读取、转换时统一换算：GTF 中 `start=101, end=200` 载入后是 `[100, 200)`；VCF `POS=101` 的 SNV 返回 `start=100`。
+**OmicsWeave 的基因组查询 key 和区间结果使用 0-based 半开坐标。** 输入的换算按格式规则处理：GTF 中 `start=101, end=200` 载入后是 `[100, 200)`；VCF `POS=101` 的 SNV 返回 `start=100`。pairs / Juicer short → hic 按输入位置直接分箱，不减一，详见 [转换](../convert.md#接触数据)。
 
 ```text
 碱基:        A   C   G   T   A
@@ -92,7 +104,7 @@ cool / mcool / pairs / Juicer short ──► .hic ──► ContactReader
 - **普通 gzip**：整个文件是一个连续的压缩流，想读中间的内容必须从头解压。
 - **BGZF**（blocked gzip，由 `bgzip` 生成）：文件由许多独立的 gzip 块组成，每块解压后不超过 64 KiB，并在块头记录自身大小。任意一块都能单独解压，配合索引即可随机访问。
 
-BGZF 仍是合法的 gzip，`zcat` 可以直接读，所以从扩展名和普通工具上看不出区别。BAM、BCF 内部都使用 BGZF；FASTA 只有 bgzip 版本能按区域查询。用 `formats.detect` 可以区分：
+BGZF 仍是合法的 gzip，`zcat` 可以直接读，所以从扩展名和普通工具上看不出区别。BAM、BCF 内部都使用 BGZF；压缩 FASTA 中只有 bgzip 版本能配合索引按区域查询，未压缩 FASTA 则使用 FAI。用 `formats.detect` 可以区分：
 
 ```python
 from omicsweave.formats import detect
@@ -100,7 +112,7 @@ from omicsweave.formats import detect
 print(detect("genome.fa.gz"))  # BgzipFasta(...) 或 GzipFasta(...)
 ```
 
-文本类转换输入（FASTA、BED、bedGraph、wig、bedMethyl、VCF、SAM、pairs、Juicer short）都接受纯文本、普通 gzip 和 BGZF 三种存储。
+文本类转换输入（FASTA、BED、bedGraph、wig、bedMethyl、MAF、VCF、SAM、pairs、Juicer short、HiC-Pro，以及 motif 文本）都接受纯文本、普通 gzip 和 BGZF 三种存储。
 
 ### 索引与伴随文件
 
@@ -113,7 +125,7 @@ print(detect("genome.fa.gz"))  # BgzipFasta(...) 或 GzipFasta(...)
 
 ### 排序
 
-区域索引依赖记录按坐标排序。BAM、BCF、CRAM 建索引前必须已经按坐标排序；BED、bedGraph、wig 转换时 OmicsWeave 会自动排序；VCF → BCF、SAM → BAM 保留输入顺序，不排序。未排序的 BAM 可以用 `ow convert in.bam out.bam --sort` 排序。
+区域索引依赖记录按坐标排序。BAM、BCF、CRAM 建索引前必须已经按坐标排序；BED、bedGraph、wig、bedMethyl、MAF 转换时 OmicsWeave 会自动排序；VCF → BCF、SAM → BAM 保留输入顺序，不排序。未排序的 BAM 可以用 `ow convert in.bam out.bam --sort` 排序。
 
 ### 染色体名称
 
@@ -141,8 +153,10 @@ print(sorted(FORMATS))         # 全部格式名，例如 'bgzip-fasta'、'bigwi
 
 - 序列：[FASTA](fasta.md) · [2bit](2bit.md) · [FAI](fai.md) · [GZI](gzi.md)
 - 信号与区间：[bigWig](bigwig.md) · [bedGraph](bedgraph.md) · [wig](wig.md) · [bigBed](bigbed.md) · [BED](bed.md) · [bedMethyl](bedmethyl.md)
+- 多序列比对：[MAF](maf.md) · [bigMaf](bigmaf.md)
 - 比对：[SAM](sam.md) · [BAM](bam.md) · [CRAM](cram.md) · [BAI](bai.md) · [CRAI](crai.md)
 - 变异：[VCF](vcf.md) · [BCF](bcf.md) · [CSI](csi.md)
-- 接触：[.hic](hic.md) · [cool](cool.md) · [mcool](mcool.md) · [4DN pairs](pairs.md) · [Juicer short](juicer-short.md)
+- 接触：[.hic](hic.md) · [cool](cool.md) · [mcool](mcool.md) · [4DN pairs](pairs.md) · [Juicer short](juicer-short.md) · [HiC-Pro](hicpro-pairs.md)
 - 注释：[GTF](gtf.md) · [GFF3](gff3.md)
+- Motif：[文本转换源](motif-texts.md) · [FFM](ffm.md) · [读取与匹配](../motif.md)
 - OmicsWeave 伴随文件：[Sidecar](sidecar.md)

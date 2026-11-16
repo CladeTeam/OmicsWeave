@@ -43,7 +43,7 @@ ow quant sample.bam -o results \
 | RNA velocity | `... --genes single-cell --velocity` | GTF / GFF3 |
 | 剪接位点 | `ow quant in.bam -o out --junctions --gtf genes.gtf --reference genome.fa.gz` | 参考（motif）、注释（是否已注释） |
 | scATAC-seq | `ow quant atac.bam -o out --atac --peaks peaks.bb --gtf genes.gtf` | 可选 peaks bigBed、注释 |
-| ChIP-seq / CUT&Tag | `ow quant chip.bam -o out --chip-peaks peaks.bb` 或 `--chip-bins 5000` | peaks bigBed |
+| ChIP-seq / CUT&Tag | `ow quant chip.bam -o out --chip-peaks peaks.bb` 或 `--chip-bins 5000` | `--chip-peaks` 需要 peaks bigBed；`--chip-bins` 不需要 |
 | SLAM-seq 等代谢标记 | `... --labeling --labeled 2 --conversion 'T>C' --reference genome.fa.gz` | 参考或 `MD` 标签；可选已知变异 BCF |
 | WGBS / EM-seq / ONT 甲基化 | `ow quant methyl.bam -o out --methylation --reference genome.fa.gz` | 参考（参考比对方式需要） |
 | Hi-C / Micro-C | `ow quant hic.bam -o out --hic --hic-resolutions 5000,25000` | BAM 含 `MC` / `MQ` |
@@ -272,13 +272,15 @@ ow quant chip.bam -o chip-results --chip-peaks peaks.bb --coverage
 
 默认输出：
 
-- `atac/fragments.tsv.gz` 和 `.tbi`；`--no-fragments` 可关闭。
+- `atac/fragments.tsv.gz` 和 tabix 索引：所有参考序列长度均不超过 2^29 bp 时为 `.tbi`，否则自动写 `.csi`；`--no-fragments` 可关闭。
 - `atac/barcode_metrics.csv`：片段、peak 内切点、TSS 及侧翼切点等指标。
 - `atac/tiles/`：默认 5000 bp tile 的切点矩阵；`--tiles 0` 可关闭。
 - 指定 `--peaks` 时的 `atac/peaks/` 切点矩阵。
 - 提供注释时的 `atac/gene_activity/` 片段矩阵，默认基因体加上游 2000 bp；`--gene-activity none` 可关闭。
 
-ChIP / CUT&Tag 的 `--chip-peaks` 和 `--chip-bins N` 分别对 peaks 和固定大小 bin 计片段，不做 peak calling。
+tabix 索引类型按 BAM header 的全部参考长度选择，包含没有片段输出的参考；右端恰好为 `2**29` 的区间仍可使用 TBI。实际索引路径会写进 `report.files` 和 `summary.json`，下游不应固定拼接 `.tbi`。索引与坐标约定见 [CSI](formats/csi.md#quant-的-tabix-csi)。
+
+ChIP / CUT&Tag 的 `--chip-peaks` 和 `--chip-bins N` 分别对 peaks 和固定大小 bin 计片段，不做 peak calling。两者可以单独或同时使用；仅使用 `--chip-bins` 时不需要 peaks 文件。
 
 ## 剪接位点与 velocity
 
@@ -319,14 +321,20 @@ ow quant methyl.bam -o methyl-results --methylation \
 
 | `source` / `--methylation-source` | 调用来源 |
 |---|---|
-| `auto`，默认 | 逐记录依次尝试 Bismark 标签、MM/ML、参考比对 |
+| `auto`，默认 | 有 `XM` 时用 Bismark；否则有 `MM` / `Mm` 时用修饰标签；否则用参考比对 |
 | `bismark` | `XM` / `XG`，按标签给出的上下文和状态 |
 | `modifications` | MM/ML 中的 5mC `C+m` 概率 |
 | `reference` | 与参考或 MD 重建的参考比较，判断 C>T / G>A |
 
-默认只统计 CpG，最低碱基质量为 5，MM/ML 概率阈值为 0.5；重叠 mates 丢弃 read 2 在 read 1 区间内的调用。`merge_cpg=True` 合并 CpG 两条链，CHG / CHH 不作链合并。
+默认只统计 CpG，最低碱基质量为 5，MM/ML 概率阈值为 0.5；重叠 mates 丢弃 read 2 在 read 1 区间内的调用。甲基化的碱基质量阈值使用 `--methylation-min-quality Q`（Python `Methylation(min_quality=Q)`）；共享的 `--min-base-quality` 只用于代谢标记、labeled 层和等位计数，不作用于甲基化。`merge_cpg=True` 合并 CpG 两条链，CHG / CHH 不作链合并。
 
-输出包括 `methylation/cytosines.tsv.gz` 与 `.tbi`、`beta.bw`、`coverage.bw`、`mbias.tsv`。胞嘧啶表七列为 `chrom, start, end, context, strand, methylated, unmethylated`。beta 是甲基化比例，coverage 是总调用数；没有覆盖的位置不列出。M-bias 仅报告，不自动截断或过滤读段。
+修饰来源要求同时存在 `MM` / `Mm` 和 `ML:B:C` / `Ml:B:C`，只统计测序方向的 `C+m`，不把 `C-m` 或其他修饰当作 5mC。概率按 `(ML + 0.5) / 256` 换算：达到阈值记甲基化，至多为 `1 - 阈值` 记未甲基化，中间不调用；无标记或 `.` 条目省略的 C 记未甲基化，`?` 条目省略的 C 不调用。修饰位置与 CIGAR 对齐后才计数，插入和 soft clip 上的位点不计。
+
+`MN` 存在时必须等于 SEQ 长度；带 hard clip 的读段还要求有 `MN`。重复的 `C+m` 类型没有唯一概率和省略模式，按坏标签处理；ML 类型/个数、delta 或其它条目不合法同样使该记录计入 `unassigned_malformed_tags`。没有配套 ML 时计入 `unassigned_no_source`。`auto` 选择来源后，缺标签或坏标签不会再回退到参考调用。区域查询的 `modifications` 可返回无 ML 的 `UNSCORED` 行，与定量所需的有评分 5mC 调用不同。
+
+输出包括 `methylation/cytosines.tsv.gz` 与 tabix 索引（所有参考序列长度均不超过 2^29 bp 时为 `.tbi`，否则为 `.csi`）、`beta.bw`、`coverage.bw`、`mbias.tsv`。胞嘧啶表七列为 `chrom, start, end, context, strand, methylated, unmethylated`。beta 是甲基化比例，coverage 是总调用数；没有覆盖的位置不列出。M-bias 仅报告，不自动截断或过滤读段。
+
+普通行是 `[pos, pos + 1)`；合并 CpG 时按正链 C 位置输出两碱基区间 `[pos, pos + 2)`，`strand="."`，两条链的计数相加后写出，不截断到 `uint32`。无法表示的坐标或超出参考长度的输出区间会报错。索引选择与 ATAC 表相同，空表也会生成对应类型的索引；`table=False` 则不生成表或索引。
 
 区域矩阵用两层保存计数，适合下游自行计算比例：
 
@@ -337,6 +345,23 @@ product = quant.Methylation(
     matrices=[quant.MethylMatrix("bins", quant.Bins(100_000), rows="@file")],
 )
 ```
+
+CLI 可同时请求多个区域矩阵：
+
+```sh
+ow quant a.bam b.bam -o methyl-matrices --methylation --no-cytosines \
+  --methylation-bins 100000 --methylation-genes --gtf genes.gtf \
+  --methylation-rows @file --matrix mtx
+```
+
+| CLI 选项 | 区域矩阵 |
+|---|---|
+| `--methylation-bins N` | 全基因组固定大小 bin |
+| `--methylation-genes` | 基因体，需要 `--gtf` |
+| `--methylation-promoters UP,DOWN` | 启动子，需要 `--gtf` |
+| `--methylation-peaks FILE.bb` | peaks bigBed 中的区间 |
+| `--methylation-rows ROWS` | 行标识：标签名（如 `CB`）、`@RG` 或 `@file`（默认，每个输入 BAM 一行） |
+| `--no-cytosines` | 关闭胞嘧啶表和 bigWig，只保留请求的区域矩阵等统计 |
 
 每胞嘧啶表和 bigWig 只支持单个 BAM；多个 BAM 时关闭 `table` 和 `bigwig`，或在 CLI 使用 `--no-cytosines`。区域矩阵输出 `methylated.*` 与 `total.*`，支持 bins、peaks、基因、启动子和自定义区域。MM/ML 当前仅输出 5mC，不单独输出 5hmC 等其他修饰，也不自动估计概率阈值。
 

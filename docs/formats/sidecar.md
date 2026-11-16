@@ -22,8 +22,8 @@ sidecar 是**可选的**。普通的 `TrackReader`、`IntervalReader`、`Contact
 
 BBI（bigWig / bigBed）和 `.hic` 都把数据切成 zlib 压缩块，并用索引告诉读取方“某个区域在哪几个块、每块从哪个偏移开始、占多少压缩字节”。但它们都**不记录块解压后有多大、里面有多少条记录**：
 
-- BBI 的 R 树索引只给出块的文件偏移和压缩长度。header 中的 `uncompressBufSize` 只是全文件的最大值。
-- `.hic` 的块索引只记录块的位置和压缩字节数；zlib 流本身不带解压长度，而且每个块的内部编码（按行列表或稠密矩阵、短字段或宽字段）是逐块选择的，不解压就无法知道它解出来多大。
+- BBI 的 R 树叶子给出块的起止染色体与坐标、文件偏移和压缩长度。header 中的 `uncompressBufSize` 只是全文件的最大值。
+- `.hic` 的块索引记录块编号、位置和压缩字节数；zlib 流本身不带解压长度，而且每个块的内部编码（按行列表或稠密矩阵、短字段或宽字段）是逐块选择的，不解压就无法知道它解出来多大。
 
 对于一次查询一个区域的普通读取，这不是问题：读出块、解压、解码即可。但对于需要在大量窗口间共享解压结果、按字节预算管理缓存、或在后台线程中预取的加载器，提前知道每块的解压大小和条目数，可以避免先解压一遍再分配。sidecar 就是把这些信息**测量一次**并保存下来。
 
@@ -99,7 +99,7 @@ sidecar 描述的是某一个具体文件的字节布局，源文件一旦改写
 | quant 输出 | `quant.Coverage(sidecar=True)`、`quant.Contacts(sidecar=True)`，CLI `ow quant --sidecar` |
 | 读取 | `formats.read_sidecar(源文件)` → `BbiSidecar` 或 `HicSidecar` |
 
-所有生成方式默认都**不**写 sidecar。
+Python writer、`convert.run` / CLI 和 quant 默认都**不**写 sidecar。Rust 直接构造的转换任务（例如 `BedToBigBed::new`、`CoolToHic::new`），以及 `Conversion::between` / `infer`，默认 `sidecar=true`；调用 `configure(&Options::default())` 时则会设为 `false`。使用 Rust API 时应检查所选入口的设置。
 
 ## 生成
 

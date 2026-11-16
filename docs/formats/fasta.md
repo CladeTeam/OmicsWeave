@@ -78,7 +78,7 @@ offset + (pos // 每行碱基数) * 每行字节数 + pos % 每行碱基数
 
 这些数字就保存在 [FAI](fai.md) 中。bgzip 文件里 FAI 给出的是**解压后**文本的位置，还需要 [GZI](gzi.md) 把它换算到压缩块。因此：
 
-- 行长不一致的 FASTA 无法建索引，需要先重新排版（例如用 `FastaWriter` 或转换重写）。
+- 行长不一致的 FASTA 无法建索引，需要先解析序列，再用 `FastaWriter` 重新排版；`ow convert` 转成 bgzip FASTA 时保留原始文本，不修复行宽。
 - 修改序列或换行方式后，旧索引立即失效，必须重建。
 
 ### 序列名
@@ -147,7 +147,7 @@ report = convert.run("ordinary-gzip.fa.gz", "genome.bgz.fa.gz", threads=4)
 print(report.target, report.companions)  # BgzipFasta(...)，(Fai(...), Gzi(...))
 ```
 
-转换到 bgzip FASTA 的输出与 `bgzip` 在同一压缩等级下的结果逐字节一致，且不随线程数改变；`--level` / `level=` 设置 libdeflate 压缩等级（0–12）。选择 bgzip FASTA 还是 2bit，见下文“选择存储方式”。
+转换到 bgzip FASTA 时原样压缩解压后的 FASTA 文本，不重排 header、碱基或换行；行宽不齐仍会在生成 FAI 时报告 `different line length`。输出与 `bgzip` 在同一压缩等级下的结果逐字节一致，且不随线程数改变；`--level` / `level=` 设置 libdeflate 压缩等级（0–12）。选择 bgzip FASTA 还是 2bit，见下文“选择存储方式”。
 
 ## 查询
 
@@ -155,7 +155,7 @@ print(report.target, report.companions)  # BgzipFasta(...)，(Fai(...), Gzi(...)
 from omicsweave.query import SequenceReader
 
 with SequenceReader("genome.fa.gz") as genome:
-    print(genome.chroms)               # {'chr1': 248956422, ...}，按文件顺序
+    print(genome.chroms)               # mappingproxy({'chr1': 248956422, ...})，按文件顺序
     print(genome.length("chr1"))
     seq = genome.fetch(("chr1", 0, 100))
     print(seq.text)                    # 'NNNN...'
@@ -223,7 +223,7 @@ with FastaWriter("example.fa.gz", line_width=60) as writer:
 
 - `compress` 默认按路径是否以 `.gz` 结尾决定，也可以显式指定 `True` / `False`；压缩时写 bgzip，`level` 为 libdeflate 等级 0–12，默认 6。
 - `line_width` 是每行碱基数，默认 60；`0` 表示每条序列写成一行。
-- 序列可以是 `str`、`bytes` 或 `uint8` 数组；名称必须唯一，碱基必须是可打印 ASCII。
+- 序列可以是 `str`、`bytes` 或 `uint8` 数组；名称必须唯一，序列非空，碱基限于 `0x21`–`0x7E` 的可打印非空白 ASCII，且不能包含 `>`。
 - 索引根据写出的布局直接生成，不再回读文件；`close()` 返回写出的伴随文件 `(Fai, Gzi)` 或 `(Fai,)`。
 - 块内发生异常时放弃未完成的文件。
 
@@ -242,7 +242,7 @@ with FastaWriter("example.fa.gz", line_width=60) as writer:
 |---|---|
 | `.fa.gz` 打不开，提示是 `GzipFasta` | 这是普通 gzip，先 `ow convert` 成 bgzip FASTA 或 2bit |
 | 提示找不到 `.fai` | reader 不自动建索引；调用 `build_index()` 或指定 `fai=` |
-| 建索引报行长不一致 | 文件各行长度不同；用 `ow convert` 或 `FastaWriter` 重新写出 |
+| 建索引报行长不一致 | 同一序列除末行外行宽不齐；解析序列后用 `FastaWriter` 统一行宽，`ow convert` 不修复此问题 |
 | 找不到染色体 | 名称取 header 第一个词；查看 `genome.chroms` |
 | 区域越界报错 | 查询不会补 N；先按 `genome.length(chrom)` 截断 |
 | 结果中有小写 | 文件中的软屏蔽；按需要转大写 |

@@ -4,7 +4,7 @@
 
 BAM 是 [SAM](sam.md) 比对记录的**压缩二进制形式**：字段与 SAM 一一对应，但以紧凑的二进制编码保存，并用 BGZF 分块压缩。按坐标排序并建立索引后，可以直接跳到某个区域，只解压包含该区域读段的少数几个块。它是测序比对数据最通用的交换和存储格式。
 
-在 OmicsWeave 中，BAM 有两种用法：`AlignmentReader` 通过 BAI / CSI 索引**按区域读取**比对记录，返回列式 NumPy 数组；[quant](../quant.md) 则**顺序扫描**坐标排序 BAM，一次扫描同时生成覆盖度、计数矩阵等多种产物。SAM、CRAM 都先转换为 BAM 再使用。
+在 OmicsWeave 中，BAM 有两种用法：`AlignmentReader` 通过 BAI / CSI 索引**按区域读取**比对记录，返回列式 NumPy 数组；[quant](../quant.md) 则**顺序扫描**坐标排序 BAM，一次扫描同时生成覆盖度、计数矩阵等多种产物。SAM 需要先转换；CRAM 可以直接按区域查询，用于 quant 时先转换为 BAM。
 
 ## 速览
 
@@ -95,7 +95,7 @@ ow convert aligned.bam sorted.bam --sort --index -t 8 -m 4G
 
 ### 重叠查询的语义
 
-区域查询返回**与区域重叠**的记录：记录的参考跨度 `[start, end)` 与查询区域有交集。跨度由 POS 和 CIGAR 中消耗参考的操作（`M`、`D`、`N`、`=`、`X`）决定，因此跨越内含子（`N`）的 RNA-seq 读段，即使查询区域落在内含子中也会返回。没有 CIGAR 的记录跨度按 1 bp 计算。
+区域查询返回**与区域重叠**的记录：记录的参考跨度 `[start, end)` 与查询区域有交集。已比对记录的跨度由 POS 和 CIGAR 中消耗参考的操作（`M`、`D`、`N`、`=`、`X`）决定，因此跨越内含子（`N`）的 RNA-seq 读段，即使查询区域落在内含子中也会返回。CIGAR 不消耗参考碱基的记录跨度按 1 bp 计算；FLAG 含 `0x4` 的未比对记录恒按 1 bp 计算，即使它带有 CIGAR。
 
 放在 mate 位置上的未比对读段（FLAG 含 `0x4` 但有 RNAME / POS）同样会被返回；RNAME 为 `*` 的读段无法按区域取到。
 
@@ -110,6 +110,7 @@ BAM 中通常同时存在主比对、次要比对、补充比对、重复读段�
 | 格式识别 | 解压首块后按 `BAM\1` magic 识别为 `Bam` |
 | 区域查询 | `AlignmentReader.fetch`，返回记录与 htslib 区域迭代器（`sam_itr_queryi`）一致，按文件顺序 |
 | 列式结果 | 固定列为 NumPy 数组；名称、序列、质量、CIGAR、标签按需解码 |
+| 碱基修饰 | 按需把 `MM` / `ML` 标签解码为每个修饰位点一行，与 htslib 的 `bam_next_basemod` 一致，并给出参考坐标 |
 | 建索引 | `Bam.build_index()`：BAI 或 CSI，与 `samtools index` 的 bins / chunks 相同 |
 | 索引查找 | 默认依次找 `<bam>.csi`、`<去扩展名>.csi`、`<bam>.bai`、`<去扩展名>.bai`；可用 `index=` 指定 |
 | header | `chroms`、`references`、`header_text` |
@@ -153,7 +154,7 @@ Bam("sorted.bam").build_index("csi", min_shift=14, threads=4)
 from omicsweave.query import AlignmentReader
 
 with AlignmentReader("sorted.bam") as reads:
-    print(reads.chroms)        # {'chr1': 248956422, ...}，按参考编号顺序
+    print(dict(reads.chroms))  # {'chr1': 248956422, ...}，按参考编号顺序
     print(reads.references)    # ('chr1', 'chr2', ...)，mate_tid 的下标
     hits = reads.fetch(("chr1", 100, 200), fields=("name", "seq", "cigar"))
     print(len(hits), hits.start, hits.end, hits.flag, hits.mapq)
@@ -185,8 +186,9 @@ with AlignmentReader("sorted.bam") as reads:
 | `qual` | `quals` | `StringVector`，原始 Phred 字节（不是 FASTQ 的 +33 编码）；缺失为 `0xff` |
 | `cigar` | `cigars` | `Cigars`：BAM 编码的 `uint32` 操作与 `offsets` |
 | `aux` | `aux` | `StringVector`，BAM 二进制编码的可选标签 |
+| `modifications` | `modifications` | `Modifications`：`MM` / `ML` 解码出的碱基修饰，见下文 |
 
-未请求的字段为 `None`。
+未请求的字段为 `None`。`"all"` 包含 `modifications`。
 
 ```python
 import numpy as np
@@ -207,9 +209,52 @@ with AlignmentReader("sorted.bam") as reads:
 
 aux 是 BAM 的二进制标签编码，例如 `NM:i:0` 存为 `b"NMC\x00"`（标签名、类型 `C` 表示 uint8、值 0），需要按 SAM 规范解析。
 
+### 碱基修饰（MM / ML）
+
+纳米孔、PacBio 等长读长数据把甲基化等碱基修饰写在 `MM` / `ML` 标签里（SAMtags 1.7 节）：`MM:Z:C+m,2,0;` 表示在读段**测序方向**上跳过 2 个 C 后第一个 C、再紧接着下一个 C 带 5mC，`ML:B:C` 依次给出每个位点的概率（0–255）。请求 `modifications` 字段后，每个修饰位点解码为一行：
+
+```python
+from omicsweave.types import ModificationFlag, Modifications
+
+with AlignmentReader("ont.bam") as reads:
+    hits = reads.fetch(("chr1", 0, 100_000), "modifications", modification_codes=["m", "h"])
+    mods = hits.modifications
+    rows = mods.rows(0)                       # 第 0 条记录的行
+    print(mods.ref_pos[rows], mods.probability[rows])
+    scored = (mods.flags & ModificationFlag.UNSCORED) == 0
+    p = (mods.probability[scored] + 0.5) / 256  # 仅换算有 ML 的行
+    on_ref = mods.ref_pos >= 0                # 插入、soft clip 上的修饰为 -1
+    if len(mods.code):
+        print(Modifications.code_name(int(mods.code[0])))  # 例如 "m"
+```
+
+| 列 | dtype | 含义 |
+|---|---|---|
+| `offsets` | `int64` | 第 `i` 条记录的行是 `offsets[i]:offsets[i + 1]`；`mods.record` 给出每行的记录下标 |
+| `ref_pos` | `int64` | 该碱基的 0-based 参考坐标；插入、soft clip 或未比对记录为 `-1` |
+| `qpos` | `int32` | 该碱基在**存储的 SEQ**（与 `seqs` 相同）中的下标，含 soft clip；不是原始测序方向下标 |
+| `code` | `int32` | 修饰代码：单字母存 ASCII 值（`m` = 109，`h` = 104，`a` = 97），ChEBI 编号取负（`A+17596` 为 `-17596`），与 htslib 的 `modified_base` 相同 |
+| `canonical` | `uint8` | `MM` 条目的原始碱基（ASCII，`A` / `C` / `G` / `T` / `N`，`U` 读作 `T`），按测序方向 |
+| `probability` | `uint8` | 原始 `ML` 值；没有 `ML` 标签时为 0，并置 `UNSCORED` 位 |
+| `flags` | `uint8` | `ModificationFlag`：`MINUS`（`-` 链条目，如双链测序的 `G-m`）、`EXPLICIT`（`?` 条目：未列出的碱基未被检查，而不是未修饰）、`UNSCORED`（无 `ML`） |
+
+正常标签的解码顺序与 htslib 一致：
+
+- 行按 SEQ 位置排列，同一位置按 `MM` 条目、条目内代码的顺序；`C+mh` 这样的多代码条目，`ML` 值按位点交错。
+- 跳过计数按读段**测序方向**数原始碱基：负链读段（FLAG `0x10`）在存储的 SEQ 上从右向左数互补碱基，结果仍落在存储坐标上；`N` 条目数所有碱基。
+- 旧标签名 `Mm` / `Ml` 同样读取，同时存在时优先 `MM` / `ML`。`MN` 可选；SEQ 非空时用它校验序列长度。
+- 只返回 `MM` 列出的位点。隐式条目（无标记或 `.`）中未列出的碱基视为未修饰，显式条目（`?`）中未列出的碱基未知。空条目不会产生行，判断整条记录的省略模式时需读取 `aux` 中的 `MM`，不能仅看已返回行的 `flags`。
+- `MINUS` 是相对测序方向的修饰链，不是基因组负链标记。已比对读段上，基因组修饰链是否为负可由读段 FLAG 的 `REVERSE` 与 `MINUS` 异或得到。
+
+`modification_codes` 接受单字母、正的 31 位 ChEBI 编号或其十进制字符串，例如 `"m"`、`["m", "h"]`、`[17596]`；省略或空列表保留全部代码。Python 参数中的正整数表示 ChEBI 编号，不表示 ASCII 值。指定该参数时必须请求 `modifications`；筛选只影响修饰行，不影响比对记录或其他字段。
+
+修饰行保留所返回读段的全部已列出位点，`ref_pos` 可以落在查询窗口外；查询窗口只筛选读段。这里不做概率阈值或位点汇总，这些属于 quant 的 [DNA 甲基化](../quant.md) 产物。
+
+未知碱基、缺少分号、列出的位点超出读段、`ML` 个数不符、`MN` 与非空 SEQ 长度不符等会使该次查询报 `InvalidError`；BAM 错误信息包含读段名。非法整数 delta 也会明确报错，不采用某些 htslib 路径的提前结束行为。不请求修饰字段时，不额外解析这些标签。
+
 ### 链方向与顺序
 
-记录按文件顺序（即坐标顺序）返回。负链 key 不会改变记录方向，也不会反向互补 SEQ；SEQ 始终是参考正链方向，读段本身的方向看 FLAG 的 `0x10`。
+记录按文件顺序返回。负链 key 不会改变记录方向，也不会反向互补 SEQ；已比对读段的存储 SEQ 按比对方向排列，读段本身的方向看 FLAG 的 `0x10`。所有结果数组独立于 reader 的下一次查询和关闭；缓存、线程与进程规则见[查询文档](../query.md#结果存储重复查询与并发)。
 
 ### 自定义索引位置
 
@@ -237,8 +282,9 @@ ow quant sorted.bam -o results --coverage --gtf genes.gtf --genes bulk
 | 找不到染色体 | 查看 `reads.chroms`，使用 header 中的名称（`chr1` 与 `1` 不互换） |
 | 结果中有重复和次要比对 | 查询不过滤；用 `flag` / `mapq` 列筛选 |
 | 质量值看起来比 FASTQ 小 33 | `quals` 是原始 Phred 值，不是 ASCII 编码 |
-| 负链读段序列不是读段原始方向 | BAM 中 SEQ 总是参考正链方向；需要原始方向时按 `0x10` 自行反向互补 |
-| 参考序列超过 512 Mb 无法写 BAI | 使用 CSI：`--index csi` |
+| 负链读段序列不是读段原始方向 | 已比对读段的 SEQ 按比对方向存储；需要测序方向时按 `0x10` 自行反向互补 |
+| `modifications` 查询报 `InvalidError` | 某条记录的 `MM` / `ML` 不合规范；查看错误中的读段名与具体原因 |
+| 参考序列超过 `2**29` bp（536,870,912 bp）无法写 BAI | 使用 CSI：`--index csi` |
 
 ## 相关格式
 

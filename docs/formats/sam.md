@@ -45,7 +45,7 @@ read1	147	chr1	10151	60	10M	=	10001	-160	TTGCATGCAA	IIIIIIIIII	NM:i:1	RG:Z:lib1
 
 | 行类型 | 作用 | 常见字段 |
 |---|---|---|
-| `@HD` | 文件级信息，必须在第一行 | `VN` 格式版本，`SO` 排序方式（`coordinate`、`queryname`、`unsorted`） |
+| `@HD` | 文件级信息；OmicsWeave 允许出现在其他 header 行后，转换时把首个 `@HD` 移到顶部 | `VN` 格式版本，`SO` 排序方式（`coordinate`、`queryname`、`unsorted`） |
 | `@SQ` | 参考序列字典，顺序决定参考序列编号 | `SN` 名称，`LN` 长度，`AN` 别名，`M5` 序列 MD5 |
 | `@RG` | read group：测序文库 / 样本 / lane | `ID`，`SM` 样本，`LB` 文库，`PL` 平台 |
 | `@PG` | 处理过该文件的程序 | `ID`，`PN`，`VN`，`CL` 命令行 |
@@ -161,7 +161,7 @@ FLAG 含 `0x4` 的读段仍可能带 RNAME / POS：配对中未比对的一端�
 
 - RNAME 或 RNEXT 不在 `@SQ`（或其 `AN` 别名）中时报错。htslib 会警告并把记录改成未定位，静默丢掉名称。
 - 含 NUL 字节的行报错。
-- 每行末尾的一个 `\r` 总会去掉，便于处理 Windows 换行。
+- 比对记录行末的一个 `\r` 会去掉；header 只在行以 `\n` 结束时去掉它前面的 `\r`。文件末尾没有 `\n` 的 header 行若以裸 `\r` 结束，该字节会保留。
 
 ## 转为 BAM
 
@@ -184,6 +184,8 @@ print(report.target, report.companions)  # Bam('sorted.bam') (Bai('sorted.bam.ba
 
 转换保留输入记录顺序，不自动排序；`--sort` 只适用于 BAM → BAM。`--index` 默认在每条参考序列都不超过 `2**29` bp 时写 [BAI](bai.md)，否则写 [CSI](csi.md)；也可用 `--index bai` / `--index csi` 指定。`--level` 设置 BGZF 压缩等级（0–12）。
 
+`formats.detect` 只凭开头的 header 标记识别 SAM，不检查无 header 的比对记录。`ow convert --from sam`，或 Python 中显式传入 `Sam(path)` / `GzipSam(path)` 时，可以处理无 header 输入；但没有 `@SQ` 就不能解析具体的参考序列名称，仅 RNAME / RNEXT 不引用未声明参考的记录可转换。Python / CLI 的输入自动识别不依赖后缀；Rust 的 `Conversion::infer` 则按后缀推断格式。
+
 转换后的 BAM 可以用 `AlignmentReader` 按区域读取，详见 [BAM](bam.md)。
 
 ## 常见问题
@@ -192,7 +194,7 @@ print(report.target, report.companions)  # Bam('sorted.bam') (Bai('sorted.bam.ba
 |---|---|
 | 报参考序列不在 header 中 | RNAME / RNEXT 未在 `@SQ` 声明；补全 header 后再转换 |
 | `--index` 报未排序 | 先不带 `--index` 转 BAM，再 `--sort --index` |
-| 没有 header 的 SAM 识别失败 | 识别依赖 header 行，且需要 `@SQ` 声明参考；先补上 header |
+| 没有 header 的 SAM 识别失败 | `detect` 依赖 header 标记；转换时用 `--from sam` 或显式 `Sam(path)`。记录引用具体参考名称时仍须补全 `@SQ` |
 | 想得到过滤后的读段 | 查询结果不自动过滤；在返回的 `flag`、`mapq` 列上筛选，或使用 quant 的过滤规则 |
 | 需要把 BAM 导出为 SAM 查看 | OmicsWeave 不提供导出，可用 `samtools view` |
 

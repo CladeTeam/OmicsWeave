@@ -24,7 +24,7 @@ wig 是 UCSC 基因组浏览器最早支持的数值轨道格式之一。为了�
 
 ## 文件结构
 
-一个 wig 文件由若干**段**组成，每段以声明行开头。常见的两种段：
+wig 可以包含以声明行开头的**段**，也可以混用或只包含 bedGraph 行。常见的两种段：
 
 ### fixedStep：等间距
 
@@ -57,13 +57,13 @@ variableStep chrom=chr2 span=5
 | `chrom` | 染色体名 | 必需 |
 | `span` | 每个值覆盖的碱基数 | 可选，默认 1 |
 
-数据行是“1-based 位置 + 值”。上例两行分别覆盖 0-based 的 `[200, 205)` 和 `[300, 305)`。适合位置不规则但跨度一致的信号。
+数据行是“1-based 位置 + 值”。上例两行分别覆盖 0-based 的 `[200, 205)` 和 `[300, 305)`。适合位置不规则但跨度一致的信号。`variableStep` 声明只接受 `chrom`、`span`，出现 `start` 或 `step` 会报 `unknown setting`。
 
 ### 其他行
 
 - `track type=wiggle_0 name=... description=...`：UCSC 轨道定义，`type=wiggle_0` 声明 wig。
 - `browser ...`、`#` 注释、空行。
-- bedGraph 行（`chrom start end value`，0-based 半开）：一些文件在 wig 中混用 bedGraph 行，它结束当前的 step 段。
+- bedGraph 行（`chrom start end value`，0-based 半开）：它结束当前的 step 段，也可以组成整份输入；没有 wig 声明时自动探测通常识别为 bedGraph，两者都能转为 bigWig。
 
 ### 同一信号的三种写法
 
@@ -143,7 +143,7 @@ print(report.records)  # 写入的信号区间数
 转换规则：
 
 - **输入**：纯文本、gzip、BGZF；`track`、`browser`、`#` 开头的行和空行跳过。
-- **声明**：`fixedStep` 必须有 `chrom` 和 `start`，`variableStep` 必须有 `chrom`；`step`、`span` 须为正整数，未知的设置项报错。
+- **声明**：`fixedStep` 必须有 `chrom` 和 `start`，还接受可选 `step`、`span`；`variableStep` 必须有 `chrom`，只接受可选 `span`。出现的 `start`、`step`、`span` 须为正整数，未知或不适用于该段类型的设置项报错。
 - **数据行**：fixedStep 段内每行一个值，variableStep 段内每行“位置 值”；列数不符合所在段时报错。
 - **排序**：段可以按任意顺序出现，转换按染色体（首次出现的顺序）和起点排序。
 - **重叠**：排序后相邻区间不能重叠；`span > step` 或不同段覆盖同一位置时报错。
@@ -168,7 +168,7 @@ with TrackReader("signal.bw") as track:
 |---|---|
 | 报错区间重叠 | `span > step`，或多个段覆盖同一位置；调整 span 或拆分文件 |
 | `fixedStep without start=` | fixedStep 声明缺少 `start` |
-| `unknown setting` | 声明行有不支持的设置项（只认 `chrom`、`start`、`step`、`span`） |
+| `unknown setting` | fixedStep 只认 `chrom`、`start`、`step`、`span`；variableStep 只认 `chrom`、`span` |
 | 结果整体偏移 1 bp | 自行解析 wig 时忘了 1-based；OmicsWeave 转换已自动处理 |
 | 空隙中是 NaN | `span < step` 或段之间没有数据；按数据含义决定是否填 0 |
 

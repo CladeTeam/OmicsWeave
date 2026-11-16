@@ -80,13 +80,13 @@ CRAM 不按记录逐条存储，而是把同一字段的所有值放在一起压
 
 读段碱基按“与参考的差异”保存。例如参考 `ACGTACGT` 上一条完全匹配的读段，只需记录起点和长度；有一个错配时，再记录一个位置和替换碱基。恢复 SEQ 必须使用**压缩时的同一份参考**：
 
-- 每个 slice header 保存它覆盖的参考片段的 **MD5**，解码时据此检查参考是否一致。
+- slice header 可以保存覆盖参考片段的 **MD5**；请求恢复碱基且校验开启时，用非零 MD5 检查所用参考。
 - SAM header 的 `@SQ M5:` 也记录每条参考序列的 MD5。
 - 文件可以把参考片段**嵌入**到 slice 中（embedded reference），或完全不使用参考压缩（no-ref）；这两种情况读取时不需要外部参考。
 
 ### MD / NM 标签
 
-CRAM 通常不存 `MD` 和 `NM` 标签，因为它们可以从参考和差异重新计算。htslib 解码时默认生成它们，OmicsWeave 默认同样生成。
+CRAM 通常不存 `MD` 和 `NM` 标签，因为它们可以从参考和差异重新计算。OmicsWeave 默认在请求 `aux` 时生成缺失的这两个标签；仅查询 `seq` 或 `modifications` 不额外生成未存储的 MD / NM。文件中的占位标签在解码过程中已恢复参考碱基时仍可重建。
 
 ## 关键概念
 
@@ -98,8 +98,9 @@ CRAM 通常不存 `MD` 和 `NM` 标签，因为它们可以从参考和差异重
 | `cigar`、`name`、`qual` | 不需要 |
 | `seq` | 需要（嵌入参考或无参考压缩的文件除外） |
 | `aux` 中生成的 `MD` / `NM` | 需要 |
+| `modifications` | 需要（同 `seq`：`MM` 的位置按读段碱基计数） |
 
-在没有参考的情况下请求 `seq`，会报 `InvalidError` 说明需要参考。
+依赖外部参考的 slice 在没有参考时请求 `seq` 或 `modifications`，会报 `InvalidError`。嵌入参考或 no-ref slice 不受此限制。`aux` 配合默认 `decode_md=True` 同样可能需要恢复碱基；只读取存储标签时可设 `decode_md=False`。仅请求 `aux` 且 `decode_md=False` 不会为 MD / NM 占位符读取参考；同时请求 `seq` 或 `modifications` 时，仍按这些字段的需要恢复碱基。
 
 ### 参考必须一致
 
@@ -119,8 +120,9 @@ CRAM 通常不存 `MD` 和 `NM` 标签，因为它们可以从参考和差异重
 | 数据系列编码 | EXTERNAL、HUFFMAN、BETA、SUBEXP、GAMMA、BYTE_ARRAY_LEN、BYTE_ARRAY_STOP |
 | 区域查询 | `AlignmentReader.fetch`，记录与 htslib `sam_itr_queryi` 一致，按文件顺序，结果结构与 BAM 相同 |
 | 按需解码 | 只解压所请求字段对应的数据系列 |
+| 碱基修饰 | `modifications` 字段解码 `MM` / `ML`，与 BAM 相同，见 [BAM](bam.md#碱基修饰mm--ml) |
 | 参考 | 普通 FASTA + `.fai`、bgzip FASTA + `.fai` + `.gzi`、2bit，或已打开的 `SequenceReader` |
-| 校验 | 默认检查 block CRC32 和 slice 参考 MD5 |
+| 校验 | 文件 header block、container header 和 slice header block 的 CRC32 始终校验；其余读取 block 的 CRC32 与 slice 参考 MD5 受 `verify_checksums` 控制 |
 | 建索引 | `Cram.build_index()` 写 CRAI，不需要参考 |
 | 缓存与并发 | 可接 `BlockCache`，缓存解析好的 container 和解码后的 slice；可 `clone()`、pickle |
 | 转换 | CRAM → BAM，slice 并行解码，可同时建 BAI / CSI |
@@ -140,7 +142,7 @@ index = Cram("reads.cram").build_index()
 print(index)  # Crai('reads.cram.crai')
 ```
 
-输入需要按坐标排序。建 CRAI 只解码多参考 slice 的定位信息，不需要外部参考，与 `samtools index` 写出的索引相同。详见 [CRAI](crai.md)。
+输入需要按坐标排序。建 CRAI 只解码多参考 slice 的定位信息，不需要外部参考；输出为 gzip 压缩的索引行，比较索引内容时应比较解压后的文本，不能假定与 `samtools index` 的压缩字节相同。详见 [CRAI](crai.md)。
 
 ## 区域查询
 
@@ -155,6 +157,8 @@ with AlignmentReader("reads.cram", reference="genome.fa.gz") as reads:
 
 返回的 `Alignments` 与 BAM 完全相同，字段说明见 [BAM](bam.md)。
 
+`modification_codes`、修饰坐标、代码和 flags 与 BAM 相同。修饰按恢复后的 SEQ 计数，参考坐标由 CIGAR 映射；未请求 `name` 时修饰标签错误可能只标为 `a record`，需要读段名诊断时同时请求 `("name", "modifications")`。
+
 ### 不带参考读取
 
 ```python
@@ -162,7 +166,7 @@ with AlignmentReader("reads.cram") as reads:
     hits = reads.fetch(("chr1", 100, 200), fields=("name", "cigar", "qual"))
 ```
 
-只需要位置、比对结构或质量时可以不提供参考，读取也更快：碱基和差异相关的 block 不会被解压。嵌入参考或无参考压缩的 CRAM 不提供参考也能恢复 `seq`。
+只需要位置、比对结构或质量时可以不提供参考，也不为未请求的 SEQ 重建碱基；实际需要解压的 block 仍由数据系列共享编码的依赖决定。嵌入参考或无参考压缩的 CRAM 不提供参考也能恢复 `seq`。
 
 ### 共享参考 reader
 
@@ -177,7 +181,9 @@ sample_a = AlignmentReader("a.cram", reference=genome, cache=cache)
 sample_b = AlignmentReader("b.cram", reference=genome, cache=cache)
 ```
 
-传入已打开的 `SequenceReader` 时，多个 CRAM reader 共享它，由调用方负责关闭；传入路径时，reader 自己打开参考（使用同一个 `cache`）。
+传入已打开的 `SequenceReader` 时，原生层复制其文件句柄与缓存，使用独立解码状态；Python 对象仍由调用方负责关闭。传入路径时，reader 自己打开和关闭参考；bgzip FASTA 和 2bit 参考使用传入的 `cache`，普通 FASTA 直接读取，不附加块缓存。
+
+缓存为调用方持有的 `BlockCache`，缓存键区分所请求字段与 CRAM 解码选项；关闭 reader 或清空缓存不会使已返回数组失效。同一 reader 的线程调用会串行使用其解码状态，`clone()` 可创建独立状态以并行读取。已打开的区域 reader 和缓存不能直接跨 fork 复用，应在子进程重新打开；pickle 仅保存打开参数，不携带缓存，见[查询文档](../query.md#结果存储重复查询与并发)。
 
 ### 解码选项
 
@@ -185,8 +191,8 @@ sample_b = AlignmentReader("b.cram", reference=genome, cache=cache)
 |---|---|---|
 | `reference` | `None` | 压缩时使用的参考 |
 | `index` | 自动查找 | 默认依次找 `<cram>.crai`、`<去扩展名>.crai` |
-| `verify_checksums` | `True` | 检查 block CRC32 和 slice 参考 MD5 |
-| `decode_md` | `True` | 为没有存储 MD / NM 的记录生成这两个标签 |
+| `verify_checksums` | `True` | 控制数据 / compression-header block 的 CRC32 及可用的 slice 参考 MD5；文件 header block、container header、slice header block 的 CRC32 始终检查 |
+| `decode_md` | `True` | 请求 `aux` 时，为没有存储 MD / NM 的记录生成这两个标签 |
 | `name_prefix` | 文件名 | 没有存储读段名的记录命名为 `<name_prefix>:<n>` |
 
 这些解码选项只适用于 CRAM；对 BAM 传入 `reference` 或这些选项会报错。
@@ -204,7 +210,7 @@ report = convert.run("reads.cram", "reads.bam", reference="genome.fa.gz", index=
 print(report.records, report.companions)
 ```
 
-输出 BAM 的数据流与 htslib 读取 CRAM 再写 BAM 的结果一致（`samtools view -b`，不加 `@PG`）：header 由 CRAM header 重建，记录中包含生成的 MD / NM。转换保留记录顺序，因此建索引仍要求 CRAM 已按坐标排序。`--no-verify` 跳过校验。
+输出 BAM 的数据流与 htslib 读取 CRAM 再写 BAM 的结果一致（`samtools view -b`，不加 `@PG`）：header 由 CRAM header 重建，记录中包含生成的 MD / NM。转换保留记录顺序，因此建索引仍要求 CRAM 已按坐标排序。`--no-verify` 跳过受 `verify_checksums` 控制的校验；文件 header block、container header 和 slice header block 的 CRC32 仍会检查。
 
 ## 常见问题
 

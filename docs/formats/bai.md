@@ -49,6 +49,8 @@ BAI 固定使用 6 层 bin，最细一层是 16 kb（`2**14`），每上一层�
 
 一条记录放入**能完整包含其参考跨度的最小 bin**。短读段通常落在第 5 层；跨越 16 kb 边界的读段、长读长或跨长内含子的 RNA-seq 读段会落到更上层。BAM 记录中的 `bin` 字段保存的就是这个编号。
 
+这是记录的初始分箱规则。写出索引前，OmicsWeave 会把压缩文件跨度较小、且父 bin 已存在的子 bin 的 chunks 并入父 bin，再合并相邻 chunks。因此索引中最终保存的 bin 不一定与每条 BAM 记录的 `bin` 字段一一对应。
+
 ### chunk 与虚拟偏移
 
 每个 bin 记录一组 **chunk**：一个 chunk 是 BAM 文件中一段连续的记录，用起止[虚拟偏移](bam.md#bgzf-分块压缩)表示。查询一个区域时：
@@ -64,7 +66,7 @@ BAI 固定使用 6 层 bin，最细一层是 16 kb（`2**14`），每上一层�
 
 ### 元数据伪 bin
 
-每条参考序列还有一个编号为 37450 的伪 bin，记录该参考序列的数据范围以及已比对 / 未比对的读段数。`samtools idxstats` 读取的就是这部分信息。
+有记录的参考序列还有一个编号为 37450 的伪 bin，记录该参考序列的数据范围以及已比对 / 未比对的读段数。OmicsWeave 为没有记录的参考写空索引项，不写伪 bin。`samtools idxstats` 使用这类元数据统计记录数。
 
 ## 关键概念
 
@@ -74,9 +76,11 @@ bin 0 覆盖 `2**29` = 536,870,912 bp，所以 BAI 无法索引更长的参考�
 
 OmicsWeave 的 `kind="auto"`（默认）会检查 header 中所有参考序列的长度：都不超过 `2**29` 时写 BAI，否则写 CSI。
 
+这个上限对应 0-based `[0, 2**29)`，因此区间右端恰好为 `2**29` 可以索引。tabix 的 `.tbi` 使用相同固定分箱上限，但它是文本索引，不能与 `.bai` 互换。quant 的 fragments / cytosines 表在所有参考长度均不超过此上限时写 `.tbi`，否则写带 BED 配置的 [CSI](csi.md#quant-的-tabix-csi)。
+
 ### 索引与数据绑定
 
-BAI 中保存的是 BAM 文件中的字节位置。BAM 一旦重新排序、重新压缩或以任何方式改写，旧索引就失效，必须重建；即使内容相同，压缩块的位置也可能变了。
+BAI 的 chunks 和线性索引保存的是 BGZF 虚拟偏移：高 48 位为压缩块在 BAM 文件中的字节偏移，低 16 位为解压后块内偏移。BAM 一旦重新排序、重新压缩或以任何方式改写，旧索引就失效，必须重建；即使内容相同，压缩块的位置也可能变了。
 
 ## OmicsWeave 中的支持
 
@@ -86,7 +90,7 @@ BAI 中保存的是 BAM 文件中的字节位置。BAM 一旦重新排序、重�
 | 内容 | 与 `samtools index` 相同的 bins、chunks 和线性偏移 |
 | 自动查找 | 未指定 `index` 时依次查找 `<bam>.csi`、`<去扩展名>.csi`、`<bam>.bai`、`<去扩展名>.bai` |
 | 显式指定 | `AlignmentReader(path, index="index/reads.bai")` |
-| 格式识别 | `formats.detect` 按 `BAI\1` magic 识别为 `Bai` |
+| 格式识别 | `formats.detect` 按文件开头的 `BAI\1` magic 识别为 `Bai`；gzip 压缩的 BAI 不走此分支，会回退为 `GzipBed` |
 | 路径对象 | `Bai.beside(path)` 构造 `<path>.bai`，不读写文件 |
 
 打开 reader 不会自动生成索引；缺少索引时报 `IoError`。

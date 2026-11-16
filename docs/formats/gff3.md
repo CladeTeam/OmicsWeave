@@ -100,6 +100,7 @@ gene              ID=gene-TP53
 
 - **识别**：有 `##gff-version 3` 指令，或第一条记录的属性是 `key=value` 语法时，按 GFF3 解析；也可传入 `dialect="gff3"` 强制指定。纯文本、gzip、BGZF 均可。
 - **层级**：沿 `ID` / `Parent` 构建。凡是有外显子级子特征（exon、CDS、UTR 等）的记录都被识别为转录本，无论类型名是什么；其父记录为基因。父记录出现在子记录之后也可以，输入不需要排序。
+- **模型 id**：基因优先使用 `gene_id`，转录本优先使用 `transcript_id`；没有对应属性时才使用该记录的 `ID`。`ID` / `Parent` 仍用于连接原始层级，查询和导出则使用模型 id。
 - **多个 Parent**：外显子等子特征的多个 Parent 会分别归入各个转录本；转录本有多个父基因时使用第一个，并记录 `multiple_parents` 问题。
 - **缺失的记录**：没有自身记录的基因由其转录本合成（`synthesized`），范围是子特征的最小 / 最大坐标。
 - **名称与类型**：基因、转录本名称取自 `Name`（`gene_name`、`gene`、`transcript_name` 等也会读取）；biotype 取自 `gene_biotype`、`gene_type`、`biotype`、`transcript_biotype` 等；`tag` 的逗号分隔值作为转录本标签，`MANE Select` 这类 RefSeq 拼写映射到与 GENCODE 相同的已知标签位。
@@ -139,7 +140,7 @@ GFF3 特有的问题类型：
 |---|---|
 | `missing_parent` | 外显子、CDS 等子特征没有 `Parent` |
 | `unknown_parent` | `Parent` 指向的 ID 不存在 |
-| `duplicate_id` | 两个基因或转录本记录使用同一 `ID`；后者保存在 `others` 中 |
+| `duplicate_id` | 重复 `ID` 的记录中至少一个不是外显子级特征，包括 gene 与 mRNA 共用 `ID`；后者保存在 `others` 中。CDS 等不连续特征可多行共用 `ID` |
 | `seqid_conflict` | 子特征与父特征位于不同序列；该记录保存在 `others` 中 |
 | `bad_nesting` | 层级不是 基因 → 转录本 → 特征，例如外显子直接挂在已有转录本的基因下、转录本挂在转录本下或 Parent 成环 |
 | `multiple_parents` | 转录本有多个父基因，使用第一个 |
@@ -159,13 +160,13 @@ annotation = Annotation.read("genomic.gff.gz", aliases=read_aliases("refseq_to_u
 ## 查询和定量
 
 ```python
-key = annotation.locus("rna-NM_000546.6")       # 按转录本 ID（或名称）生成 Spliced key
-cds = annotation.locus("rna-NM_000546.6", "cds")
+key = annotation.locus("NM_000546.6")       # RefSeq 记录含 transcript_id=NM_000546.6 时
+cds = annotation.locus("NM_000546.6", "cds")
 genes = annotation.overlaps(("NC_000017.11", 7_660_000, 7_700_000), level="gene")
 promoters = annotation.promoters(upstream=2000, downstream=200)
 ```
 
-转录本的 id 是 GFF3 的 `ID` 值。`cds` part 拼接该转录本的 CDS 行；GFF3 的 CDS 通常已包含终止密码子。
+这里的查询名应与 `annotation.transcripts.id` 中的模型 id 一致：例如 `ID=rna-NM_000546.6;transcript_id=NM_000546.6` 使用 `NM_000546.6`；只有缺少 `transcript_id` 时才使用 `rna-NM_000546.6`。也可按转录本名称查找。`cds` part 拼接该转录本的编码特征（CDS 及起止密码子）；GFF3 的 CDS 通常已包含终止密码子。
 
 ```sh
 ow quant reads.bam -o results --gtf genes.gff3 --genes bulk
@@ -180,7 +181,7 @@ annotation.write_gtf("genes.gtf")            # GFF3 来源时 auto 即 model 布
 annotation.write_bed12("transcripts.bed")
 ```
 
-`layout="model"` 从模型写出 GTF 的 gene、transcript 和 feature 行：`gene_id` / `transcript_id` 取自 GFF3 的 `ID`，名称和 biotype 写成 GTF 惯用的 key，保留的其他属性附在其后。`layout="original"` 只适用于从 GTF 载入的注释，不能用于 GFF3 原文回写。当前不提供 GFF3 writer。
+`layout="model"` 从模型写出 GTF 的 gene、transcript 和 feature 行：`gene_id` / `transcript_id` 使用模型 id，即优先读取同名属性、缺省才用原记录的 `ID`；名称和 biotype 写成 GTF 惯用的 key，保留的其他属性附在其后，GFF3 的 `ID` / `Parent` 不写出。`layout="original"` 只适用于从 GTF 载入的注释，不能用于 GFF3 原文回写。当前不提供 GFF3 writer。
 
 ## 常见问题
 

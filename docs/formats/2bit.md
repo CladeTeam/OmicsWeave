@@ -47,11 +47,11 @@
 └──────────────────────────────────────┘
 ```
 
-- **header**：版本 0 的目录偏移为 32 bit，文件不能超过 4 GiB；版本 1 使用 64 bit 偏移，用于更大的文件。
+- **header**：版本 0 的目录偏移为 32 bit，每条序列记录的起点必须不超过 `2^32 - 1`；最后一条记录可以延伸到 4 GiB 之外。版本 1 使用 64 bit 偏移。
 - **目录**：序列名最长 255 字节，偏移指向该序列记录的起点。因为目录位于所有记录之前，写文件时必须预先知道全部序列名。
 - **packedDna**：每字节 4 个碱基，高位在前，编码为 `T=00`、`C=01`、`A=10`、`G=11`。N 位置在 packedDna 中也占位（按 `T` 填充），真实含义由 N 块覆盖。
 
-读取一个区域的过程：在目录中找到序列 → 读取记录头（N 块、屏蔽块）→ 计算区域在 packedDna 中的字节范围并一次读出 → 解码为碱基 → 用 N 块覆盖为 `N` → 需要时用屏蔽块转为小写。
+读取一个区域的过程：在目录中找到序列 → 读取记录头（N 块、屏蔽块）→ 计算区域在 packedDna 中的字节范围并一次读出 → 解码为碱基 → 需要时用屏蔽块转为小写 → 最后用 N 块覆盖为大写 `N`。
 
 例如，序列 `ACGTNacgtN`：
 
@@ -126,7 +126,7 @@ from omicsweave import convert
 convert.run("genome.fa.gz", "genome.2bit", threads=4, memory="2G")
 ```
 
-普通、gzip、bgzip FASTA 均可作为输入，行为与 `faToTwoBit` 一致：ACGT 以外的字符变为 N，小写保留为软屏蔽块。因为目录必须写在所有记录之前，转换先获得全部序列名：输入旁边有可用的 `.fai` 时直接读取，否则多扫描一遍输入。每条序列的碱基在 N / 屏蔽块确定之前暂存，超出内存预算时写入临时文件（位置由 `tmp_dir` 决定）。
+普通、gzip、bgzip FASTA 均可作为输入：ACGT 以外的字符变为 N，小写保留为软屏蔽块。因为目录必须写在所有记录之前，转换先获得全部序列名：输入旁边有可用的 `.fai` 时直接读取，否则多扫描一遍输入。版本选择以序列记录起点是否能用 32 bit 表示为准，并计入 N / 屏蔽块的空间；仅凭现有 `.fai` 的长度无法判断时，会额外流式扫描输入。每条序列的碱基在 N / 屏蔽块确定之前暂存，超出内存预算时写入临时文件；指定 `tmp_dir` 时使用该目录，否则使用输出文件所在目录（裸文件名使用当前目录）。
 
 ## 从内存写入
 
@@ -141,7 +141,7 @@ with TwoBitWriter("example.2bit", names=["chr1", "chr2"]) as writer:
 
 - `names` 预先声明全部序列，`add` 必须按这个顺序逐条调用；`next_name` 给出下一条应添加的名称，全部添加后为 `None`。
 - 序列可以是 `str`、`bytes` 或 `uint8` 数组。ACGT 以外的字符存为 N，N 和小写的连续区段自动记为块。
-- 文件达到或超过 4 GiB 时使用 `wide_offsets=True`，以 64-bit 偏移写出 version 1。
+- 任何序列记录的起点可能超过 `2^32 - 1` 时，使用 `wide_offsets=True` 写出 version 1；writer 不会自动升级版本。版本 0 只检查每条记录的起点，因此最后一条记录可以跨过 4 GiB 边界。
 - 离开 `with` 时补写目录并完成文件；块内发生异常时放弃未完成的文件。
 
 ## 2bit 与 FASTA 的选择
@@ -164,7 +164,7 @@ with TwoBitWriter("example.2bit", names=["chr1", "chr2"]) as writer:
 | 模糊碱基变成了 N | 2bit 无法保存 IUPAC 码；需要时使用 FASTA |
 | 打开时报 `BigEndianError` | 文件是 big-endian 2bit，用 UCSC 工具转回 FASTA 再转换 |
 | 写入时报名称顺序错误 | `add` 必须按 `names` 顺序调用，查看 `writer.next_name` |
-| 超过 4 GiB 写入失败 | 设置 `wide_offsets=True` |
+| 序列记录起点超过 32-bit 范围，写入失败 | `TwoBitWriter` 设置 `wide_offsets=True`；FASTA 转换会自动选择版本 |
 
 ## 相关格式
 

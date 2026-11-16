@@ -151,11 +151,11 @@ print(report.target, report.records)
 - **输入**：纯文本、gzip、BGZF 均可。`track`、`browser`、`#` 开头的行和空行跳过。
 - **分隔符**：含 tab 的行按 tab 切分；不含 tab 的行按连续空白切分。名称中含空格时应使用 tab 分隔。
 - **列数**：至少三列，且所有记录的列数必须相同；第 4 列起原样保存，以 tab 连接。
-- **坐标**：起点、右端须是非负整数，`start > end` 报错。
+- **坐标**：起点、右端须是 `uint32` 范围内的非负整数，`start > end` 报错。
 - **排序**：不要求输入有序。转换按染色体（首次出现的顺序）和起点排序，起点相同时保持输入顺序；数据超过内存预算时使用临时文件外排序。
 - **重叠**：允许。
 - **染色体长度**：`chrom_sizes` 接受两列长度表、`.fai` 或 `.2bit`。提供后，记录中出现但长度表中没有的染色体会报错，右端超过染色体长度也会报错，不会自动裁剪。省略时以每条染色体最大的右端作为长度。输出只包含实际有记录的染色体。
-- **schema**：前 `min(列数, 12)` 列标记为 BED 标准字段，其余为扩展字段；BED 转换不写 autoSql。
+- **schema**：前 `min(列数, 12)` 列标记为 BED 标准字段，其余为扩展字段；BED 转换不写 autoSql。`IntervalReader.schema.fields` 的标准回退名称把第 9、12 列分别称为 `reserved`、`chromStarts`（对应上表的 `itemRgb`、`blockStarts`）。
 - 可选 `--sidecar` 同时写出 [sidecar](sidecar.md)，普通查询不需要。
 
 转换后查询：
@@ -169,11 +169,11 @@ with IntervalReader("peaks.bb") as peaks:
     print(hits.annotation.to_list())     # ['peak1\t960\t+', 'peak2\t512\t-']
 ```
 
-`annotation` 中是第 4 列起的原始文本，不会自动拆分成 name、score、strand。需要某一列时自行 `split("\t")`。
+`annotation` 中是第 4 列起的原始文本，不会自动拆分成 name、score、strand。需要某一列时自行 `split("\t")`。`fetch(..., clip=True)` 可把返回坐标截到查询区域，附加字段保持原样。
 
 ## 识别与显式指定
 
-自动识别只看内容：每个数据行都恰好四列、且最后一列是数字的文本，会被识别为 [bedGraph](bedgraph.md)（例如 `chr1 100 200 5` 既可能是带分值的区间，也可能是信号）。区间语义更合适时，显式指定格式：
+自动识别只检查开头最多 64 KiB 中的完整行：样本中有数据行，且每个数据行都恰好四列、起点和右端可解析为 `uint32`、最后一列可解析为浮点数时，会识别为 [bedGraph](bedgraph.md)；`track type=bedGraph` 也可直接指定该类型。例如 `chr1 100 200 5` 既可能是带分值的区间，也可能是信号。区间语义更合适时，显式指定格式：
 
 ```python
 from omicsweave import convert
@@ -190,11 +190,11 @@ CLI 对应 `--from bed`。符合 [bedMethyl](bedmethyl.md) 列结构的文件会
 | 现象 | 原因与处理 |
 |---|---|
 | `bed is not read by region` | BED 不直接查询；按提示用 `ow convert` 转为 bigBed |
-| 被识别为 bedGraph | 四列且末列为数字；用 `Bed(path)` 或 `--from bed` 显式指定 |
+| 被识别为 bedGraph | 探测样本符合四列 bedGraph 条件，或有相应 track 声明；用 `Bed(path)` 或 `--from bed` 显式指定 |
 | `N fields; earlier records have M` | 所有行列数必须一致；先补齐或裁掉多余列 |
 | `chromosome ... is not in the chromosome sizes` | 长度表与 BED 的染色体命名不一致（如 `chr1` 与 `1`），或长度表不完整 |
 | `end ... past the end of ...` | 区间超出染色体长度；检查参考版本，或先自行裁剪 |
-| 查询结果坐标超出查询区域 | `IntervalReader` 返回完整记录，不裁剪；需要时自行 `np.clip` |
+| 查询结果坐标超出查询区域 | `IntervalReader` 默认返回完整记录；需要裁剪时使用 `fetch(region, clip=True)` |
 | 与浏览器显示差 1 | 浏览器显示 1-based；BED 起点比浏览器显示的小 1 |
 
 ## 相关格式

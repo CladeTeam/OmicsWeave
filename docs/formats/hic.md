@@ -1,10 +1,10 @@
 # .hic
 
-[格式总览](README.md) · [查询](../query.md) · [转换](../convert.md) · [定量](../quant.md) · [cool](cool.md) · [mcool](mcool.md) · [4DN pairs](pairs.md) · [Juicer short](juicer-short.md)
+[格式总览](README.md) · [查询](../query.md) · [转换](../convert.md) · [定量](../quant.md) · [cool](cool.md) · [mcool](mcool.md) · [4DN pairs](pairs.md) · [Juicer short](juicer-short.md) · [HiC-Pro](hicpro-pairs.md)
 
 `.hic` 是 Aiden 实验室 Juicer 工具链用来保存 **Hi-C / Micro-C 染色质接触矩阵**的二进制格式。一个文件包含全部染色体对、多种分辨率的接触矩阵，按块压缩并带有索引，因此可以只取出某个二维窗口，例如“chr1 上 0–1 Mb 对 0–1 Mb，5 kb 分辨率”的一块矩阵。
 
-在 OmicsWeave 中，`.hic` 是接触数据的标准查询格式：[cool](cool.md)、[mcool](mcool.md)、[4DN pairs](pairs.md) 和 [Juicer short](juicer-short.md) 都转换为 `.hic` 后按窗口读取，`quant` 从 Hi-C BAM 计算的接触也直接写成 `.hic`。查询返回原始计数，可以直接作为模型的二维输入。
+在 OmicsWeave 中，`.hic` 是接触数据的标准查询格式：[cool](cool.md)、[mcool](mcool.md)、[4DN pairs](pairs.md)、[Juicer short](juicer-short.md) 和 [HiC-Pro](hicpro-pairs.md) 都转换为 `.hic` 后按窗口读取，`quant` 从 Hi-C BAM 计算的接触也直接写成 `.hic`。查询返回原始计数，可以直接作为模型的二维输入。
 
 ## 速览
 
@@ -14,7 +14,7 @@
 | 常见后缀 | `.hic` |
 | 存储 | 二进制，矩阵切成块，每块 zlib 压缩 |
 | 坐标 | BP 分辨率下为碱基坐标；FRAG 分辨率下为酶切片段编号 |
-| 随机访问 | 支持，文件 footer 中有主索引和各矩阵的块索引 |
+| 随机访问 | 支持，footer 主索引定位矩阵记录，各矩阵记录包含分辨率和块索引 |
 | 外部索引 | 不需要 |
 | 版本 | OmicsWeave 读取 v8 / v9，写出 v9（默认） |
 | 典型来源 | Juicer `pre`、4DN / ENCODE 数据门户、`ow convert`、`ow quant --hic` |
@@ -33,19 +33,20 @@ Hi-C 实验测量基因组中任意两个位点在三维空间里相互靠近的
 │ header                              │  magic "HIC"、版本、footer 位置、genome、
 │                                     │  属性、染色体表、BP / FRAG 分辨率、酶切位点
 ├─────────────────────────────────────┤
-│ body：每个染色体对的矩阵            │
-│   matrix (chr1, chr1)               │
-│     resolution BP 2.5 Mb → blocks   │
-│     resolution BP 1 Mb   → blocks   │
-│     ...                             │
-│     resolution BP 5 kb   → blocks   │  每块 zlib 压缩，记录 (x bin, y bin, 计数)
-│   matrix (chr1, chr2)               │
-│   ...                               │
+│ 压缩数据块                          │  每块记录 (x bin, y bin, 计数)
 ├─────────────────────────────────────┤
-│ footer                              │  主索引：染色体对 → 矩阵位置
-│                                     │  expected 值、归一化向量（可选）
+│ 矩阵记录                            │  每个染色体对的 BP / FRAG 分辨率，
+│                                     │  以及各分辨率的块位置和大小
+├─────────────────────────────────────┤
+│ footer                              │  长度字段、主索引、raw expected
+├─────────────────────────────────────┤
+│ normalized expected                 │
+├─────────────────────────────────────┤
+│ normalization vector index          │  归一化向量的位置索引
 └─────────────────────────────────────┘
 ```
+
+图示为 OmicsWeave writer 的顺序。footer 长度字段覆盖主索引和 raw expected 部分，normalized expected 与归一化向量索引位于其后；实际文件的归一化向量数据另由索引定位，不能把它们当作矩阵块索引。
 
 层级关系是 **矩阵 → 分辨率 → 块**：
 
@@ -63,14 +64,14 @@ Hi-C 实验测量基因组中任意两个位点在三维空间里相互靠近的
 |---|---|---|
 | 染色体长度 | 32-bit | 64-bit |
 | footer 长度字段 | 32-bit | 64-bit |
-| 归一化向量索引 | 在 footer 中 | header 额外记录其位置和长度 |
+| 归一化向量索引 | 在 footer 长度覆盖区及 normalized expected 之后 | header 额外记录其位置和长度；矩阵 reader 跳过这两个字段 |
 | 染色体内块布局 | 方形网格 | 可按到对角线的距离分层排列（`v9-depth-base` 属性） |
 
 v9 的对角线布局让沿对角线滑动的窗口读取更少的块，这正是 Hi-C 模型常见的访问方式。v8 之前的版本以及更新的实验版本，OmicsWeave 不读取。
 
 ### 归一化与 expected
 
-Hi-C 原始计数存在测序深度、GC、可比对性等偏差，常用 KR、VC、VC_SQRT、SCALE 等方法计算每个 bin 的校正向量；expected 是按距离对角线的远近统计的平均接触值，用于计算 observed / expected。`.hic` 可以在 footer 中保存这些向量，但它们是**分析结果**，不是矩阵本身。OmicsWeave 只读取原始计数（Juicer 中 `NONE` 归一化），不读取也不计算归一化向量和 expected；写出的文件中这两部分为空列表。
+Hi-C 原始计数存在测序深度、GC、可比对性等偏差，常用 KR、VC、VC_SQRT、SCALE 等方法计算每个 bin 的校正向量；expected 是按距离对角线的远近统计的平均接触值，用于计算 observed / expected。`.hic` 可以保存这些结果及其索引，但它们是**分析结果**，不是矩阵本身。OmicsWeave 只读取原始计数（Juicer 中 `NONE` 归一化），不读取也不计算归一化向量和 expected；写出的 raw expected、normalized expected 和归一化向量索引均为空列表。
 
 ## 关键概念
 
@@ -111,7 +112,7 @@ print(window.row_bins)  # range(0, 201)
 | 文件信息 | `version`、`genome`、`attributes`、`chroms`、`maps`、`resolutions()`、`sites()`、`fragment_count()` |
 | 缓存与并发 | 可接 `BlockCache`；解码释放 GIL；可 `clone()`、pickle |
 | 写入 | `HicBuilder`（从接触位置分箱）、`HicWriter`（从已分箱像素），可多线程压缩、可选 sidecar |
-| 转换生成 | cool、mcool、4DN pairs、Juicer short → `.hic` |
+| 转换生成 | cool、mcool、4DN pairs、Juicer short、HiC-Pro → `.hic` |
 | quant 输出 | `ow quant --hic`：从 Hi-C / Micro-C BAM 生成 pairs 和 `.hic` |
 
 限制：
@@ -129,13 +130,13 @@ from omicsweave.query import ContactReader
 
 with ContactReader("contacts.hic") as contacts:
     print(contacts.version, contacts.genome)  # 9 hg38
-    print(contacts.chroms)                    # {'chr1': 248956422, ...}
+    print(dict(contacts.chroms))              # {'chr1': 248956422, ...}
     print(contacts.resolutions())             # (2500000, 1000000, ..., 5000)
     print(contacts.maps[:3])                  # (('chr1', 'chr1'), ('chr1', 'chr2'), ...)
-    print(contacts.attributes)                # {'software': ...}
+    print(dict(contacts.attributes))          # {'software': ...}
 ```
 
-`resolutions()` 默认列出 BP 分辨率，顺序与文件一致（Juicer 工具按由粗到细）。`maps` 是有接触矩阵的染色体对；对其他染色体对查询会得到全 0。
+`resolutions()` 默认列出 BP 分辨率，顺序与文件一致（Juicer 工具按由粗到细）。`maps` 只列 footer 主索引中实际保存了矩阵记录的染色体对，不是染色体表的全部组合，也不保证每个矩阵都有非零计数；对其他染色体对查询会得到全 0。
 
 ### 稠密矩阵
 
@@ -214,10 +215,12 @@ ow convert sample.mcool contacts.hic --resolutions 5000,25000
 ow convert sample.pairs.gz contacts.hic --resolutions 5000,25000
 ow convert sample.short contacts.hic --from juicer-short \
   --chrom-sizes genome.chrom.sizes --resolutions 5000,25000
+ow convert sample.validPairs contacts.hic --from hicpro-pairs \
+  --chrom-sizes genome.chrom.sizes --resolutions 5000,25000
 ```
 
 - cool / mcool 保留源文件已有的分辨率和原始 count，不读取 balance weight。
-- pairs / Juicer short 按指定分辨率分箱；默认是 Juicer `pre` 的九档 2.5 Mb、1 Mb、500 kb、250 kb、100 kb、50 kb、25 kb、10 kb、5 kb。较粗分辨率必须是最细分辨率的整数倍。
+- pairs / Juicer short / HiC-Pro 按指定分辨率分箱；默认是 Juicer `pre` 的九档 2.5 Mb、1 Mb、500 kb、250 kb、100 kb、50 kb、25 kb、10 kb、5 kb。较粗分辨率必须是最细分辨率的整数倍。
 
 细节见各源格式文档。
 
@@ -285,5 +288,5 @@ with HicWriter("binned.hic", header) as writer:
 ## 相关格式
 
 - [cool](cool.md)、[mcool](mcool.md)：基于 HDF5 的接触矩阵，转换为 `.hic` 后查询。
-- [4DN pairs](pairs.md)、[Juicer short](juicer-short.md)：每行一条接触的文本，转换时分箱。
+- [4DN pairs](pairs.md)、[Juicer short](juicer-short.md)、[HiC-Pro](hicpro-pairs.md)：每行一条接触的文本，转换时分箱。
 - [Sidecar](sidecar.md)：记录 `.hic` 每块解压后的大小和记录数，供数据加载器预先规划，普通查询不需要。

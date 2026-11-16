@@ -1,6 +1,6 @@
 # 按区域查询
 
-[格式转换](convert.md) · [定量分析](quant.md) · [安装](../README.md#安装)
+[格式转换](convert.md) · [定量分析](quant.md) · [安装](../README.md#installation)
 
 给定一段基因组坐标，OmicsWeave 可以返回这段区域的序列、信号、区间、比对、变异或接触矩阵。查询直接返回包含 NumPy 数组的结果对象。
 
@@ -61,11 +61,13 @@ query.open("peaks.bed")
 | 原始信号区间 | `TrackReader.intervals` | bigWig | `Region` | `SignalIntervals` |
 | 分链信号 | `StrandedTrackReader` | 正、负链各一个 bigWig | 带 `+` / `-` 的 key | 与 `TrackReader` 相同 |
 | 重叠的区间记录 | `IntervalReader.fetch` | bigBed | `Region` | `Intervals` |
+| 多序列比对矩阵 | `MsaReader.fetch` | bigMaf（bigBed） | `Region` | `MultipleAlignment` |
 | 接触矩阵或非零像素 | `ContactReader.matrix` / `pixels` | `.hic` v8 / v9 | `ContactWindow` | `ContactMatrix` / `ContactPixels` |
 | 比对记录 | `AlignmentReader.fetch` | BAM、CRAM 3.0 / 3.1 | `Region` + 可选字段 | `Alignments` |
 | 基因型 | `VariantReader.genotypes` | BCF | `Region` + 可选样本 | `Genotypes` |
 | 变异字段与过滤结果 | `VariantReader.fetch` | BCF | `Region` + 字段、过滤表达式 | `Variants` |
 | 应用变异后的序列 | `ConsensusReader.fetch` / `fetch_batch` | BCF + 参考序列 | `Region` + 等位选择 | `ConsensusSequence` / `ConsensusBatch` |
+| 按编号或 ID 取 motif | `MotifReader[i]` / `MotifReader[id]` | FFM | 整数下标 / ID | `Motif` |
 
 也可以让 `omicsweave.query.open(path)` 根据文件内容选择普通 reader。分链信号和 consensus 需要额外输入，使用对应的 reader 创建。
 
@@ -77,12 +79,15 @@ query.open("peaks.bed")
 | BED | bigBed | [BED](formats/bed.md)、[bigBed](formats/bigbed.md) |
 | bedGraph、wig | bigWig | [bedGraph](formats/bedgraph.md)、[wig](formats/wig.md)、[bigWig](formats/bigwig.md) |
 | bedMethyl | bigBed（所有字段）或 bigWig（一个数值字段） | [bedMethyl](formats/bedmethyl.md) |
+| MAF | bigMaf | [MAF](formats/maf.md)、[bigMaf](formats/bigmaf.md) |
 | VCF，包括压缩 VCF | BCF + `.csi` | [VCF](formats/vcf.md)、[BCF](formats/bcf.md) |
 | SAM，包括压缩 SAM | BAM + `.bai` / `.csi` | [SAM](formats/sam.md)、[BAM](formats/bam.md) |
 | `.cool`、`.mcool` | `.hic` | [cool](formats/cool.md)、[mcool](formats/mcool.md) |
-| 4DN pairs、Juicer short | `.hic` | [pairs](formats/pairs.md)、[Juicer short](formats/juicer-short.md) |
+| 4DN pairs、Juicer short、HiC-Pro pairs | `.hic` | [pairs](formats/pairs.md)、[Juicer short](formats/juicer-short.md)、[HiC-Pro pairs](formats/hicpro-pairs.md) |
 
 [GTF](formats/gtf.md) 和 [GFF3](formats/gff3.md) 通过 `Annotation.read` 载入，用于查找基因、转录本和生成查询 key，见下文。
+
+`MotifReader` 按 motif 编号或 ID 查询，与基因组区域无关。它在打开时完整读取并校验 FFM，之后的查找使用常驻数据，不接收 `BlockCache`；用法见 [FFM](formats/ffm.md)。
 
 ## 查询 key
 
@@ -160,7 +165,8 @@ print(window.shape)  # (200, 100)
 | `Signal` | `values` | `float32 [长度]` |
 | `SignalBins` | `values`、`stats`、`edges` | `float32 [统计量数, bin 数]`；edges 是局部坐标边界 |
 | `SignalIntervals` | `start`、`end`、`value` | `uint32 [N]`、`uint32 [N]`、`float32 [N]` |
-| `Intervals` | `start`、`end`、`annotation` | 两列 `uint32 [N]`；其余 BED 字段为 `StringVector` |
+| `Intervals` | `start`、`end`、`annotation` | 两列 `uint32 [N]`；`annotation` 为 `StringVector`，每条字符串将第 4 列起的 BED 字段以 tab 拼接 |
+| `MultipleAlignment` | `bases`、`species`、`row(name)` | `uint8 [物种数, 长度]`，每列对应一个参考碱基 |
 | `ContactMatrix` | `values` | `float32 [行 bin 数, 列 bin 数]` |
 | `ContactPixels` | `row`、`col`、`value` | 两列 `uint32 [N]`；值为 `float32 [N]` |
 | `Alignments` | 固定比对列及选取的可变列 | 见下文 |
@@ -196,7 +202,7 @@ with TrackReader("signal.bw") as track:
     print(runs.start, runs.end, runs.value)
 ```
 
-逐碱基信号中没有数据的位置为 NaN，超过已知染色体末端的部分同样为 NaN。`intervals` 返回文件中存储的 runs，并裁剪到查询区域。
+逐碱基信号中没有数据的位置为 NaN，超过已知染色体末端的部分同样为 NaN。`intervals` 返回文件中存储的 runs，默认裁剪到查询区域（信号描述的是每个碱基的值，裁剪后只覆盖查询的碱基）；`clip=False` 保留 runs 的原始起止。
 
 `bins` 直接汇总区间数据，支持一次计算多个统计量：
 
@@ -205,7 +211,7 @@ with TrackReader("signal.bw") as track:
 | `mean` | 有数据碱基的均值 | NaN |
 | `min` / `max` | 有数据碱基的最小值 / 最大值 | NaN |
 | `sum` | 按覆盖碱基数加权的总和 | NaN |
-| `std` | 有数据碱基的样本标准差；只有一个碱基时为 0 | NaN |
+| `std` | 有数据碱基的样本标准差；精确路径只有一个碱基时为 0，zoom 路径有效碱基数 ≤ 1 时为 NaN | NaN |
 | `coverage` | 有数据碱基占 bin 的比例 | 0 |
 
 例如，100 bp 的 bin 中只有 20 bp 的值为 5，`mean=5`、`sum=100`、`coverage=0.2`。若把缺失碱基视为 0，该 bin 的均值为 `sum / 100 = 1`。
@@ -237,7 +243,45 @@ with IntervalReader("peaks.bb") as peaks:
     print(peaks.schema)
 ```
 
-返回与区域重叠的完整记录，按起点排列；记录的坐标不会裁剪。`annotation` 保存第 4 列起的字段，以 tab 分隔，不会自动拆成 name、score 等列。BED12 的 block 字段也保存在这里。格式和写入方法见 [bigBed](formats/bigbed.md)。
+返回与区域重叠的完整记录，按起点排列：区间是一条注释，默认保留原始起止坐标；`fetch(region, clip=True)` 把坐标截到查询区域内，注释字段不变。`annotation` 保存第 4 列起的字段，以 tab 分隔。BED12 的 block 字段也保存在这里。格式和写入方法见 [bigBed](formats/bigbed.md)。
+
+需要按列取值时，用 `schema.columns` 按 autoSql 拆列：
+
+```python
+with IntervalReader("calls.bb") as calls:            # bedMethyl 转成的 bigBed
+    hits = calls.fetch(("chr1", 10_000, 11_000))
+    cols = calls.schema.columns(hits, ["Nvalid_cov", "percent_modified"])
+    coverage = cols["Nvalid_cov"]                     # uint32 [N]
+    percent = cols["percent_modified"]                # float32 [N]，0–100
+    print([f.name for f in calls.schema.fields])      # 全部字段名，含坐标三列
+```
+
+列名取自 autoSql；文件没有 autoSql 时使用标准 BED 字段名（`name`、`score`、`strand`、...），其余为 `field13` 等。`uint`、`int`、`float`、`double` 等标量数值返回对应 dtype 的 NumPy 数组；字符串、`char[N]`、数组字段（如 `blockSizes`）以及颜色字段（`reserved` / `itemRgb`，内容是 `r,g,b` 文本）返回 `StringVector`。数值字段无法解析时报 `ValueError` 并给出字段名。
+
+## 多序列比对
+
+```python
+from omicsweave.query import MsaReader
+
+species = ["hg38", "panTro4", "mm10", "canFam3"]
+with MsaReader("multiz100way.bigmaf", species) as msa:
+    aln = msa.fetch(("chr22", 10_600_000, 10_731_072))
+    aln.bases                 # uint8 [4, 131072]，ASCII
+    aln.row("mm10")           # 某个物种的一行
+    rc = msa.fetch(("chr22", 10_600_000, 10_731_072, "-"))  # 反向互补
+```
+
+`MsaReader` 读 [bigMaf](formats/bigmaf.md)，把每个比对块投影到参考坐标：每列对应参考的一个碱基，参考行为 `-` 的列（其他物种相对参考的插入）被丢弃；其他物种的 `-` 表示相对参考的缺失。物种名取 `src` 第一个点之前的部分（`hg38.chr1` → `hg38`）。
+
+- `species` 固定输出的行及其顺序，未列出的物种跳过；列出但块中没有的物种，以及没有任何块覆盖的位置，填 `fill`（默认 `"-"`，与缺失相同；需要区分“无比对”时可设为 `"."` 等其他字符）。不指定 `species` 时，行是本次读到的物种，按首次出现排序，因此不同查询的行可能不同；训练时应固定 `species`。
+- 一个块中同一物种有多行时取第一行；重叠块按记录顺序覆盖实际出现的物种行，后块缺少某物种不会清除前块的该行。碱基保留文件中的大小写。
+- 每块首个 `s` 行必须是正链参考，坐标和 `srcSize` 匹配 bigBed 元数据。其他物种行即使标为负链，其文本已处于参考比对方向，不会单独反向互补。
+- `-` 链 key 与 `SequenceReader` 一致：列顺序反转，碱基按 IUPAC 互补，`-` 不变。
+- 传入 `out=`（可写、C 连续、`uint8`、形状 `(len(species), len(region))`）可写入预分配的缓冲，要求打开时已固定 `species`。
+
+比对块解析、投影和大块写入在 Rust 中释放 GIL；NumPy 输出创建与包装在 GIL 内。默认返回独立的二维 NumPy-owned 数组，后续查询、reader 关闭或缓存清空不会覆盖结果；`out=` 返回的 `bases` 则是原数组。动态物种模式下，无命中块时形状为 `(0, len(region))`；固定模式即使无命中仍有指定行数。区间超出染色体末端，或染色体未知时，按请求长度填 `fill`；负链查询中填充值保持原样，实际比对碱基正常互补。
+
+`cache=BlockCache(...)` 与 `set_cache()` 控制底层 bigBed 解码块，投影矩阵不进入缓存；clone 共享元信息与缓存，但保持独立 scratch。查询检查与区域重叠的 bigBed 记录中的所有 `s` 行：列数、非 gap 数量、坐标、链、UTF-8 源名称和可打印 ASCII 文本，即使该行的物种未被选择；不检查未访问的记录，也不解析 `a`、`i`、`e`、`q` 等其他行。错误行使查询失败，不返回部分矩阵；Rust 层在下一次成功查询前拒绝 `write`。详见 [bigMaf 校验与所有权](formats/bigmaf.md#校验错误与所有权)。
 
 ## 接触矩阵
 
@@ -278,9 +322,23 @@ with AlignmentReader("reads.bam") as reads:
 | `mate_start` | `int32` | mate 的 0-based 起点；`-1` 表示没有 |
 | `tlen` | `int32` | SAM TLEN |
 
-`mate_tid` 对应 `reader.references` 中的顺序。可选字段名为 `name`、`seq`、`qual`、`cigar`、`aux`，或用 `fields="all"` 全部读取；未请求的字段为 `None`。质量是原始 Phred 字节，不是 FASTQ 的 ASCII 编码；缺失质量为 `0xff`。CIGAR 用 `.string(i)` 查看，aux 保存 BAM 二进制标签。
+`mate_tid` 对应 `reader.references` 中的顺序。可选字段名为 `name`、`seq`、`qual`、`cigar`、`aux`、`modifications`，或用 `fields="all"` 全部读取；未请求的字段为 `None`。质量是原始 Phred 字节，不是 FASTQ 的 ASCII 编码；缺失质量为 `0xff`。CIGAR 用 `.string(i)` 查看，aux 保存 BAM 二进制标签。
+
+`modifications` 把 `MM` / `ML` 碱基修饰标签解码为每个已列出位点一行（`Modifications`：参考坐标、存储 SEQ 下标、修饰代码、原始碱基、`ML` 值和 flags）。`modification_codes=["m", "h"]` 只保留指定代码；也可传正的 ChEBI 编号，如 `[17596]`，结果 `code` 列则保存 `-17596`。指定筛选参数时必须请求修饰字段。列、缺失概率和严格错误校验见 [BAM](formats/bam.md#碱基修饰mm--ml)。
+
+```python
+from omicsweave.types import ModificationFlag
+
+with AlignmentReader("ont.bam") as reads:
+    mods = reads.fetch(("chr1", 0, 100_000), "modifications", modification_codes="m").modifications
+    scored = (mods.flags & ModificationFlag.UNSCORED) == 0
+    p_5mc = (mods.probability[scored] + 0.5) / 256
+    sites = mods.ref_pos[mods.ref_pos >= 0]
+```
 
 查询按文件顺序返回区域记录，不按 MAPQ、duplicate、secondary 等自动过滤，也不会因为负链 key 而反向互补读段。需要计数或覆盖度时使用 [quant](quant.md)。
+
+窗口筛选的是读段，修饰行不再按窗口截断；同一读段位于窗口外的修饰也会返回。`ref_pos=-1` 表示插入、soft clip、未比对或没有可用参考位置；`qpos` 始终索引存储的 SEQ。
 
 CRAM 查询通常需要压缩时的参考：
 
@@ -289,7 +347,7 @@ with AlignmentReader("reads.cram", reference="genome.fa.gz") as reads:
     hits = reads.fetch(("chr1", 100, 200), "all")
 ```
 
-只读固定列、CIGAR、名称、质量时可以不提供参考；embedded-reference 或无参考压缩的 CRAM 也可自行恢复序列。校验和、MD/NM 和索引说明见 [CRAM](formats/cram.md)。
+只读固定列、CIGAR、名称、质量时可以不提供参考（`seq` 与 `modifications` 需要）；embedded-reference 或无参考压缩的 CRAM 也可自行恢复序列。校验和、MD/NM 和索引说明见 [CRAM](formats/cram.md)。
 
 ## 变异与基因型
 
@@ -340,10 +398,34 @@ with SequenceReader("genome.fa.gz") as genome:
 | `AllAlt()`，也是默认值 | 对每条记录取第一个 ALT，不参考样本 GT |
 | `Samples(["sample1", ...])` | 根据这些样本的 GT 生成 IUPAC 序列 |
 | `Haplotype("sample1", "1")` / `"2"` | 取样本指定的单倍型等位 |
+| `Record(i, alt=1)` | 只套用区域内第 `i` 条记录的第 `alt` 个 ALT，其余记录全部不套用 |
+| `Variant(start, ref, alt)` | 只套用 0-based `start` 处 REF、ALT 匹配的那条记录（忽略大小写，多条匹配取文件中第一条），其余记录全部不套用 |
+
+前三种是**一个基因组的视角**：所选样本或单倍型携带的每条记录都会套用，适合个体化序列。后两种是**一个变异的视角**：窗口里即使还有别的记录，也只套用这一条，适合变异效应预测（VEP）给每个变异单独打分。单条记录直接使用写在文件里的 ALT，`iupac_codes` 不起作用；被 mask 的记录照常不套用；区域里找不到对应记录、下标越界或 ALT 编号不存在时报错。
+
+`Record` 的下标从 0 开始，按 `records(region)` 列出的顺序计数；`alt` 从 1 开始。记录先经过 `regions_overlap` 和 `include` / `exclude`；mask 命中的记录仍占一行，并以 `masked=True` 标记，不会从表中移除。选择这种记录不会应用其 ALT。`records` 的 `start` / `end` 是原始参考跨度，`ref` 为 REF，`alt` 以逗号连接所有 ALT，记录不因 key 为负链而重排：
+
+```python
+from omicsweave.types import Record, Variant
+
+with SequenceReader("genome.fa.gz") as genome, ConsensusReader("clinvar.bcf", genome) as variants:
+    window = Region("chr17", 43_040_904, 43_049_096)
+    records = variants.records(window)
+    print(records.start, records.ref.to_list(), records.alt.to_list(), records.masked)
+    if len(records):
+        alts = records.alt[0].split(",")
+        if alts[0]:
+            target = Variant(int(records.start[0]), records.ref[0], alts[0])
+            alt = variants.fetch(window, target)
+            pair = variants.fetch_batch(window, [Record(0), Record(0, alt=len(alts))])
+    ref = genome.fetch(window)
+```
 
 `Haplotype` 还支持 `R`、`A`、`LR`、`LA`、`SR`、`SA`、`I`、`<N>pIu` 等 bcftools 选择方式。`ConsensusOptions` 可以设置 `include` / `exclude`、缺失基因型字符 `missing`、无变异位置字符 `absent`、插入/缺失/SNV 标记、BED mask 和 `chain` 输出。
 
 consensus 的区域是参考坐标；插入和缺失会改变结果长度。批量结果按 `offsets` 打包，不能假定是等长二维数组。默认 `regions_overlap="record"`，也可设为 `"start"` 或 `"variant"` 改变区域记录的重叠判定。
+
+Python 的每次 `fetch`、`records` 和非空 `fetch_batch` 都重新载入该区域；只有同一 `fetch_batch` 内的选择共享一次参考和记录解码。跨调用需要复用数据块时显式配置 `BlockCache`。单记录选择只处理目标记录；`absent`、标记和 chain 等选项仍然作用于结果。
 
 ## 从注释生成 key
 
@@ -392,7 +474,11 @@ print(cache.stats())
 
 bgzip FASTA、2bit、bigWig、bigBed、hic、BAM、CRAM、BCF 支持缓存；普通 FASTA 不接受非空缓存。缓存预算限制已接纳的数据，不是进程总内存上限。使用期间不要替换数据、索引或参考文件。
 
-解码会释放 GIL。多个线程可共享 reader；需要独立解码状态时使用 `reader.clone()`，clone 共享文件和缓存。reader 可以 pickle，并在 DataLoader worker 中重新打开文件；缓存不会随之传递，`BlockCache` 必须在每个进程内新建，也不能跨 fork 使用。convert 和 quant 的 Plan 是进程内对象，不能 pickle。
+未配置缓存时，reader 仍会复用解码工作区的容量、保留本次查询等待写出的结果；这些不构成跨查询的数据块缓存。`MotifReader` 的 FFM 常驻集合是另一种明确的整集载入模式，既不是 `BlockCache`，也不会随其 `clear()` 释放。
+
+区域解码会释放 GIL。同一个区域 reader 可以在线程间共享，内部工作状态由锁串行使用；需要并行解码时，每个线程使用 `reader.clone()`，共享打开文件、索引和显式缓存，解码状态独立。`MotifReader` 不提供 `clone()`，其读取使用已经载入的只读集合。
+
+reader 可以 pickle，在接收进程按打开参数重新打开文件，缓存不随之传递。已打开的区域 reader、writer 和 `BlockCache` 不能直接继承到 fork 子进程继续使用；子进程应重新打开并新建缓存，或用 `spawn`。convert 和 quant 的 Plan 是进程内对象，不能 pickle。
 
 ## 查看文件信息
 
@@ -400,15 +486,18 @@ reader 打开后即可查看文件的元信息，不需要发起查询：
 
 | Reader | 属性与方法 |
 |---|---|
-| 所有 reader | `source`（打开的格式对象）、`chroms`（名称 → 长度）、`closed` |
+| 所有 reader | `closed` |
+| 单文件区域 reader | `source`（打开的格式对象）；除 `ConsensusReader` 外均有 `chroms`（只读名称 → 长度映射） |
 | `SequenceReader` | `length(chrom)` |
 | `TrackReader` | `summary`（全文件统计）、`zoom_reductions` |
-| `StrandedTrackReader` | `plus`、`minus`（两条链各自的 `TrackReader`） |
-| `IntervalReader` | `schema`（字段数、标准字段数、autoSql） |
+| `StrandedTrackReader` | `plus`、`minus`（两条链各自的 `TrackReader`）；`chroms` 来自 `plus`，文件对象分别由 `plus.source`、`minus.source` 取得，没有统一的 `source` |
+| `IntervalReader` | `schema`（字段数、标准字段数、autoSql；`fields` 为解析后的字段） |
+| `MsaReader` | `species`（固定的物种行，未固定时为 `None`） |
 | `ContactReader` | `version`、`genome`、`attributes`、`maps`（有矩阵的染色体对）、`resolutions(unit)`、`sites(chrom)`、`fragment_count(chrom)` |
 | `AlignmentReader` | `references`（按编号排列，对应 `mate_tid`）、`header_text`、`index` |
 | `VariantReader` | `samples`、`index`；`chroms` 中 header 未给长度的 contig 为 `None` |
-| `ConsensusReader` | `samples`、`reference`、`options`、`index` |
+| `ConsensusReader` | `source`（BCF）、`samples`、`reference`、`options`、`index`；参考染色体信息使用 `reference.chroms`，自身没有 `chroms` |
+| `MotifReader` | `source`、`closed`、`ids`、`alphabet`、`schema`、`widths()`；不使用染色体坐标 |
 
 ## 在 PyTorch DataLoader 中使用
 
@@ -469,27 +558,29 @@ loader = DataLoader(
 - **格式对象可以 pickle，reader 也可以。** reader 被 pickle 时只保存打开参数，在 worker 中重新打开文件；`BlockCache` 不能 pickle，也不能跨 fork 使用，必须在每个进程内新建。
 - **一个 worker 内共享缓存。** 序列和多条信号轨道共用一个 `BlockCache`，相邻或重叠的窗口复用已解码的数据块。
 - **采样器在主进程。** 让 sampler 产出 `Region`，新 epoch 的窗口即可传给 persistent worker，无需重建 Dataset。
-- **多线程场景**（例如在一个进程内用线程池取样）可以共享同一个 reader；需要并行解码时，每个线程使用 `reader.clone()`。
+- **多线程场景**（例如在一个进程内用线程池取样）可以共享同一个区域 reader；需要并行解码时，每个线程使用 `reader.clone()`。
 - **预分配 batch。** 固定大小的查询可以用 `out=` 直接写入 batch 数组的一行，省去一次拷贝。
 
 完整示例见 [examples](../examples)：NonB 的轨道 / peak 加载器，以及按细胞组织多种测定、Hi-C tile 和表达量的 CENO 加载器。
 
 ## 错误类型
 
-所有异常都继承自 `omicsweave.errors.OmicsWeaveError`，并同时继承对应的 Python 内置异常，可以按需捕获：
+下列库异常继承自 `omicsweave.errors.OmicsWeaveError`，部分还继承对应的 Python 内置异常，可以按需捕获。Python 参数校验及绑定层也可能直接抛出内置异常：
 
 | 异常 | 也是 | 常见原因 |
 |---|---|---|
 | `UnknownChromError` | `LookupError` | 文件中没有该染色体名 |
 | `InvalidRegionError` | `ValueError` | `start > end` |
 | `RegionOutOfRangeError` | `IndexError` | 序列查询超出参考长度 |
-| `OutputSizeError` | `ValueError` | `out=` 的形状或 dtype 不匹配 |
+| `OutputSizeError` | `ValueError` | sequence / signal / bins 查询的 `out=` 元素数量不匹配 |
 | `InvalidError` | `ValueError` | 参数或记录不合法；格式需要先转换 |
 | `FormatError` | `ValueError` | 文本无法解析，附带 1-based 行号 |
 | `IoError` | `OSError` | 文件或索引不存在、无法读取 |
 | `BadMagicError`、`TruncatedError`、`InflateError` | — | 文件损坏、截断或不是预期格式 |
-| `UnsupportedError` | `NotImplementedError` | 合法但未实现的输入，如 big-endian BBI、CRAM 2.x |
+| `UnsupportedError` | `NotImplementedError` | 未实现的格式能力（如 big-endian BBI、CRAM 2.x），或参考语义未定义、无法安全求值的过滤输入 |
 | `StaleSidecarError` | — | sidecar 与当前数据文件不匹配，需要重建 |
+
+sequence / signal / bins 的 dtype 或数组维数不符由绑定抛内置 `TypeError`；连续性、可写借用，以及 bins 的统计量行数不符抛内置 `ValueError`。`ContactReader.matrix(..., out=...)` 的形状、连续性或可写借用错误抛内置 `ValueError`，dtype 或数组维数不符抛 `TypeError`。`MsaReader.fetch(..., out=...)` 在 Python 层统一用内置 `ValueError` 拒绝数组类型、dtype、形状、连续性、可写性不符，以及未固定 `species` 的情况；这些参数错误不属于 `OutputSizeError`。
 
 ## 常见问题
 

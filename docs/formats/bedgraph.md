@@ -72,7 +72,7 @@ bedGraph 和 BED4 都是四列，区别在第四列的含义：bedGraph 是数�
 | 功能 | 支持情况 |
 |---|---|
 | 文件对象 | `BedGraph`（纯文本）、`GzipBedGraph`（gzip 或 bgzip） |
-| 格式识别 | `track` 行写有 `type=bedGraph`，或每个数据行都是四列且最后一列为数字 |
+| 格式识别 | 开头最多 64 KiB 中有 `track type=bedGraph`，或样本数据行都是四列、坐标可解析为 `uint32`、末列可解析为浮点数 |
 | 区域查询 | 不直接支持；`query.open` 会报错并给出转换命令 |
 | 转为 bigWig | 存储数值信号，支持逐碱基查询和分箱统计 |
 | 转为 bigBed | 保留四列区间语义，数值作为附加字段文本 |
@@ -96,9 +96,9 @@ print(report.records)  # 写入的信号区间数
 - **输入**：纯文本、gzip、BGZF；`track`、`browser`、`#` 开头的行和空行跳过。字段以空白分隔。
 - **排序**：不要求有序，按染色体（首次出现的顺序）和起点排序；超出内存预算时外排序。
 - **区间**：必须非空（`start < end`），排序后相邻区间不能重叠，重叠时报错并指出两行的行号。
-- **数值**：按双精度解析，以 `float32` 存储；必须是有限的 32-bit 浮点数，`nan`、`inf` 或超出 float32 范围的值报错。值按原样保存，不做缩放或平滑。
+- **数值**：按双精度解析，再转为 `float32`；转换后必须有限，`nan`、`inf` 或溢出 float32 的值报错。小数可能舍入或下溢，例如 `1e-300` 会存为 0；不做额外缩放或平滑。
 - **染色体长度**：`chrom_sizes` 接受两列长度表、`.fai` 或 `.2bit`。提供时，不在长度表中的染色体和超出长度的区间都会报错，不会自动裁剪；省略时用每条染色体最大的右端作为长度。
-- 输出 bigWig 带有默认的 zoom 层，块与 zoom 布局可用 `bbi=BbiOptions(...)` 或 `--block-size` / `--items-per-slot` / `--zoom-levels` 调整；`--sidecar` 可同时写出 [sidecar](sidecar.md)。
+- 输出 bigWig 默认尝试生成 zoom 层，只保留比上一层记录更少的层，因此小文件可能没有 zoom 层。块与 zoom 布局可用 `bbi=BbiOptions(...)` 或 `--block-size` / `--items-per-slot` / `--zoom-levels` 调整；`--sidecar` 可同时写出 [sidecar](sidecar.md)。
 
 转换后读取：
 
@@ -136,7 +136,7 @@ with IntervalReader("signal.bb") as records:
 `formats.detect` 读取前 64 KiB 判断格式。以下情况会被识别为 bedGraph：
 
 - `track` 行写有 `type=bedGraph`；
-- 每个数据行都恰好四列，且最后一列是数字。
+- 样本中有数据行，每个完整数据行都恰好四列，起点和右端可解析为 `uint32`，最后一列可解析为浮点数。
 
 如果一个四列文件实际上是 BED4（第四列是数字编号的名称），显式按 BED 转换：
 

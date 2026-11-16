@@ -35,7 +35,7 @@ BGZF（Blocked GNU Zip Format）是 htslib 使用的分块 gzip：数据被切�
 └────────────────────────────────────────┘
 ```
 
-每个条目是一对位置：该块在压缩文件中的字节偏移，以及它的第一个字节在解压后文本中的偏移。第一个块的 `(0, 0)` 省略不写。条目按两种偏移递增排列，相邻条目的解压后偏移之差不超过 64 KiB。
+每个条目是一对位置：该块在压缩文件中的字节偏移，以及它的第一个字节在解压后文本中的偏移。起始 `(0, 0)` 隐含、不写入文件。OmicsWeave 建索引时只为非空块记录位置，首个非空块对应隐含的 `(0, 0)`；空块（包括 EOF）不写条目。读取索引时要求压缩偏移严格递增、解压偏移不减，允许空块对应相同的解压偏移；相邻条目的解压偏移之差不超过 64 KiB。
 
 ## 原理：GZI 如何配合 FAI
 
@@ -49,13 +49,13 @@ BGZF（Blocked GNU Zip Format）是 htslib 使用的分块 gzip：数据被切�
 碱基坐标 ──FAI──▶ 解压后字节 [a, b) ──GZI──▶ 压缩块 k … m ──inflate──▶ 碱基
 ```
 
-因为块是独立的，相邻查询命中的块可以复用。OmicsWeave 给每个块一个稳定编号，`BlockCache` 以此缓存解压后的块，滑动窗口等重复读取同一区域的场景不会反复解压。
+因为块是独立的，相邻查询命中的块可以复用。OmicsWeave 给每个块一个稳定编号；显式传入 `BlockCache` 时可缓存解压后的块，减少滑动窗口等重复查询的解压工作。默认 `cache=None`，不启用共享块缓存。
 
 ## OmicsWeave 中的支持
 
 | 功能 | 支持情况 |
 |---|---|
-| 建索引 | `BgzipFasta.build_index()` 一次扫描同时写 `.fai` 和 `.gzi`，只读取块头 |
+| 建索引 | `BgzipFasta.build_index()` 一次扫描，完整解压并校验各块以生成 `.fai`，同时生成 `.gzi`；Rust `Gzi::build` 单独建 GZI 时只读块头和 `ISIZE` 尾字段，不解压 |
 | 随写随建 | 压缩的 `FastaWriter`、FASTA → bgzip 转换根据写出的块直接生成 |
 | 查询 | `SequenceReader(path, gzi=...)`；默认使用 `<fasta>.gzi` |
 | 路径对象 | `Gzi.beside(path)` 返回 `<path>.gzi` 的格式对象，不执行建索引 |
@@ -63,7 +63,7 @@ BGZF（Blocked GNU Zip Format）是 htslib 使用的分块 gzip：数据被切�
 
 限制：
 
-- `.gzi` 没有固定签名，`formats.detect` 不能识别它。
+- `.gzi` 没有固定签名，也没有专门的探测分支；文本探测兜底可能将其识别为 `Bed`，应使用 `Gzi(path)` 显式声明索引类型。
 - OmicsWeave 只在 bgzip FASTA 查询中使用 GZI。BAM、BCF 通过 [BAI](bai.md) / [CSI](csi.md) 中的虚拟偏移定位，不需要 GZI。
 
 ## 使用
@@ -99,7 +99,7 @@ with SequenceReader(
 | bgzip FASTA 提示缺少 `.gzi` | 调用 `BgzipFasta(...).build_index()`，或用 `gzi=` 指定位置 |
 | 给普通 gzip 文件建 GZI 失败 | 普通 gzip 没有块结构；先 `ow convert` 成 bgzip FASTA |
 | 重新压缩后查询出错 | 即使碱基相同，块边界也可能改变；使用与新文件配套的 `.fai` 和 `.gzi` |
-| `detect` 认不出 `.gzi` | 正常现象：GZI 没有签名 |
+| `detect` 返回 `Bed` 或不能识别 `.gzi` | GZI 没有专门的探测分支；使用 `Gzi(path)` 显式声明 |
 
 ## 相关格式
 

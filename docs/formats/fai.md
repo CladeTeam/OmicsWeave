@@ -54,19 +54,21 @@ OFFSET + (pos // LINEBASES) × LINEWIDTH + pos % LINEBASES
 
 例如 chr1 的第 5 个碱基（`a`）：`6 + (5 // 4) × 5 + 5 % 4 = 12`。读取 `[start, end)` 时，只需算出起止字节，读出这段文本并去掉其中的换行符。
 
-这套算术成立的前提是**同一条序列除最后一行外各行长度相同**。因此 OmicsWeave 与 samtools 一样，遇到行长不一致的序列会拒绝建索引；重新排版可用 [FastaWriter](fasta.md#从内存写入) 或 `ow convert`。
+这套算术成立的前提是**同一条序列除最后一行外各行长度相同**。因此 OmicsWeave 遇到行长不一致的序列会拒绝建索引；解析序列后可用 [FastaWriter](fasta.md#从内存写入) 统一行宽。`ow convert` 转成 bgzip FASTA 时原样压缩文本，不会修复行宽。
 
 对 bgzip FASTA，OFFSET 指的是**解压后**文本中的位置。FAI 给出要读的文本范围，再由 [GZI](gzi.md) 找出覆盖这段范围的压缩块。
 
 ## 建索引的规则
 
-OmicsWeave 生成的 `.fai` 与 `samtools faidx` 逐字节一致，规则相同：
+`Fasta.build_index()` / `BgzipFasta.build_index()` 扫描现有 FASTA 的规则按 `samtools faidx` 实现：
 
 - 序列名从 `>` 后的第一个非空白字节开始，到下一个空白字符结束，其余描述被忽略；名称必须是 UTF-8。
 - 一条序列的各行长度必须一致，只有最后一行可以更短，且较短的行之后只能是下一个 header 或空行。
 - 碱基按可打印的非空白字节计数；`\r\n` 换行的文件也可以建索引。
 - 同名序列只保留第一条；没有任何序列行的记录被丢弃（但文件最后一条记录为空时报错）。
 - 普通 gzip 无法建索引（与 htslib 相同）；先转换为 bgzip。
+
+这些是扫描已有文件时的规则；`FastaWriter` 直接拒绝重复名称和空序列，再根据写出的统一行宽生成索引。
 
 ## OmicsWeave 中的支持
 
@@ -77,12 +79,12 @@ OmicsWeave 生成的 `.fai` 与 `samtools faidx` 逐字节一致，规则相同�
 | 查询 | `SequenceReader(path, fai=...)`；默认使用 `<fasta>.fai` |
 | 路径对象 | `Fai.beside(path)` 返回 `<path>.fai` 的格式对象，不创建、不校验 |
 | 染色体长度 | 转换的 `chrom_sizes` / `--chrom-sizes` 接受 `.fai` |
-| 保存方式 | `build_index()` 先写临时文件再重命名，中途失败不会留下半个索引 |
+| 保存方式 | 每个索引单独以临时文件加重命名写入；bgzip 先保存 `.gzi` 再保存 `.fai`，后者失败可能留下新 `.gzi`，两者不构成一次原子提交 |
 
 限制：
 
 - reader 打开时不会自动建索引，缺少索引报 `IoError`。
-- `.fai` 没有固定的文件签名，`formats.detect` 不能识别它；需要时用 `Fai("path")` 声明。
+- `.fai` 没有固定签名，也没有专门的探测分支；符合 BED 文本探测条件时可能被 `formats.detect` 识别为 `Bed`。需要声明索引类型时用 `Fai("path")`。
 
 ## 使用
 
@@ -125,7 +127,7 @@ ow convert peaks.bed peaks.bb --chrom-sizes genome.fa.fai
 | 建索引报行长不一致 | 重新排版 FASTA 后再建索引 |
 | 查询结果错位 | FASTA 被修改或替换过，旧索引失效；重建 |
 | 普通 gzip FASTA 无法建索引 | 先 `ow convert` 成 bgzip FASTA |
-| `detect` 认不出 `.fai` | 正常现象：FAI 没有签名 |
+| `detect` 返回 `Bed` 或不能识别 `.fai` | FAI 没有专门的探测分支；使用 `Fai(path)` 显式声明 |
 
 ## 相关格式
 

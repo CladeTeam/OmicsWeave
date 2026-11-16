@@ -31,13 +31,16 @@ bigBed 与 [bigWig](bigwig.md) 由 UCSC 基因组浏览器团队同时设计（K
 ```text
 ┌──────────────────────────────┐
 │ 固定 header                  │  magic、版本、字段数、标准字段数、各段偏移
-│ zoom header × N              │  各汇总层的分辨率与位置
+│ zoom header 表及预留空间     │  各汇总层的分辨率与位置
 │ autoSql 文本（可选）         │  每一列的名称、类型与说明
 │ 全文件 summary               │
+│ extension header             │  扩展头；OmicsWeave 不写 extra index
 │ 染色体 B+ 树                 │  染色体名 → 编号、长度
+│ 记录数（uint64）             │  原始 bigBed 记录总数
 │ 数据块（zlib 压缩）          │  按染色体、起点排序的记录
 │ R 树索引                     │  区域 → 数据块位置
 │ zoom 层数据 + 索引           │  区间覆盖度的预汇总
+│ 尾部 magic                   │
 └──────────────────────────────┘
 ```
 
@@ -66,13 +69,17 @@ table bedMethyl
 
 它让下游工具知道每一列的名称和类型，但只是描述，记录本身仍以文本保存。
 
-**zoom 层**保存区间覆盖度的预汇总，主要供浏览器在缩小视图时显示密度；OmicsWeave 写入时会生成 zoom 层以保持兼容，查询记录时不使用它们。
+上图是 OmicsWeave writer 的段顺序；读取其他文件时应使用 header 中的偏移，不能假定这些段紧邻排列。
+
+**zoom 层**保存区间覆盖度的预汇总，主要供浏览器在缩小视图时显示密度；OmicsWeave 默认按记录密度推导并保留能减少记录数的层，空文件及部分小文件没有 zoom 层。查询区间记录时不使用 zoom。
 
 ## 关键概念
 
 ### 返回完整记录
 
-区间查询返回所有与查询区域**至少重叠 1 bp** 的记录，且是完整记录：坐标不会裁剪到查询区域。一个跨越查询边界的长区间会以原始起止坐标返回。这与 bigWig 的 `intervals` 不同，后者会裁剪。
+区间查询返回满足 `record.end > region.start` 且 `record.start < region.end` 的记录，空查询区域返回空结果。`fetch(region, clip=False)` 是默认行为：跨越查询边界的记录保留原始起止坐标。需要把坐标截到查询区域时传 `clip=True`。bigWig 的 `intervals` 默认则为 `clip=True`。
+
+裁剪只改变返回的 `start`、`end`，附加字段保持原样，包括 BED12 的 `thickStart`、`thickEnd`、`blockSizes`、`chromStarts`。`clip=True` 不会重建一个裁剪后的 BED12 转录本结构。
 
 ### 区间可以重叠和嵌套
 
@@ -92,11 +99,11 @@ BED12 的 blocks（外显子结构）保存在附加字段中，索引只认识�
 |---|---|
 | 格式识别 | `formats.detect` 按 magic 识别为 `BigBed` |
 | 区域查询 | `IntervalReader.fetch`：重叠记录的 `start`、`end`（`uint32`）与附加字段（`StringVector`），按起点排列 |
-| schema | `IntervalReader.schema`：`field_count`、`defined_field_count`、`auto_sql` |
-| 文件信息 | `chroms`：染色体名 → 长度 |
+| schema | `IntervalReader.schema`：`field_count`、`defined_field_count`、`auto_sql`；`fields` 为解析后的字段，`columns(hits)` 按 autoSql 类型拆成各列数组 |
+| 文件信息 | `chroms`：染色体名 → 长度的只读 mappingproxy |
 | 缓存与并发 | 可接 `BlockCache`；解码释放 GIL；可 `clone()`、pickle |
 | 写入 | `BigBedWriter`，可多线程压缩块，可选同时写 sidecar |
-| 转换生成 | BED、bedGraph、bedMethyl → bigBed |
+| 转换生成 | BED、bedGraph、bedMethyl → bigBed；MAF → bigMaf（也是 bigBed） |
 | 定量 | `quant.Peaks("peaks.bb")`：每条记录一个特征列 |
 
 限制：
@@ -112,12 +119,12 @@ BED12 的 blocks（外显子结构）保存在附加字段中，索引只认识�
 from omicsweave.query import IntervalReader
 
 with IntervalReader("peaks.bb") as peaks:
-    print(peaks.chroms)                 # {'chr1': 248956422, ...}
+    print(dict(peaks.chroms))           # {'chr1': 248956422, ...}
     print(peaks.schema)                 # BigBedSchema(field_count=6, defined_field_count=6, auto_sql=None)
 
     hits = peaks.fetch(("chr1", 100, 200))
     print(len(hits))
-    print(hits.start, hits.end)         # uint32 数组，0-based 半开，不裁剪
+    print(hits.start, hits.end)         # uint32 数组，0-based 半开，默认不裁剪
     print(hits.annotation.to_list())    # ['peak1\t960\t+', ...]
 ```
 
@@ -126,7 +133,19 @@ with IntervalReader("peaks.bb") as peaks:
 ```python
 names = [row.split("\t")[0] for row in hits.annotation.to_list()]
 scores = [int(row.split("\t")[1]) for row in hits.annotation.to_list()]
+
+# 或按 schema 一次拆列：数值字段得到对应 dtype 的数组
+cols = peaks.schema.columns(hits, ["name", "score"])
+cols["score"]             # uint32 [N]
+cols["name"]              # StringVector
+cols["name"].to_list()    # list[str]
 ```
+
+`schema.fields` 返回全部列的 `AutoSqlField(name, type, comment)`，前三列是坐标；`schema.columns(...)` 只拆分第 4 列起的注释字段，既接受 `hits`，也接受 `hits.annotation`。省略 `names` 时拆分全部附加列。
+
+`AutoSqlField.dtype` 给出标量数值类型的 NumPy dtype，例如 `uint` → `uint32`、`int` → `int32`、`float` → `float32`、`double` → `float64`。字符串、数组、enum、set，以及颜色字段 `reserved` / `itemRgb` 的 dtype 为 `None`，拆列后得到 `StringVector`。拆列会分配新结果；行的字段数不符或数字无法转换时会报错。
+
+没有 autoSql，或解析出的列数与 `field_count` 不符时，`fields` 回退到前 12 列的标准 BED 名称，其余列叫 `field13`、`field14` 等。此回退只是列名约定，不推断自定义列的真实语义；使用这类文件前应核对数据约定。
 
 ### 生成标签
 
@@ -136,14 +155,14 @@ scores = [int(row.split("\t")[1]) for row in hits.annotation.to_list()]
 import numpy as np
 
 def peak_mask(peaks: IntervalReader, chrom: str, start: int, end: int) -> np.ndarray:
-    hits = peaks.fetch((chrom, start, end))
+    hits = peaks.fetch((chrom, start, end), clip=True)
     mask = np.zeros(end - start, dtype=np.uint8)
     for s, e in zip(hits.start, hits.end):
-        mask[max(int(s), start) - start : min(int(e), end) - start] = 1
+        mask[int(s) - start : int(e) - start] = 1
     return mask
 ```
 
-因为返回的记录不裁剪，这里用 `max` / `min` 把坐标截到窗口内。
+`clip=True` 让坐标落在窗口内，可以直接换算成窗口下标。
 
 ## 准备 bigBed
 
@@ -211,9 +230,9 @@ ow quant chip.bam -o chip --chip-peaks peaks.bb
 
 | 现象 | 原因与处理 |
 |---|---|
-| 结果坐标超出查询区域 | bigBed 返回完整记录，不裁剪；需要时自行截断 |
+| 结果坐标超出查询区域 | bigBed 默认返回完整记录；需要时传 `clip=True` |
 | 查询内含子也返回转录本 | BED12 按整体跨度索引；自行解析 blocks |
-| `annotation` 只有一个字符串 | 第 4 列起的字段以 tab 连接，需自行拆分 |
+| `annotation` 只有一个字符串 | 第 4 列起的字段以 tab 连接；用 `schema.columns(hits)` 按列拆分 |
 | `auto_sql` 为 `None` | 文件没有 autoSql（BED 转换不写），字段含义由 `defined_field_count` 和数据约定决定 |
 | 找不到染色体 | 检查 `peaks.chroms`；转换时只写入有记录的染色体 |
 | 写入时报排序错误 | `BigBedWriter` 要求按染色体顺序和起点排序；先排序，或改用 BED + `ow convert` |
@@ -223,4 +242,5 @@ ow quant chip.bam -o chip --chip-peaks peaks.bb
 - [BED](bed.md)：bigBed 的文本来源。
 - [bigWig](bigwig.md)：同一 BBI 容器中的数值信号。
 - [bedMethyl](bedmethyl.md)：转为 bigBed 时保留全部列和 autoSql。
+- [bigMaf](bigmaf.md)：bed3 + 整个 MAF 比对块的 bigBed，由 `MsaReader` 投影为比对矩阵。
 - [Sidecar](sidecar.md)：bigBed 数据块布局的可选伴随文件，普通查询不需要。

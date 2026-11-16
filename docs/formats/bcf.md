@@ -93,7 +93,7 @@ OmicsWeave 把这些值统一映射为易用的常量，见下文“结果中的
 
 ### 记录与区域的重叠
 
-一条记录覆盖 `[POS, POS + rlen)`。rlen 来自 REF 长度，以及 INFO/END、INFO/SVLEN、FORMAT/LEN（与 htslib 相同）。因此：
+区域迭代使用 BCF 固定字段中保存的跨度 `[POS, POS + rlen)` 筛选记录，不为判断重叠重新读取 INFO/END 等字段。OmicsWeave 从 VCF 转换时，会根据 REF 长度及 INFO/END、INFO/SVLEN、FORMAT/LEN 等计算并保存 rlen。因此对正常编码了跨度的记录：
 
 - 删除 `ACGT → A` 覆盖 4 个参考碱基，与其中任一碱基重叠的区域都会返回它。
 - `<DEL>` 加 `END=200` 的结构变异，与其跨度内任意位置重叠的区域都会返回它。
@@ -104,7 +104,7 @@ OmicsWeave 把这些值统一映射为易用的常量，见下文“结果中的
 
 ### 过滤表达式
 
-bcftools 的 `-i` / `-e` 表达式（如 `QUAL>30 && INFO/DP>10`、`GT="het"`）是筛选变异的通用语言。OmicsWeave 用 Rust 重写了 bcftools 1.23.1 的 `filter.c`（不含 Perl 过滤），语法、报错和结果与 bcftools 一致，不需要安装 bcftools。
+bcftools 的 `-i` / `-e` 表达式（如 `QUAL>30 && INFO/DP>10`、`GT="het"`）是筛选变异的通用语言。OmicsWeave 用 Rust 实现 bcftools 1.23.1 的 `filter.c` 表达式语义（不含 Perl 过滤），不需要安装 bcftools。对参考实现具有已定义语义的输入进行结果对照；触发未初始化缓冲读取的输入会安全返回 `UnsupportedError`。
 
 ## OmicsWeave 中的支持
 
@@ -112,12 +112,12 @@ bcftools 的 `-i` / `-e` 表达式（如 `QUAL>30 && INFO/DP>10`、`GT="het"`）
 |---|---|
 | 格式识别 | 按解压后的 magic `BCF\2` 识别为 `Bcf`，支持 2.1 与 2.2 |
 | 基因型矩阵 | `VariantReader.genotypes`：只解码固定字段和 GT |
-| 字段读取 | `VariantReader.fetch`：QUAL、FILTER、任意 INFO / FORMAT，一次扫描 |
+| 字段读取 | `VariantReader.fetch`：QUAL、FILTER、INFO 与非 GT、非 Flag 的 FORMAT，一次扫描；GT 始终在 `records.genotypes` 中 |
 | 样本选择 | `samples=` 按名字选择并按请求顺序返回；默认全部样本 |
 | 过滤表达式 | `include` / `exclude`，bcftools 语法，二者互斥 |
 | 个体化序列 | `ConsensusReader`：`bcftools consensus` 1.23 的 Rust 实现，在内存中生成 |
 | 建索引 | `Bcf.build_index()` 写 `<bcf>.csi`，等同 `bcftools index` |
-| 索引查找 | 默认 `<bcf>.csi`，再试去扩展名后的 `.csi`；可用 `index=` 指定 |
+| 索引查找 | 默认 `<bcf>.csi`，再试去扩展名后的 `.csi`，之后同样尝试 `.bai`；找到 BAI 后仍因类型不符报错。可用 `index=` 指定 CSI |
 | 缓存与并发 | 可接 `BlockCache`；解码释放 GIL；可 `clone()`、pickle |
 | 生成 | VCF（纯文本 / gzip / BGZF）→ BCF；外部工具写出的 BGZF BCF 同样可用 |
 | quant | `Task.variants` 屏蔽已知位点；`Alleles` 统计二等位 SNV 的 ref / alt / other |
@@ -125,7 +125,7 @@ bcftools 的 `-i` / `-e` 表达式（如 `QUAL>30 && INFO/DP>10`、`GT="het"`）
 限制：
 
 - 区域查询只支持 BGZF 压缩、按坐标排序且有 CSI 的 BCF；未压缩 BCF（`bcftools -Ou`）不能建索引。
-- reader 打开时不会自动建索引，缺少 CSI 时报错并提示 `Bcf.build_index()`。
+- reader 打开时不会自动建索引；没有任何候选索引时报 `IoError` 并提示 `Bcf.build_index()`；若只找到合法 BAI，则报 `InvalidError`：`a BCF is indexed by a CSI`。
 - `VariantReader` 和 `ConsensusReader` 只接受连续 `Region`，不接受 `Spliced`。
 - 当前不提供 BCF → VCF 导出，也没有从内存写 BCF 的 writer。
 
@@ -208,6 +208,8 @@ with VariantReader("cohort.bcf") as variants:
 
 字段名必须在 header 中声明，否则报 `INFO/XX is not declared in the header`；同一个字段不能重复请求。
 
+`format=["GT"]` 会报错：GT 已包含在 `records.genotypes` 中，应从这里读取。声明为 Flag 的 FORMAT 字段同样被拒绝；Flag 只支持 INFO 字段。
+
 | 字段类型 | 返回 |
 |---|---|
 | INFO Flag | `bool [记录数]` |
@@ -252,6 +254,8 @@ variants.fetch(region, exclude='TYPE="indel"')
 
 `genotypes()` 不接受过滤表达式；需要过滤时使用 `fetch`，再从 `records.genotypes` 取基因型。
 
+`fisher` 的两个 FORMAT 参数必须在 header 中声明为 `Number=R`，例如 `fisher(FMT/AD[:0-1], FMT/ADR[:0-1])`；仅有相同数量的值不能代替该声明。参考实现对不符合这个参数域的输入可能产生未定义结果，OmicsWeave 会拒绝读取未写入的结果值。
+
 ## 个体化序列：consensus
 
 `ConsensusReader` 把 BCF 中的变异应用到参考序列的一个区域上，等同于对该区域运行 `bcftools consensus`，但在内存中直接返回数组：
@@ -277,6 +281,12 @@ with SequenceReader("genome.fa.gz") as genome, ConsensusReader(
 | `AllAlt()`（默认） | `-s -` | 每条记录取第一个 ALT，不看样本 |
 | `Samples(["s1", ...])` | `-s s1,...` | 用这些样本的基因型生成 IUPAC 码 |
 | `Haplotype("s1", "1")` | `-s s1 -H 1` | 取样本的某条单倍型 |
+| `Record(i, alt=1)` | 无（相当于只含这条记录的文件加 `-s -`） | 只套用区域内第 `i` 条记录的这个 ALT，其他记录不套用 |
+| `Variant(start, ref, alt)` | 同上 | 按 0-based 位置和 REF/ALT 找到那条记录，只套用它 |
+
+后两种用于变异效应预测：每个变异单独生成 ALT 序列，窗口里的其他变异不会混进来；不应用 `iupac_codes`，但保留 mask、`absent`、标记和 chain 的行为。
+
+`ConsensusReader.records(region)` 返回 `ConsensusRecords`，包含 `start` / `end`（`int64`，原始参考跨度）、`ref`、逗号连接的 `alt` 和布尔 `masked`。顺序是经过区域重叠规则、`include` / `exclude` 后的文件顺序，`Record.index` 从 0 开始，`Record.alt` 从 1 开始。mask 命中的记录仍占下标，只是不应用其 ALT；负链 key 不改变这个列表的顺序。`Variant` 忽略 REF / ALT 的 ASCII 大小写，重复匹配选文件中第一条；无匹配、记录下标或 ALT 编号越界均报错。实际示例见[查询文档](../query.md#个体化序列consensus)。
 
 `Haplotype` 还支持 `R`、`A`、`LR`、`LA`、`SR`、`SA`、`I`、`<N>pIu` 等 bcftools `-H` 写法，写错时立即报 `ValueError`。
 
@@ -297,8 +307,9 @@ with SequenceReader("genome.fa.gz") as genome, ConsensusReader(
 
 - 区域使用参考坐标；插入和缺失会改变输出长度，批量结果按 `offsets` 打包，不能假定等长。
 - 负链区域返回 consensus 的反向互补（IUPAC 码同样取互补，大小写保留）；chain 始终是正链。
-- 同一区域的多次查询复用已解码的参考和记录；`fetch_batch` 一次生成整批序列，适合多样本、多单倍型。
+- 每次 Python `fetch`、`records` 和非空 `fetch_batch` 都重新载入区域。`fetch_batch` 内部共享一次参考和记录解码，适合多样本、多单倍型和逐记录选择；跨调用的数据块复用由显式 `BlockCache` 提供。
 - `reference` 可以是已打开的 `SequenceReader`（共享，不由 consensus 关闭），也可以是 FASTA、bgzip FASTA 或 2bit 路径（由 consensus 打开和关闭）。
+- 返回数组由结果持有，之后查询、清空缓存或关闭 reader 不使它们失效。同一个 reader 在线程间串行使用其解码状态；`clone()` 共享文件、索引和缓存，使用独立状态并行解码。已打开的区域 reader 和缓存不能直接跨 fork 使用，pickle 则在接收进程重新打开且不携带缓存。
 
 ## 用于定量
 
