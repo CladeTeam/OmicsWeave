@@ -26,9 +26,9 @@ def test_interval_and_track_columns_keep_order_bits_and_ownership(tmp_path):
     options = BbiOptions(zoom_levels=0)
     track_path = tmp_path / "columns.bw"
     bed_path = tmp_path / "columns.bb"
-    with BigWigWriter(track_path, chroms, options) as writer:
+    with BigWigWriter(track_path, chroms, options=options) as writer:
         writer.add("c", starts, ends, values)
-    with BigBedWriter(bed_path, chroms, BigBedSchema(field_count=4), options) as writer:
+    with BigBedWriter(bed_path, chroms, BigBedSchema(field_count=4), options=options) as writer:
         writer.add("c", starts, ends, notes)
     with TrackReader(track_path) as track:
         full = track.intervals(("c", 0, chroms["c"]))

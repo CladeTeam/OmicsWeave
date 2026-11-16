@@ -125,7 +125,6 @@ def test_errors_open_and_pickle(files):
     ]
     clone = reader.clone()
     assert len(clone.fetch(("chr1", 0, 5000))) == len(expected("chr1", 0, 5000))
-    assert clone.cache_namespace == reader.cache_namespace
     reader.close()
     with pytest.raises(ValueError, match="closed"):
         reader.fetch(("chr1", 0, 10))

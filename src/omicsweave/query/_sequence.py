@@ -9,7 +9,7 @@ from types import MappingProxyType
 import numpy as np
 
 from .. import _native
-from ..cache import BlockCache, BlockKey
+from ..cache import BlockCache
 from ..cache import native as native_cache
 from ..errors import UnknownChromError
 from ..formats import BgzipFasta, Fai, Fasta, Gzi, PathLike, TwoBit
@@ -60,14 +60,6 @@ class SequenceReader(CachedReader):
         """Attach caller-owned blocks; plain FASTA rejects a nonempty cache."""
         self._native.set_cache(native_cache(cache))
 
-    def describe_cache(self, locus: LocusLike) -> tuple[BlockKey, ...]:
-        """The block keys on which this locus depends, each once."""
-        return tuple(self._native.describe_cache(native_key(as_locus(locus))))
-
-    def prefetch_cache(self, locus: LocusLike) -> None:
-        """Populate the attached cache without constructing sequence output."""
-        self._native.prefetch_cache(native_key(as_locus(locus)))
-
     @property
     def chroms(self) -> Mapping[str, int]:
         """Sequence lengths by name, in file order."""
@@ -105,3 +97,13 @@ class SequenceReader(CachedReader):
         else:
             self._native.sequence(native, out)
         return Sequence(key, out)
+
+
+def reference_reader(
+    reference: Fasta | BgzipFasta | TwoBit | PathLike, cache: BlockCache | None
+) -> SequenceReader:
+    """A reader of ``reference`` for another reader to use, sharing ``cache``
+    where its format caches blocks (bgzip FASTA, 2bit; plain FASTA is read
+    directly)."""
+    file = resolve(reference, (Fasta, BgzipFasta, TwoBit), "the reference")
+    return SequenceReader(file, cache=None if isinstance(file, Fasta) else cache)

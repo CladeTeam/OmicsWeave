@@ -9,7 +9,7 @@ from types import MappingProxyType
 import numpy as np
 
 from .. import _native
-from ..cache import BlockCache, BlockKey
+from ..cache import BlockCache
 from ..cache import native as native_cache
 from ..errors import InvalidError, UnknownChromError
 from ..formats import BigWig, BigWigSummary, PathLike
@@ -57,14 +57,6 @@ class TrackReader(CachedReader):
     def set_cache(self, cache: BlockCache | None) -> None:
         """Attach external decoded blocks, or detach them with None."""
         self._native.set_cache(native_cache(cache))
-
-    def describe_cache(self, locus: LocusLike) -> tuple[BlockKey, ...]:
-        """The full-resolution blocks this locus depends on, each once."""
-        return tuple(self._native.describe_cache(native_key(as_locus(locus))))
-
-    def prefetch_cache(self, locus: LocusLike) -> None:
-        """Prepare blocks without constructing the query's final output."""
-        self._native.prefetch_cache(native_key(as_locus(locus)))
 
     @property
     def chroms(self) -> Mapping[str, int]:
@@ -147,7 +139,10 @@ class StrandedTrackReader(Reader):
     (RNA-seq, CAGE, PRO-seq coverage). A key on ``"+"`` reads ``plus``; a key
     on ``"-"`` reads ``minus``, 5' to 3' of the minus strand. Values come as
     stored (a minus file holding negative values keeps them). Unstranded
-    keys are refused: they do not say which file to read."""
+    keys are refused: they do not say which file to read.
+
+    :attr:`plus` and :attr:`minus` are the :class:`TrackReader` of each
+    strand (their summaries and zoom levels)."""
 
     def __init__(
         self,
@@ -175,6 +170,26 @@ class StrandedTrackReader(Reader):
     @property
     def chroms(self) -> Mapping[str, int]:
         return self.plus.chroms
+
+    def set_cache(self, cache: BlockCache | None) -> None:
+        """Attach external decoded blocks to both strands, or detach them."""
+        self.plus.set_cache(cache)
+        self.minus.set_cache(cache)
+
+    def clone(self) -> StrandedTrackReader:
+        """Both strands cloned: shared sources and caches, separate state."""
+        plus = self.plus.clone()
+        try:
+            minus = self.minus.clone()
+        except BaseException:
+            plus.close()
+            raise
+        cloned = object.__new__(type(self))
+        cloned.__dict__ = self.__dict__.copy()
+        cloned.plus, cloned.minus = plus, minus
+        cloned._native = _Pair(plus, minus)
+        cloned._closed = False
+        return cloned
 
     def signal(self, locus: LocusLike, out: np.ndarray | None = None) -> Signal:
         """The values of the key's strand; see :meth:`TrackReader.signal`."""

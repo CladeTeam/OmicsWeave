@@ -10,22 +10,20 @@ from typing import Literal
 import numpy as np
 
 from .. import _native
-from ..cache import BlockCache, BlockKey
+from ..cache import BlockCache
 from ..cache import native as native_cache
 from ..formats import Bai, Bam, BgzipFasta, Crai, Cram, Csi, Fasta, PathLike, TwoBit, detect
 from ..types import AlignmentField, Alignments, Cigars, RegionLike
 from ..types._genome import as_region
 from ..types._string import StringVector
 from ._base import CachedReader, resolve
-from ._sequence import SequenceReader
+from ._sequence import SequenceReader, reference_reader
 
 __all__ = ["AlignmentReader"]
 
 Fields = AlignmentField | Literal["all"] | Iterable[str]
 
 _FIELD_NAMES = {f.name.lower(): f for f in AlignmentField}  # type: ignore[union-attr]
-
-UNMAPPED, SECONDARY, QC_FAIL, DUPLICATE = 0x4, 0x100, 0x200, 0x400
 
 NO_FIELDS = AlignmentField(0)
 ALL_FIELDS = AlignmentField(sum(AlignmentField))
@@ -51,12 +49,6 @@ def _fields(fields: Fields) -> AlignmentField:
 Reference = SequenceReader | Fasta | BgzipFasta | TwoBit | PathLike
 
 
-def _reference(reference: Reference | None) -> object:
-    if reference is None or isinstance(reference, SequenceReader):
-        return None if reference is None else reference._native
-    return os.fspath(reference)
-
-
 def _index(index: Bai | Csi | Crai | PathLike | None) -> str | None:
     return None if index is None else os.fspath(index)
 
@@ -78,11 +70,17 @@ class AlignmentReader(CachedReader):
     on open.
 
     ``reference`` is the sequence a CRAM was compressed against: a
-    :class:`SequenceReader` or a FASTA, bgzip FASTA or 2bit file. Its
-    bases rebuild the reads' sequences (and the MD / NM tags htslib
-    generates), each slice checked against its MD5; fixed fields, CIGARs,
-    names and qualities need no reference, and CRAMs with embedded or no
-    reference need none at all. BAM takes no reference.
+    :class:`SequenceReader` (shared, left open) or a FASTA, bgzip FASTA or
+    2bit file (opened with the same ``cache``). Its bases rebuild the
+    reads' sequences (and the MD / NM tags htslib generates), each slice
+    checked against its MD5; fixed fields, CIGARs, names and qualities
+    need no reference, and CRAMs with embedded or no reference need none
+    at all. BAM takes no reference.
+
+    CRAM decoding follows htslib's defaults: ``verify_checksums`` checks
+    block CRC32s and slice reference MD5s, ``decode_md`` generates the MD
+    and NM tags records do not store, and reads stored without a name are
+    named ``<name_prefix>:<n>`` (default: the file's name).
 
     ``cache`` optionally supplies caller-owned decoded BGZF blocks (BAM)
     or prepared containers and decoded slices (CRAM). The file, index and
@@ -95,16 +93,40 @@ class AlignmentReader(CachedReader):
         index: Bai | Csi | Crai | PathLike | None = None,
         *,
         reference: Reference | None = None,
+        verify_checksums: bool = True,
+        decode_md: bool = True,
+        name_prefix: str | None = None,
         cache: BlockCache | None = None,
     ) -> None:
         file = resolve(source, (Bam, Cram), "AlignmentReader")
-        native = _native.AlignmentReader(
-            os.fspath(file), _index(index), native_cache(cache), _reference(reference)
-        )
-        if reference is None:
-            self._open(native, file, index)
-        else:
-            self._open(native, file, index, reference=reference)
+        opened = None
+        if reference is not None and not isinstance(reference, SequenceReader):
+            opened = reference = reference_reader(reference, cache)
+        try:
+            native = _native.AlignmentReader(
+                os.fspath(file),
+                _index(index),
+                native_cache(cache),
+                None if reference is None else reference._native,
+                verify_checksums=verify_checksums,
+                decode_md=decode_md,
+                name_prefix=name_prefix,
+            )
+        finally:
+            # The native reader holds its own handle on the reference.
+            if opened is not None:
+                opened.close()
+        options = {
+            k: v
+            for k, v in (
+                ("reference", opened.source if opened is not None else reference),
+                ("verify_checksums", verify_checksums),
+                ("decode_md", decode_md),
+                ("name_prefix", name_prefix),
+            )
+            if v is not None and v is not True
+        }
+        self._open(native, file, index, **options)
         self.source = file
         chroms = native.chroms()
         self._chroms = MappingProxyType(dict(chroms))
@@ -114,29 +136,6 @@ class AlignmentReader(CachedReader):
     def set_cache(self, cache: BlockCache | None) -> None:
         """Attach externally owned query blocks, or detach them with None."""
         self._native.set_cache(native_cache(cache))
-
-    def describe_cache(
-        self, region: RegionLike, fields: Fields = NO_FIELDS
-    ) -> tuple[BlockKey, ...]:
-        """Dependencies for the region and fields; BAM uses physical BGZF
-        blocks, CRAM also distinguishes the selected data series."""
-        r = as_region(region)
-        return tuple(self._native.describe_cache(r.chrom, r.start, r.end, int(_fields(fields))))
-
-    def prefetch_cache(self, region: RegionLike, fields: Fields = NO_FIELDS) -> None:
-        """Load dependencies without constructing alignment output. For
-        CRAM, use the same fields as the subsequent fetch."""
-        r = as_region(region)
-        self._native.prefetch_cache(r.chrom, r.start, r.end, int(_fields(fields)))
-
-    def stream_stats(self) -> dict[str, int]:
-        """Physical work in this context: BAM block inflations and buffer
-        movement, or CRAM container/slice decoding and candidate records."""
-        return self._native.stream_stats()
-
-    def reset_stream_stats(self) -> None:
-        """Reset physical-work counters, retaining blocks and query state."""
-        self._native.reset_stream_stats()
 
     @property
     def chroms(self) -> Mapping[str, int]:

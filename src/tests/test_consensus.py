@@ -6,6 +6,7 @@ import pytest
 
 import omicsweave as ow
 from omicsweave import _native, errors
+from omicsweave.cache import BlockCache
 from omicsweave.formats import Bcf, Bed, Fasta, FastaWriter, GzipVcf
 from omicsweave.query import ConsensusOptions, ConsensusReader, SequenceReader
 from omicsweave.types import AllAlt, Haplotype, Region, Samples, Spliced
@@ -76,7 +77,7 @@ def test_haplotypes_and_all_alt(files):
 
 def test_batch_equals_single_queries(files):
     vcf, ref = files
-    c = ConsensusReader(vcf, ref, ConsensusOptions(chain=True))
+    c = ConsensusReader(vcf, ref, options=ConsensusOptions(chain=True))
     selectors = [Haplotype(s, h) for s in c.samples for h in "12"] + [
         AllAlt(),
         Samples(["s1", "s2"]),
@@ -92,18 +93,18 @@ def test_batch_equals_single_queries(files):
 
 def test_options(files, tmp_path):
     vcf, ref = files
-    shallow = ConsensusReader(vcf, ref, ConsensusOptions(include="DP>5"))
+    shallow = ConsensusReader(vcf, ref, options=ConsensusOptions(include="DP>5"))
     assert shallow.fetch(("chr1", 0, 40)).text == edit(snv=True, dele=True)
-    deep = ConsensusReader(vcf, ref, ConsensusOptions(exclude="DP>5"))
+    deep = ConsensusReader(vcf, ref, options=ConsensusOptions(exclude="DP>5"))
     assert deep.fetch(("chr1", 0, 40)).text == edit(ins=True)
-    iupac = ConsensusReader(vcf, ref, ConsensusOptions(iupac_codes=True))
+    iupac = ConsensusReader(vcf, ref, options=ConsensusOptions(iupac_codes=True))
     assert iupac.fetch(("chr1", 0, 10), Samples(["s1"])).text[4] == "R"
-    marked = ConsensusReader(vcf, ref, ConsensusOptions(mark_snv="lower", mark_del="-"))
+    marked = ConsensusReader(vcf, ref, options=ConsensusOptions(mark_snv="lower", mark_del="-"))
     text = marked.fetch(("chr1", 0, 40)).text
     assert text[4] == "g" and "-" in text
     mask = tmp_path / "mask.bed"
     mask.write_text("chr1\t0\t6\n")
-    masked = ConsensusReader(vcf, ref, ConsensusOptions(mask=mask))
+    masked = ConsensusReader(vcf, ref, options=ConsensusOptions(mask=mask))
     assert masked.fetch(("chr1", 0, 8)).text == "NNNNNN" + REF[6:8]
     with pytest.raises(ValueError):
         ConsensusOptions(include="DP>1", exclude="DP>2")
@@ -114,12 +115,12 @@ def test_errors_and_pickle(files):
     c = ConsensusReader(vcf, SequenceReader(ref))
     with pytest.raises(errors.InvalidError):
         c.fetch(("chr1", 0, 10), Haplotype("nobody"))
-    with pytest.raises(errors.InvalidError):
-        c.fetch(("chr1", 0, 10), Haplotype("s1", "9x"))
+    with pytest.raises(ValueError, match="not a haplotype"):
+        Haplotype("s1", "9x")
     with pytest.raises(errors.RegionOutOfRangeError):
         c.fetch(("chr1", 0, 41))
     with pytest.raises(errors.OmicsWeaveError):
-        ConsensusReader(vcf, ref, ConsensusOptions(include="NOSUCH>1"))
+        ConsensusReader(vcf, ref, options=ConsensusOptions(include="NOSUCH>1"))
     with pytest.raises(TypeError, match="Spliced"):
         c.fetch(Spliced("chr1", [(0, 4), (8, 12)], "-"))
     with pytest.raises(TypeError, match="Spliced"):
@@ -149,18 +150,23 @@ def test_file_objects_and_ownership(files):
     shared.close()
 
 
-def test_missing_index_names_the_convert_command(files, tmp_path):
+def test_missing_index_names_how_to_build_it(files, tmp_path):
     vcf, ref = files
     lone = tmp_path / "lone.bcf"
     lone.write_bytes(vcf.read_bytes())
-    with pytest.raises(errors.IoError, match="--index"):
+    with pytest.raises(errors.IoError, match=r"Bcf\.build_index\(\)"):
         ConsensusReader(lone, ref)
+    index = Bcf(lone).build_index(threads=1)
+    assert index.path == tmp_path / "lone.bcf.csi"
+    assert index.path.read_bytes() == vcf.with_name("v.bcf.csi").read_bytes()
+    with ConsensusReader(lone, ref) as c, ConsensusReader(vcf, ref) as d:
+        assert c.fetch(("chr1", 0, 40)).text == d.fetch(("chr1", 0, 40)).text
 
 
 def test_reverse_strand_reads_the_reverse_complement(files):
     vcf, ref = files
-    c = ConsensusReader(vcf, ref, ConsensusOptions(chain=True))
-    iupac = ConsensusReader(vcf, ref, ConsensusOptions(iupac_codes=True))
+    c = ConsensusReader(vcf, ref, options=ConsensusOptions(chain=True))
+    iupac = ConsensusReader(vcf, ref, options=ConsensusOptions(iupac_codes=True))
     selectors = [Haplotype(s, h) for s in c.samples for h in "12"] + [AllAlt()]
     for start, end in [(0, 40), (2, 12), (15, 25), (7, 7)]:
         forward = Region("chr1", start, end, "+")
@@ -207,3 +213,19 @@ def test_failed_constructor_closes_only_its_own_reference(files, monkeypatch, ow
     finally:
         if shared is not None:
             shared.close()
+
+
+def test_a_shared_cache_holds_bcf_and_reference_blocks(files, tmp_path):
+    vcf, ref = files
+    bgzip = ow.convert.run(ref, tmp_path / "ref.fa.gz", threads=1).target
+    cache = BlockCache(max_bytes=1 << 22)
+    region = ("chr1", 0, 40)
+    with ConsensusReader(vcf, ref) as plain:
+        want = plain.fetch(region, Haplotype("s1", "1")).text
+    with ConsensusReader(vcf, bgzip, cache=cache) as c:
+        assert c.fetch(region, Haplotype("s1", "1")).text == want
+        loaded = cache.stats()["loads"]
+        assert loaded > 0
+        with c.clone() as twin:
+            assert twin.fetch(region, Haplotype("s1", "1")).text == want
+        assert cache.stats()["loads"] == loaded

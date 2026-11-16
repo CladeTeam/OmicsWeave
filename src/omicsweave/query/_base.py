@@ -3,14 +3,82 @@ leaving a ``with`` block, and pickled as the files it was opened on."""
 
 from __future__ import annotations
 
+import os
 from typing import Any, Self
 
-from ..cache import CacheNamespace
 from ..errors import InvalidError
-from ..formats import File, PathLike, detect
+from ..formats import (
+    Bed,
+    BedGraph,
+    BedMethyl,
+    Cool,
+    File,
+    GzipBed,
+    GzipBedGraph,
+    GzipBedMethyl,
+    GzipFasta,
+    GzipJuicerShort,
+    GzipPairs,
+    GzipSam,
+    GzipVcf,
+    GzipWig,
+    JuicerShort,
+    Mcool,
+    Pairs,
+    PathLike,
+    Sam,
+    Vcf,
+    Wig,
+    detect,
+)
 from ..formats._base import ensure_format
 
 __all__ = ["Reader"]
+
+_SIZES = " --chrom-sizes <genome.sizes>"
+# What each format that is not read by region converts to: the target's
+# format, its suffix, and the options the conversion usually needs.
+_CONVERSIONS: dict[type[File], tuple[str, str, str]] = {
+    Bed: ("bigBed", ".bb", _SIZES),
+    GzipBed: ("bigBed", ".bb", _SIZES),
+    BedGraph: ("bigWig", ".bw", _SIZES),
+    GzipBedGraph: ("bigWig", ".bw", _SIZES),
+    Wig: ("bigWig", ".bw", _SIZES),
+    GzipWig: ("bigWig", ".bw", _SIZES),
+    BedMethyl: ("bigBed", ".bb", ""),
+    GzipBedMethyl: ("bigBed", ".bb", ""),
+    Vcf: ("BCF", ".bcf", " --index"),
+    GzipVcf: ("BCF", ".bcf", " --index"),
+    Sam: ("BAM", ".bam", " --index"),
+    GzipSam: ("BAM", ".bam", " --index"),
+    GzipFasta: ("bgzip FASTA", ".bgz.fa.gz", ""),
+    Cool: (".hic", ".hic", ""),
+    Mcool: (".hic", ".hic", ""),
+    Pairs: (".hic", ".hic", ""),
+    GzipPairs: (".hic", ".hic", ""),
+    JuicerShort: (".hic", ".hic", _SIZES),
+    GzipJuicerShort: (".hic", ".hic", _SIZES),
+}
+
+
+def _stem(path: str) -> str:
+    name = path[:-3] if path.endswith(".gz") else path
+    root, ext = os.path.splitext(name)
+    return root if ext else name
+
+
+def conversion(file: File) -> str | None:
+    """Why ``file`` is not read by region and the command that makes it
+    readable; ``None`` when it is read by region."""
+    known = _CONVERSIONS.get(type(file))
+    if known is None:
+        return None
+    target, suffix, options = known
+    path = os.fspath(file.path)
+    return (
+        f"{file.format} is not read by region; convert it to {target} with "
+        f"`ow convert {path} {_stem(path)}{suffix}{options}`"
+    )
 
 
 def _reopen(cls: type, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -81,15 +149,13 @@ class Reader:
 
 
 class CachedReader(Reader):
-    """A reader able to describe and reuse independently decoded blocks."""
-
-    @property
-    def cache_namespace(self) -> CacheNamespace:
-        """Process-local source session identity, shared by execution clones."""
-        return self._native.cache_namespace()
+    """A reader whose decoded blocks a :class:`~omicsweave.cache.BlockCache`
+    can hold, and that clones for threads."""
 
     def clone(self) -> Self:
-        """Share the immutable source and cache with independent execution state."""
+        """A reader of the same open file, index and cache with its own
+        decoding state, for another thread: clones decode in parallel
+        instead of taking turns."""
         native = self._native.clone_context()
         cloned = object.__new__(type(self))
         cloned.__dict__ = self.__dict__.copy()

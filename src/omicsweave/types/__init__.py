@@ -7,23 +7,28 @@
   :class:`SignalIntervals`
 - Contacts: :class:`ContactWindow` (the key), :class:`BinUnit`,
   :class:`ContactMatrix`, :class:`ContactPixels`
-- Variants: :class:`Genotypes`; :class:`AllAlt`, :class:`Samples`,
+- Variants: :class:`Variants` (:class:`Genotypes`); :class:`AllAlt`, :class:`Samples`,
   :class:`Haplotype` (:data:`Alleles`), :class:`ConsensusSequence`,
   :class:`ConsensusBatch`
-- Alignments: :class:`Alignments`, :class:`AlignmentField`, :class:`Cigars`
+- Alignments: :class:`Alignments`, :class:`AlignmentField`, :class:`Cigars`,
+  :class:`SamFlag`
 - Strings: :class:`StringVector`
 
 Results carry their key; their data are numpy arrays, in columns.
 """
 
-from ._alignment import AlignmentField, Alignments, Cigars
+from ._alignment import AlignmentField, Alignments, Cigars, SamFlag
 from ._contact import BinUnit, ContactMatrix, ContactPixels, ContactWindow
 from ._genome import STRANDS, Intervals, Locus, LocusLike, Region, RegionLike, Sequence, Spliced
 from ._signal import Signal, SignalBins, SignalIntervals, Stat
 from ._string import StringVector
 from ._variant import (
+    FLOAT_END,
+    FLOAT_MISSING,
     GT_ABSENT,
     GT_MISSING,
+    INT_END,
+    INT_MISSING,
     AllAlt,
     Alleles,
     ConsensusBatch,
@@ -31,12 +36,17 @@ from ._variant import (
     Genotypes,
     Haplotype,
     Samples,
+    Variants,
 )
 
 __all__ = [
-    "STRANDS",
+    "FLOAT_END",
+    "FLOAT_MISSING",
     "GT_ABSENT",
     "GT_MISSING",
+    "INT_END",
+    "INT_MISSING",
+    "STRANDS",
     "AlignmentField",
     "Alignments",
     "AllAlt",
@@ -55,6 +65,7 @@ __all__ = [
     "LocusLike",
     "Region",
     "RegionLike",
+    "SamFlag",
     "Samples",
     "Sequence",
     "Signal",
@@ -63,4 +74,5 @@ __all__ = [
     "Spliced",
     "Stat",
     "StringVector",
+    "Variants",
 ]

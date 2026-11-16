@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .. import _native
+from ..cache import BlockCache
+from ..cache import native as native_cache
 from ..errors import InvalidError
 from ..formats import Bcf, BgzipFasta, Csi, Fasta, File, GzipVcf, PathLike, TwoBit, Vcf, detect
 from ..types import (
@@ -21,8 +23,8 @@ from ..types import (
     Samples,
 )
 from ..types._genome import Region, Spliced, as_region
-from ._base import Reader, resolve
-from ._sequence import SequenceReader
+from ._base import CachedReader, conversion, resolve
+from ._sequence import SequenceReader, reference_reader
 
 __all__ = ["ConsensusOptions", "ConsensusReader"]
 
@@ -66,23 +68,12 @@ class ConsensusOptions:
 def _bcf(variants: Bcf | PathLike) -> Bcf:
     """``variants`` as a BCF: VCF text is not read by region."""
     file = variants if isinstance(variants, File) else detect(variants)
-    if isinstance(file, (Vcf, GzipVcf)):
-        detail = (
-            "ConsensusReader reads an indexed BCF by region, not VCF text; convert it "
-            f"with `ow convert {file.path} {_bcf_name(file)} --index`"
-        )
+    detail = conversion(file) if isinstance(file, (Vcf, GzipVcf)) else None
+    if detail is not None:
         if isinstance(variants, File):
             raise TypeError(detail)
         raise InvalidError(f"{file.path}: {detail}", what=str(file.path), detail=detail)
     return resolve(variants, (Bcf,), "ConsensusReader")
-
-
-def _bcf_name(file: Vcf | GzipVcf) -> str:
-    name = os.fspath(file.path)
-    for suffix in (".vcf.gz", ".vcf.bgz", ".vcf"):
-        if name.endswith(suffix):
-            return name[: -len(suffix)] + ".bcf"
-    return name + ".bcf"
 
 
 def _key(region: RegionLike) -> Region:
@@ -105,7 +96,7 @@ def _selector(alleles: Alleles) -> tuple[str, list[str], str | None]:
     raise TypeError(f"expected AllAlt, Samples or Haplotype, not {alleles!r}")
 
 
-class ConsensusReader(Reader):
+class ConsensusReader(CachedReader):
     """Reads personal sequences by region: the records of a BCF, read by
     region through its CSI index, applied to a reference.
 
@@ -113,10 +104,14 @@ class ConsensusReader(Reader):
     raises :class:`~omicsweave.errors.IoError`. VCF text is not read by
     region: convert it first (``ow convert cohort.vcf.gz cohort.bcf
     --index``). ``reference`` is an open :class:`SequenceReader`, shared and
-    left open, or a sequence file, which this reader opens and closes.
-    Each region decodes the records it takes once; consecutive reads of one
-    region reuse its reference and records, and :meth:`fetch_batch` builds
-    a whole batch in one call.
+    left open, or a sequence file, which this reader opens (with ``cache``)
+    and closes. ``options`` are those of ``bcftools consensus``
+    (:class:`ConsensusOptions`). Each region decodes the records it takes
+    once; consecutive reads of one region reuse its reference and records,
+    and :meth:`fetch_batch` builds a whole batch in one call.
+
+    ``cache`` holds the BCF's decoded BGZF blocks (and the reference's,
+    when this reader opens it).
 
     A region on ``"-"`` reads the reverse complement of its consensus
     (IUPAC codes complemented, case kept); the chain stays on the forward
@@ -125,42 +120,32 @@ class ConsensusReader(Reader):
 
     def __init__(
         self,
-        variants: Bcf | PathLike,
+        source: Bcf | PathLike,
         reference: SequenceReader | Fasta | BgzipFasta | TwoBit | PathLike,
-        options: ConsensusOptions | None = None,
-        *,
         index: Csi | PathLike | None = None,
+        *,
+        options: ConsensusOptions | None = None,
+        cache: BlockCache | None = None,
     ) -> None:
-        file = _bcf(variants)
+        file = _bcf(source)
         options = options or ConsensusOptions()
         given = reference
         self._owns_reference = not isinstance(reference, SequenceReader)
         if not isinstance(reference, SequenceReader):
-            reference = SequenceReader(reference)
-        o = options
+            reference = reference_reader(reference, cache)
         try:
             native = _native.ConsensusBuilder(
                 os.fspath(file),
                 None if index is None else os.fspath(index),
                 reference._native,
-                o.iupac_codes,
-                o.missing,
-                o.absent,
-                o.mark_del,
-                o.mark_ins,
-                o.mark_snv,
-                None if o.mask is None else os.fspath(o.mask),
-                o.mask_with,
-                o.regions_overlap,
-                o.chain,
-                o.include,
-                o.exclude,
+                options,
+                native_cache(cache),
             )
         except BaseException:
             if self._owns_reference:
                 reference.close()
             raise
-        self._open(native, file, given, options, index=index)
+        self._open(native, file, given, index, options=options)
         self.source = file
         self.index = detect(native.index_path)
         self.reference = reference
@@ -170,6 +155,13 @@ class ConsensusReader(Reader):
     @property
     def samples(self) -> tuple[str, ...]:
         return self._samples
+
+    def set_cache(self, cache: BlockCache | None) -> None:
+        """Attach caller-owned BCF blocks (and the reference's, when this
+        reader opened it), or detach them with None."""
+        self._native.set_cache(native_cache(cache))
+        if self._owns_reference:
+            self.reference.set_cache(cache)
 
     def fetch(self, region: RegionLike, alleles: Alleles | None = None) -> ConsensusSequence:
         """The consensus of ``region`` with ``alleles`` (default
@@ -190,7 +182,8 @@ class ConsensusReader(Reader):
         return ConsensusBatch(r, alleles, offsets, bases, tuple(chains))
 
     def clone(self) -> ConsensusReader:
-        """Share the BCF header, index and reference blocks with separate work state."""
+        """Share the BCF header, index, cache and reference blocks with
+        separate work state."""
         reference = self.reference.clone()
         try:
             native = self._native.clone_context(reference._native)

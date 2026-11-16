@@ -53,7 +53,7 @@ def test_bigbed_round_trip(tmp_path, seed):
     path = tmp_path / "f.bb"
     schema = BigBedSchema(field_count=6, auto_sql='table x\n"x"\n()\n')
     options = BbiOptions(items_per_slot=int(rng.integers(1, 30)), block_size=3)
-    with BigBedWriter(path, CHROMS, schema, options) as w:
+    with BigBedWriter(path, CHROMS, schema, options=options) as w:
         for name in CHROMS:
             rows = [r for r in features if r[0] == name]
             w.add(name, [r[1] for r in rows], [r[2] for r in rows], [r[3] for r in rows])
@@ -120,7 +120,7 @@ def test_scalar_annotation_matches_string_column(tmp_path, n, annotation):
     for name, notes in [("scalar", annotation), ("column", [annotation] * n)]:
         path = tmp_path / f"{name}.bb"
         with BigBedWriter(
-            path, {"c": 1000}, BigBedSchema(field_count=4), BbiOptions(zoom_levels=0)
+            path, {"c": 1000}, BigBedSchema(field_count=4), options=BbiOptions(zoom_levels=0)
         ) as writer:
             writer.add("c", starts, ends, notes)
         with IntervalReader(path) as reader:
@@ -139,7 +139,7 @@ def test_scalar_annotation_owns_writable_buffers(tmp_path, monkeypatch):
     monkeypatch.setattr(
         _native,
         "BigBedWriter",
-        lambda *args: SimpleNamespace(add=lambda *args: columns.append(args)),
+        lambda *args, **kwargs: SimpleNamespace(add=lambda *args: columns.append(args)),
     )
     writer = BigBedWriter(tmp_path / "buffers.bb", {"c": 100})
     writer.add("c", [1, 3], [2, 4], "héllo")

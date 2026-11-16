@@ -10,10 +10,28 @@ import numpy as np
 from ._genome import Region
 from ._string import StringVector
 
-__all__ = ["AlignmentField", "Alignments", "Cigars"]
+__all__ = ["AlignmentField", "Alignments", "Cigars", "SamFlag"]
 
 CIGAR_OPS = "MIDNSHP=X"
 """CIGAR operation letters by code (``op & 0xf``)."""
+
+
+class SamFlag(enum.IntFlag):
+    """The bits of a SAM record's FLAG (:attr:`Alignments.flag`, and the
+    read selection of :class:`omicsweave.quant.Filter`)."""
+
+    PAIRED = 0x1
+    PROPER_PAIR = 0x2
+    UNMAPPED = 0x4
+    MATE_UNMAPPED = 0x8
+    REVERSE = 0x10
+    MATE_REVERSE = 0x20
+    READ1 = 0x40
+    READ2 = 0x80
+    SECONDARY = 0x100
+    QC_FAIL = 0x200
+    DUPLICATE = 0x400
+    SUPPLEMENTARY = 0x800
 
 
 class AlignmentField(enum.IntFlag):

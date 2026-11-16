@@ -9,7 +9,7 @@ from types import MappingProxyType
 import numpy as np
 
 from .. import _native
-from ..cache import BlockCache, BlockKey
+from ..cache import BlockCache
 from ..cache import native as native_cache
 from ..errors import UnknownChromError
 from ..formats import Hic, PathLike
@@ -47,14 +47,6 @@ class ContactReader(CachedReader):
         """Attach external decoded blocks or return to direct reads."""
         self._native.set_cache(native_cache(cache))
 
-    def describe_cache(self, window: ContactWindow) -> tuple[BlockKey, ...]:
-        """The source-bound blocks required by this window."""
-        return tuple(self._native.describe_cache(_tile(window)))
-
-    def prefetch_cache(self, window: ContactWindow) -> None:
-        """Prepare reusable blocks without producing a matrix or pixels."""
-        self._native.prefetch_cache(_tile(window))
-
     @property
     def version(self) -> int:
         return self._native.version
@@ -71,6 +63,12 @@ class ContactReader(CachedReader):
     def chroms(self) -> Mapping[str, int]:
         """Chromosome lengths (base pairs) by name, in file order."""
         return self._chroms
+
+    @property
+    def maps(self) -> tuple[tuple[str, str], ...]:
+        """The chromosome pairs that have a contact map, in chromosome
+        order; a window over any other pair reads no contacts."""
+        return tuple(self._native.maps())
 
     def resolutions(self, unit: BinUnit | str = BinUnit.BP) -> tuple[int, ...]:
         """The bin sizes stored in ``unit``."""
