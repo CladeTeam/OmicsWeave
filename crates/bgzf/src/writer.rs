@@ -78,6 +78,7 @@ pub struct Writer<W: Write> {
     queued: VecDeque<u64>,
     text_pos: u64,
     blocks: Blocks,
+    catalog: bool,
     failed: bool,
 }
 
@@ -85,6 +86,23 @@ impl<W: Write> Writer<W> {
     /// A writer at libdeflate compression `level` (0 to 12) compressing on
     /// `exec`.
     pub fn new(out: W, level: i32, exec: Box<dyn Ordered<Vec<u8>>>) -> Result<Writer<W>> {
+        Self::with_catalog(out, level, exec, true)
+    }
+
+    /// A writer that keeps no per-block directory. Use this for outputs
+    /// that do not need virtual-offset indexes and finish it with
+    /// [`Writer::finish_streaming`]. In-flight buffers still follow the
+    /// supplied queue's limit; metadata does not grow with the file.
+    pub fn new_streaming(out: W, level: i32, exec: Box<dyn Ordered<Vec<u8>>>) -> Result<Writer<W>> {
+        Self::with_catalog(out, level, exec, false)
+    }
+
+    fn with_catalog(
+        out: W,
+        level: i32,
+        exec: Box<dyn Ordered<Vec<u8>>>,
+        catalog: bool,
+    ) -> Result<Writer<W>> {
         check_level(level)?;
         Ok(Writer {
             out,
@@ -95,6 +113,7 @@ impl<W: Write> Writer<W> {
             queued: VecDeque::new(),
             text_pos: 0,
             blocks: Blocks::default(),
+            catalog,
             failed: false,
         })
     }
@@ -203,7 +222,9 @@ impl<W: Write> Writer<W> {
         };
         let text = self.queued.pop_front().expect("a queued block per result");
         self.out.write_all(&block)?;
-        self.blocks.starts.push((self.blocks.end, text));
+        if self.catalog {
+            self.blocks.starts.push((self.blocks.end, text));
+        }
         self.blocks.end += block.len() as u64;
         if self.text.is_empty() && block.capacity() > self.text.capacity() {
             // The sink has consumed these compressed bytes. Their allocation
@@ -217,6 +238,27 @@ impl<W: Write> Writer<W> {
     /// Writes the last block and the end-of-file block, and returns the sink
     /// and the layout of the blocks.
     pub fn finish(mut self) -> Result<Finished<W>> {
+        if !self.catalog {
+            return Err(Error::invalid(
+                "bgzf writer",
+                "block directory disabled; use finish_streaming",
+            ));
+        }
+        self.complete()?;
+        Ok(Finished {
+            out: self.out,
+            blocks: self.blocks,
+        })
+    }
+
+    /// Writes the final data block and EOF marker and flushes the sink.
+    /// This also accepts a catalog writer, discarding its block directory.
+    pub fn finish_streaming(mut self) -> Result<W> {
+        self.complete()?;
+        Ok(self.out)
+    }
+
+    fn complete(&mut self) -> Result<()> {
         let r = self.finish_blocks();
         if r.is_err() {
             self.failed = true;
@@ -225,10 +267,7 @@ impl<W: Write> Writer<W> {
         self.out.write_all(&EOF_BLOCK)?;
         self.out.flush()?;
         self.blocks.text_len = self.text_pos;
-        Ok(Finished {
-            out: self.out,
-            blocks: self.blocks,
-        })
+        Ok(())
     }
 
     fn finish_blocks(&mut self) -> Result<()> {
@@ -316,6 +355,33 @@ mod tests {
             if i < recs.len() {
                 at += recs[i].len();
             }
+        }
+    }
+
+    #[test]
+    fn streaming_directory_capacity_does_not_grow_with_flushed_blocks() {
+        for streaming in [false, true] {
+            let queue = Box::new(Inline::new());
+            let mut writer = if streaming {
+                Writer::new_streaming(std::io::sink(), 0, queue)
+            } else {
+                Writer::new(std::io::sink(), 0, queue)
+            }
+            .unwrap();
+            for i in 0..4096 {
+                writer.write(b"x").unwrap();
+                writer.flush_block().unwrap();
+                assert_eq!(writer.tell(), Logical::new(i + 1, 0));
+                assert_eq!(writer.text_len(), i + 1);
+            }
+            if streaming {
+                assert_eq!(writer.blocks.starts.len(), 0);
+                assert_eq!(writer.blocks.starts.capacity(), 0);
+            } else {
+                assert_eq!(writer.blocks.starts.len(), 4096);
+                assert!(writer.blocks.starts.capacity() >= 4096);
+            }
+            writer.finish_streaming().unwrap();
         }
     }
 }

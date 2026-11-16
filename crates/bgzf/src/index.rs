@@ -133,11 +133,130 @@ struct Bin {
     chunks: Vec<(u64, u64)>,
 }
 
+/// Ordinary indexes use a compact direct table. CSI can represent billions
+/// of bottom-level windows without serializing that table, so unusually
+/// wide spans switch to first-offset runs instead of allocating by span.
+enum Linear {
+    Dense(Vec<u64>),
+    Sparse { len: usize, runs: Vec<(usize, u64)> },
+}
+
+impl Default for Linear {
+    fn default() -> Self {
+        Self::Dense(Vec::new())
+    }
+}
+
+impl Linear {
+    const DENSE_LIMIT: usize = 1 << 16;
+
+    fn run(runs: &mut Vec<(usize, u64)>, end: usize, offset: u64) {
+        if let Some(last) = runs.last_mut()
+            && last.1 == offset
+        {
+            last.0 = end;
+        } else {
+            runs.push((end, offset));
+        }
+    }
+
+    fn extend(&mut self, lo: usize, hi: usize, offset: u64, csi: bool) {
+        if csi
+            && hi >= Self::DENSE_LIMIT
+            && let Self::Dense(dense) = self
+        {
+            let mut runs = Vec::new();
+            for (at, &value) in dense.iter().enumerate() {
+                Self::run(&mut runs, at + 1, value);
+            }
+            *self = Self::Sparse {
+                len: dense.len(),
+                runs,
+            };
+        }
+        match self {
+            Self::Dense(dense) => {
+                let old = dense.len();
+                if old <= hi {
+                    dense.resize(hi + 1, UNSET);
+                    let from = lo.max(old);
+                    if from <= hi {
+                        dense[from..=hi].fill(offset);
+                    }
+                }
+            }
+            Self::Sparse { len, runs } => {
+                if *len <= hi {
+                    if lo > hi {
+                        // A boundary-empty interval extends the table but
+                        // covers no window and supplies no first offset.
+                        Self::run(runs, hi + 1, UNSET);
+                    } else {
+                        if lo > *len {
+                            Self::run(runs, lo, UNSET);
+                        }
+                        Self::run(runs, hi + 1, offset);
+                    }
+                    *len = hi + 1;
+                }
+            }
+        }
+    }
+
+    fn resolve(&mut self, resolve: impl Fn(u64) -> u64) {
+        match self {
+            Self::Dense(dense) => {
+                for offset in dense.iter_mut() {
+                    if *offset != UNSET {
+                        *offset = resolve(*offset);
+                    }
+                }
+                for i in (0..dense.len().saturating_sub(1)).rev() {
+                    if dense[i] == UNSET {
+                        dense[i] = dense[i + 1];
+                    }
+                }
+            }
+            Self::Sparse { runs, .. } => {
+                let mut next = UNSET;
+                for (_, offset) in runs.iter_mut().rev() {
+                    if *offset == UNSET {
+                        *offset = next;
+                    } else {
+                        *offset = resolve(*offset);
+                        next = *offset;
+                    }
+                }
+            }
+        }
+    }
+
+    fn get(&self, at: usize) -> Option<u64> {
+        match self {
+            Self::Dense(dense) => dense.get(at).copied(),
+            Self::Sparse { len, runs } => {
+                if at >= *len {
+                    None
+                } else {
+                    Some(runs[runs.partition_point(|&(end, _)| end <= at)].1)
+                }
+            }
+        }
+    }
+
+    fn dense(&self) -> &[u64] {
+        match self {
+            Self::Dense(dense) => dense,
+            Self::Sparse { .. } => unreachable!("BAI retains its serialized linear table"),
+        }
+    }
+}
+
 #[derive(Default)]
 struct RefIndex {
     present: bool,
     bins: BTreeMap<u32, Bin>,
-    linear: Vec<u64>,
+    linear: Linear,
     /// Pseudo-bin: (first offset, end offset, mapped, unmapped).
     meta: Option<(u64, u64, u64, u64)>,
 }
@@ -335,14 +454,12 @@ impl BinningIndex {
             // Within a reference `beg` never decreases, so every window
             // below the current length that this record covers was set by
             // an earlier record; only windows past the length can be new.
-            let old = r.linear.len();
-            if old < hi + 1 {
-                r.linear.resize(hi + 1, UNSET);
-                let from = lo.max(old);
-                if from <= hi {
-                    r.linear[from..=hi].fill(self.last_off);
-                }
-            }
+            r.linear.extend(
+                lo,
+                hi,
+                self.last_off,
+                matches!(self.format, IndexFormat::Csi { .. }),
+            );
         } else {
             self.n_no_coor += 1;
         }
@@ -390,11 +507,7 @@ impl BinningIndex {
         let resolve = |v: u64| blocks.resolve(Logical(v));
         let (n_bins, levels) = (self.n_bins, self.levels);
         for r in &mut self.refs {
-            for slot in &mut r.linear {
-                if *slot != UNSET {
-                    *slot = resolve(*slot);
-                }
-            }
+            r.linear.resolve(resolve);
             for bin in r.bins.values_mut() {
                 for c in &mut bin.chunks {
                     *c = (resolve(c.0), resolve(c.1));
@@ -404,16 +517,10 @@ impl BinningIndex {
                 m.0 = resolve(m.0);
                 m.1 = resolve(m.1);
             }
-            // update_loff
-            for l in (0..r.linear.len().saturating_sub(1)).rev() {
-                if r.linear[l] == UNSET {
-                    r.linear[l] = r.linear[l + 1];
-                }
-            }
             for (&key, bin) in r.bins.iter_mut() {
                 let bot = bin_bot(key, levels) as usize;
-                bin.loff = if key < n_bins && bot < r.linear.len() {
-                    r.linear[bot]
+                bin.loff = if key < n_bins {
+                    r.linear.get(bot).unwrap_or(0)
                 } else {
                     0
                 };
@@ -458,8 +565,9 @@ impl BinningIndex {
                 }
             }
             if !csi {
-                body.extend_from_slice(&(r.linear.len() as i32).to_le_bytes());
-                for &o in &r.linear {
+                let linear = r.linear.dense();
+                body.extend_from_slice(&(linear.len() as i32).to_le_bytes());
+                for &o in linear {
                     body.extend_from_slice(&o.to_le_bytes());
                 }
             }
@@ -537,5 +645,129 @@ mod tests {
         assert_eq!(try_csi_levels(1 << 31, 14).unwrap(), (14, 6));
         assert_eq!(try_csi_levels(0, 14).unwrap(), (14, 0));
         assert_eq!(try_csi_levels(1 << 50, 14).unwrap(), (24, 9));
+    }
+
+    #[test]
+    fn sparse_first_offsets_match_dense_sorted_records_and_gap_resolution() {
+        for seed in 0..64u64 {
+            let mut sparse = Linear::Sparse {
+                len: 0,
+                runs: Vec::new(),
+            };
+            let mut dense = Vec::new();
+            let mut start = 0;
+            let mut rng = seed + 1;
+            for record in 0..200 {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                start += (rng >> 59) as usize;
+                let end = start + ((rng >> 32) as usize % 300);
+                let offset = record * 17 + 1;
+                if dense.len() <= end {
+                    dense.resize(end + 1, UNSET);
+                }
+                for value in &mut dense[start..=end] {
+                    if *value == UNSET {
+                        *value = offset;
+                    }
+                }
+                sparse.extend(start, end, offset, true);
+            }
+            for (i, &value) in dense.iter().enumerate() {
+                assert_eq!(sparse.get(i), Some(value));
+            }
+            let resolve = |value| value * 3 + 11;
+            sparse.resolve(resolve);
+            for value in &mut dense {
+                if *value != UNSET {
+                    *value = resolve(*value);
+                }
+            }
+            for i in (0..dense.len().saturating_sub(1)).rev() {
+                if dense[i] == UNSET {
+                    dense[i] = dense[i + 1];
+                }
+            }
+            for (i, &value) in dense.iter().enumerate() {
+                assert_eq!(sparse.get(i), Some(value));
+            }
+            assert_eq!(sparse.get(dense.len()), None);
+        }
+    }
+
+    #[test]
+    fn csi_wide_spans_use_bounded_runs_while_bai_remains_dense() {
+        let mut csi = Linear::default();
+        csi.extend(10, 20, 7, true);
+        csi.extend(1_000_000_000, 1_000_000_100, 9, true);
+        let Linear::Sparse { len, runs } = &csi else {
+            panic!("expected sparse CSI windows")
+        };
+        assert_eq!(*len, 1_000_000_101);
+        assert_eq!(runs.len(), 4);
+        assert!(runs.capacity() <= 8);
+        assert_eq!(csi.get(10), Some(7));
+        assert_eq!(csi.get(500_000_000), Some(UNSET));
+        csi.resolve(|value| value);
+        assert_eq!(csi.get(0), Some(7));
+        assert_eq!(csi.get(500_000_000), Some(9));
+
+        let mut bai = Linear::default();
+        bai.extend(0, Linear::DENSE_LIMIT + 10, 7, false);
+        assert!(matches!(bai, Linear::Dense(_)));
+    }
+
+    #[test]
+    fn sparse_empty_windows_and_unset_tails_match_dense_offsets() {
+        let limit = Linear::DENSE_LIMIT;
+        let cases = [
+            vec![(limit + 2, limit + 1, 7)],
+            vec![(limit, limit - 1, 5), (limit + 2, limit + 1, 7)],
+            vec![(limit + 2, limit + 1, 7), (limit + 10, limit + 9, 11)],
+            vec![(3, 7, 1), (limit + 2, limit + 1, 7)],
+            vec![(0, limit + 20, 1), (limit + 8, limit + 7, 7)],
+            vec![(0, limit + 1, 1), (limit + 8, limit + 7, 7)],
+            vec![
+                (0, limit + 1, 1),
+                (limit + 8, limit + 7, 7),
+                (limit + 9, limit + 10, 11),
+            ],
+            vec![(limit + 2, limit + 1, 7), (limit + 2, limit + 2, 11)],
+        ];
+        for records in cases {
+            let mut actual = Linear::default();
+            let mut expected = Vec::new();
+            for (lo, hi, offset) in records {
+                expected.resize(expected.len().max(hi + 1), UNSET);
+                if lo <= hi {
+                    for value in &mut expected[lo..=hi] {
+                        if *value == UNSET {
+                            *value = offset;
+                        }
+                    }
+                }
+                actual.extend(lo, hi, offset, true);
+            }
+            for (i, &offset) in expected.iter().enumerate() {
+                assert_eq!(actual.get(i), Some(offset));
+            }
+            actual.resolve(|offset| offset * 3 + 1);
+            for offset in &mut expected {
+                if *offset != UNSET {
+                    *offset = *offset * 3 + 1;
+                }
+            }
+            for i in (0..expected.len().saturating_sub(1)).rev() {
+                if expected[i] == UNSET {
+                    expected[i] = expected[i + 1];
+                }
+            }
+            for (i, &offset) in expected.iter().enumerate() {
+                assert_eq!(actual.get(i), Some(offset));
+            }
+            let Linear::Sparse { runs, .. } = actual else {
+                panic!("expected sparse")
+            };
+            assert!(runs.windows(2).all(|w| w[0].0 < w[1].0));
+        }
     }
 }

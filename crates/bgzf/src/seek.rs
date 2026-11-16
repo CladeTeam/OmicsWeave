@@ -48,7 +48,7 @@ fn cache_chunks(chunks: &[Chunk]) -> Result<Cow<'_, [Chunk]>> {
     {
         return Ok(Cow::Borrowed(chunks));
     }
-    let mut merged: Vec<Chunk> = Vec::with_capacity(chunks.len());
+    let mut merged: Vec<Chunk> = Vec::new();
     for &chunk in chunks {
         if chunk.start == chunk.end {
             continue;
@@ -457,6 +457,7 @@ impl SeekReader {
         let original = chunks;
         let chunks = cache_chunks(chunks)?;
         let merged = matches!(&chunks, Cow::Owned(_));
+        let ordered = chunks.windows(2).all(|pair| pair[0].start <= pair[1].start);
         let mut cursor = 0;
         for chunk in chunks.iter() {
             if chunk.start == chunk.end {
@@ -466,7 +467,7 @@ impl SeekReader {
             self.window = window(at, chunk.end);
             while (at << 16) < chunk.end {
                 let key = self.key(at);
-                if seen.insert(key) {
+                if ordered || seen.insert(key) {
                     out.push(key);
                 }
                 let cached = match &self.cache {

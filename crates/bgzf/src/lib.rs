@@ -8,6 +8,7 @@
 //!   and writes them in order; positions it reports are
 //!   [`Logical`] offsets that [`Blocks::resolve`] turns into virtual
 //!   offsets once the file is written.
+//!   [`Writer::new_streaming`] omits that directory for non-indexed output.
 //! - [`Reader`]: inflates consecutive blocks of a stream ahead of the
 //!   reader through an [`omicsweave_core::exec`] queue.
 //! - [`BinningIndex`]: the BAI / CSI index htslib builds from the same

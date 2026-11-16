@@ -489,9 +489,11 @@ name = "omicsweave-bgzf"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "htslib-sys",
  "libdeflater",
  "omicsweave-core",
  "proptest",
+ "tempfile",
 ]
 
 [[package]]
