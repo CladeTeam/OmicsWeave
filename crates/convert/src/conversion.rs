@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use omicsweave_bbi::WriteOptions;
 use omicsweave_core::exec::Pool;
 use omicsweave_core::{Error, Result};
 
@@ -95,6 +96,15 @@ pub struct Options {
     /// CRAM to BAM: the reference the CRAM was compressed against (FASTA
     /// with `.fai`, bgzip FASTA with `.fai` and `.gzi`, or 2bit).
     pub reference: Option<PathBuf>,
+    /// BAM `.csi` (`index` [`Index::Csi`]): bins of `2^min_shift` bases
+    /// instead of `2^14`.
+    pub min_shift: Option<u32>,
+    /// CRAM to BAM: check block CRC32s and each slice's reference MD5, as
+    /// htslib does unless told to ignore them.
+    pub verify_checksums: bool,
+    /// bigBed, bigWig: how blocks, the index and zoom levels are written;
+    /// `level` still sets the compression level when given.
+    pub bbi: Option<WriteOptions>,
 }
 
 impl Default for Options {
@@ -107,10 +117,13 @@ impl Default for Options {
             value: None,
             mod_code: None,
             strand: None,
-            sidecar: true,
+            sidecar: false,
             add_contigs: false,
             sort: false,
             reference: None,
+            min_shift: None,
+            verify_checksums: true,
+            bbi: None,
         }
     }
 }
@@ -249,6 +262,64 @@ impl Conversion {
             "reference",
             self,
         )?;
+        takes(
+            !o.verify_checksums,
+            matches!(self, Conversion::CramToBam(_)),
+            "verify_checksums",
+            self,
+        )?;
+        let bam = matches!(
+            self,
+            Conversion::SamToBam(_) | Conversion::BamSort(_) | Conversion::CramToBam(_)
+        );
+        takes(
+            o.min_shift.is_some(),
+            bam && o.index == Some(Index::Csi),
+            "min_shift",
+            self,
+        )?;
+        takes(
+            o.bbi.is_some(),
+            matches!(
+                self,
+                Conversion::BedToBigBed(_)
+                    | Conversion::BedGraphToBigWig(_)
+                    | Conversion::WigToBigWig(_)
+                    | Conversion::BedMethylToBigBed(_)
+                    | Conversion::BedMethylToBigWig(_)
+            ),
+            "bbi",
+            self,
+        )?;
+        takes(
+            o.sidecar,
+            matches!(
+                self,
+                Conversion::BedToBigBed(_)
+                    | Conversion::BedGraphToBigWig(_)
+                    | Conversion::WigToBigWig(_)
+                    | Conversion::BedMethylToBigBed(_)
+                    | Conversion::BedMethylToBigWig(_)
+                    | Conversion::CoolToHic(_)
+                    | Conversion::PairsToHic(_)
+            ),
+            "sidecar",
+            self,
+        )?;
+        let bam_index = |index: Option<Index>| match index {
+            None => BamIndex::None,
+            Some(Index::Auto) => BamIndex::Auto,
+            Some(Index::Bai) => BamIndex::Bai,
+            Some(Index::Csi) => BamIndex::Csi {
+                min_shift: o.min_shift.unwrap_or(14),
+            },
+        };
+        let bbi = |options: &mut WriteOptions| {
+            if let Some(b) = &o.bbi {
+                *options = b.clone();
+            }
+            options.level = o.level.unwrap_or(options.level);
+        };
         match self {
             Conversion::FastaToBgzipFasta(c) => c.level = o.level.unwrap_or(c.level),
             Conversion::FastaToTwoBit(_) => {}
@@ -268,22 +339,13 @@ impl Conversion {
             }
             Conversion::SamToBam(c) => {
                 c.level = o.level.unwrap_or(c.level);
-                c.index = match o.index {
-                    None => BamIndex::None,
-                    Some(Index::Auto) => BamIndex::Auto,
-                    Some(Index::Bai) => BamIndex::Bai,
-                    Some(Index::Csi) => BamIndex::Csi { min_shift: 14 },
-                };
+                c.index = bam_index(o.index);
             }
             Conversion::CramToBam(c) => {
                 c.level = o.level.unwrap_or(c.level);
                 c.reference = o.reference.clone();
-                c.index = match o.index {
-                    None => BamIndex::None,
-                    Some(Index::Auto) => BamIndex::Auto,
-                    Some(Index::Bai) => BamIndex::Bai,
-                    Some(Index::Csi) => BamIndex::Csi { min_shift: 14 },
-                };
+                c.verify_checksums = o.verify_checksums;
+                c.index = bam_index(o.index);
             }
             Conversion::BamSort(c) => {
                 if !o.sort {
@@ -298,32 +360,27 @@ impl Conversion {
                     ));
                 }
                 c.level = o.level.unwrap_or(c.level);
-                c.index = match o.index {
-                    None => BamIndex::None,
-                    Some(Index::Auto) => BamIndex::Auto,
-                    Some(Index::Bai) => BamIndex::Bai,
-                    Some(Index::Csi) => BamIndex::Csi { min_shift: 14 },
-                };
+                c.index = bam_index(o.index);
             }
             Conversion::BedToBigBed(c) => {
                 if let Some(p) = &o.chrom_sizes {
                     c.chrom_sizes = ChromSizes::File(p.clone());
                 }
-                c.options.level = o.level.unwrap_or(c.options.level);
+                bbi(&mut c.options);
                 c.sidecar = o.sidecar;
             }
             Conversion::BedGraphToBigWig(c) => {
                 if let Some(p) = &o.chrom_sizes {
                     c.chrom_sizes = ChromSizes::File(p.clone());
                 }
-                c.options.level = o.level.unwrap_or(c.options.level);
+                bbi(&mut c.options);
                 c.sidecar = o.sidecar;
             }
             Conversion::WigToBigWig(c) => {
                 if let Some(p) = &o.chrom_sizes {
                     c.chrom_sizes = ChromSizes::File(p.clone());
                 }
-                c.options.level = o.level.unwrap_or(c.options.level);
+                bbi(&mut c.options);
                 c.sidecar = o.sidecar;
             }
             Conversion::CoolToHic(c) => {
@@ -347,7 +404,7 @@ impl Conversion {
                 if let Some(p) = &o.chrom_sizes {
                     c.chrom_sizes = ChromSizes::File(p.clone());
                 }
-                c.options.level = o.level.unwrap_or(c.options.level);
+                bbi(&mut c.options);
                 c.sidecar = o.sidecar;
             }
             Conversion::BedMethylToBigWig(c) => {
@@ -359,7 +416,7 @@ impl Conversion {
                 }
                 c.mod_code = o.mod_code.clone();
                 c.strand = o.strand.as_deref().map(Strand::from_name).transpose()?;
-                c.options.level = o.level.unwrap_or(c.options.level);
+                bbi(&mut c.options);
                 c.sidecar = o.sidecar;
             }
         }

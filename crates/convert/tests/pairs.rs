@@ -239,6 +239,7 @@ fn pairs_match_the_builder_in_memory_and_spilled() {
         .count() as u64;
     let options = Options {
         resolutions: Some(resolutions.clone()),
+        sidecar: true,
         ..Options::default()
     };
     for storage in STORAGES {

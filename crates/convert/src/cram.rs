@@ -39,6 +39,8 @@ pub struct CramToBam {
     pub level: i32,
     pub index: BamIndex,
     pub reference: Option<PathBuf>,
+    /// Check block CRC32s and slice reference MD5s.
+    pub verify_checksums: bool,
 }
 
 /// Bytes a slice holds in flight: its share of the container and the BAM
@@ -124,6 +126,7 @@ impl CramToBam {
             level: omicsweave_bgzf::DEFAULT_LEVEL,
             index: BamIndex::None,
             reference: None,
+            verify_checksums: true,
         }
     }
 
@@ -182,6 +185,7 @@ impl CramToBam {
                 .file_name()
                 .map(|n| n.to_string_lossy().as_bytes().to_vec())
                 .unwrap_or_default(),
+            verify_checksums: self.verify_checksums,
             ..CramOptions::default()
         });
         let sam = header.sam();

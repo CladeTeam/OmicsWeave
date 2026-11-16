@@ -81,6 +81,11 @@ fn bcf_matches_htslib_with_its_index() {
         std::fs::write(&plain, &text).unwrap();
         let reference = dir.path().join("ref.bcf");
         hts::bcf_of(&plain, &reference);
+        // A BCF htslib wrote, blocks cut where htslib cuts them.
+        let built = omicsweave_vcf::build_index_file(&reference, 14, 1).unwrap();
+        let theirs = dir.path().join("ref.htslib.csi");
+        hts::bcf_index(&reference, &theirs);
+        assert_eq!(hts::parse_index(&built), hts::parse_index(&theirs));
         let want = inflate(&reference);
         let mut first: Option<(Vec<u8>, Vec<u8>)> = None;
         for storage in STORAGES {
@@ -96,6 +101,14 @@ fn bcf_matches_htslib_with_its_index() {
                 let theirs = dir.path().join("theirs.csi");
                 hts::bcf_index(&dst, &theirs);
                 assert_eq!(hts::parse_index(&ours), hts::parse_index(&theirs));
+                // Indexing the written file gives the index written with it.
+                let rebuilt = omicsweave_vcf::build_index(
+                    std::fs::File::open(&dst).unwrap(),
+                    omicsweave_bgzf::inflate_queue(2),
+                    omicsweave_vcf::CSI_MIN_SHIFT,
+                )
+                .unwrap();
+                assert_eq!(rebuilt, std::fs::read(&ours).unwrap());
                 let files = (std::fs::read(&dst).unwrap(), std::fs::read(&ours).unwrap());
                 match &first {
                     None => first = Some(files),
@@ -169,4 +182,26 @@ fn undeclared_contigs_fail_without_output() {
     .unwrap_err();
     assert!(err.to_string().contains("line 3"), "{err}");
     assert!(!dst.exists());
+}
+
+#[test]
+fn unsorted_bcf_is_not_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("u.vcf");
+    std::fs::write(
+        &src,
+        "##fileformat=VCFv4.2\n##contig=<ID=c,length=100>\n\
+         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+         c\t50\t.\tA\tG\t.\t.\t.\nc\t10\t.\tA\tG\t.\t.\t.\n",
+    )
+    .unwrap();
+    let dst = dir.path().join("u.bcf");
+    convert(
+        Conversion::VcfToBcf(VcfToBcf::new(&src, &dst)),
+        budgets()[0].clone(),
+        None,
+    )
+    .unwrap();
+    assert!(omicsweave_vcf::build_index_file(&dst, 14, 1).is_err());
+    assert!(!dir.path().join("u.bcf.csi").exists());
 }
