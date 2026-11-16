@@ -11,10 +11,13 @@
 //!   bases of a record without qualities): `ref` when it is the REF base,
 //!   `alt` the ALT base, `other` any other of `A`, `C`, `G`, `T` (`N`
 //!   observes nothing). Deletions and introns over a site observe nothing.
-//! - **Units**: with `umi`, distinct UMIs (exact values of `umi_tag`; reads
+//! - **Units**: with `umi`, keys of `umi_tag` (reads
 //!   without one are not counted) per row, site and allele; otherwise
 //!   distinct read names, so both mates of a pair count once. A unit whose
 //!   reads disagree counts in each allele it shows.
+//!   Uppercase ACGT UMIs of at most 31 bases are packed losslessly;
+//!   other UMIs use a 63-bit fingerprint, read-name units a 64-bit
+//!   fingerprint. Fingerprint collisions are not resolved.
 //! - **Rows**: a tag (`CB`), the read group or the input file, optionally
 //!   a whitelist.
 //! - **Gene-level ASE** (`genes`): at sites where the phasing sample is
@@ -43,7 +46,9 @@ use super::coverage::Tally;
 use super::velocity::{EXONIC, INTRONIC};
 use super::{Accumulator, BatchInfo, Delivery, MemoryNeed, Needs, PlanInfo, RunCtx};
 use crate::assign::{Query, SpaceId};
-use crate::model::{BarcodeTable, Cells, CountMatrix, FeatureList, FeatureTable, VariantTable};
+use crate::model::{
+    BarcodeTable, Cells, CountMatrix, FeatureList, FeatureTable, Site, VariantTable,
+};
 use crate::prelude::{Filter, ReadView, Strandedness, fnv, umi_key};
 use crate::reference::SitePanel;
 use crate::sink::json::Json;
@@ -181,6 +186,27 @@ impl AlleleStage {
     }
 }
 
+/// Visits panel columns only within aligned segments, in panel order.
+fn aligned_sites(
+    sites: &[Site],
+    segments: &[(u32, u32, u32)],
+    mut visit: impl FnMut(usize, &Site, u32),
+) {
+    let mut at = 0;
+    for &(start, query, len) in segments {
+        at += sites[at..].partition_point(|s| s.pos < start);
+        let end = start.saturating_add(len);
+        while let Some(site) = sites.get(at)
+            && site.pos < end
+        {
+            if let Some(q) = query.checked_add(site.pos - start) {
+                visit(at, site, q);
+            }
+            at += 1;
+        }
+    }
+}
+
 impl Accumulator for AlleleStage {
     type Batch = AlleleBatch;
     type Total<'p> = AlleleTotal<'p>;
@@ -237,6 +263,10 @@ impl Accumulator for AlleleStage {
         if sites.get(at).is_none_or(|s| s.pos >= hi) {
             return Ok(());
         }
+        if r.rec.l_seq() == 0 {
+            return Ok(());
+        }
+        let end = at + sites[at..].partition_point(|s| s.pos < hi);
         let Some(row) = self.rows.of(r, &mut b.local) else {
             b.status.no_row += 1;
             return Ok(());
@@ -256,14 +286,16 @@ impl Accumulator for AlleleStage {
         let no_qual = qual.first() == Some(&0xff);
         let mut haps = 0u32;
         let mut observed = 0u64;
-        for (k, s) in sites[at..].iter().enumerate() {
-            if s.pos >= hi {
-                break;
+        aligned_sites(&sites[at..end], r.segments(), |k, s, q| {
+            let Some(&quality) = qual.get(q as usize) else {
+                return;
+            };
+            if q as usize >= r.rec.l_seq() {
+                return;
             }
-            let Some(q) = r.query_at(s.pos) else { continue };
-            if !no_qual && qual[q as usize] < self.spec.min_quality {
+            if !no_qual && quality < self.spec.min_quality {
                 b.status.low_quality += 1;
-                continue;
+                return;
             }
             let base = match r.base(q as usize) {
                 b'=' => s.reference,
@@ -276,7 +308,7 @@ impl Accumulator for AlleleStage {
             } else if matches!(base, b'A' | b'C' | b'G' | b'T') {
                 2
             } else {
-                continue;
+                return;
             };
             observed += 1;
             b.variants.push(Entry {
@@ -289,7 +321,7 @@ impl Accumulator for AlleleStage {
             if let (Some(h), true) = (s.hap1, allele < 2) {
                 haps |= if allele as u8 == h { EXONIC } else { INTRONIC };
             }
-        }
+        });
         if observed > 0 {
             b.status.reads += 1;
             b.status.observations += observed;
@@ -499,5 +531,71 @@ impl Accumulator for AlleleStage {
         fields.extend(tally.json());
         fields.push(("files", Json::Arr(files)));
         Ok(Json::obj(fields))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aligned_panel_sites_match_naive_per_site_mapping() {
+        for step in [1, 3, 17] {
+            let mut sites = Vec::new();
+            for p in 0..1000 {
+                let site = Site {
+                    contig: 0,
+                    pos: p * step,
+                    reference: b'A',
+                    alt: b'C',
+                    hap1: None,
+                };
+                sites.push(site);
+                if p % 13 == 0 {
+                    sites.push(site);
+                }
+            }
+            let cases: [Vec<(u32, u32, u32)>; 5] = [
+                vec![],
+                vec![(0, 0, 1)],
+                vec![(10, 0, 7), (17, 9, 5)],
+                vec![(100, 2, 10), (10_000, 13, 10)],
+                vec![(u32::MAX - 3, 0, 8)],
+            ];
+            for segments in cases {
+                let want: Vec<_> = sites
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| {
+                        segments
+                            .iter()
+                            .find_map(|&(r, q, len)| {
+                                s.pos
+                                    .checked_sub(r)
+                                    .filter(|&d| d < len)
+                                    .and_then(|d| q.checked_add(d))
+                            })
+                            .map(|q| (i, q))
+                    })
+                    .collect();
+                let mut got = Vec::new();
+                aligned_sites(&sites, &segments, |i, _, q| got.push((i, q)));
+                assert_eq!(got, want);
+            }
+        }
+        let sites: Vec<_> = (0..100_000)
+            .map(|pos| Site {
+                contig: 0,
+                pos,
+                reference: b'A',
+                alt: b'C',
+                hap1: None,
+            })
+            .collect();
+        let mut got = Vec::new();
+        aligned_sites(&sites, &[(0, 0, 1), (99_999, 1, 1)], |i, _, q| {
+            got.push((i, q))
+        });
+        assert_eq!(got, [(0, 0), (99_999, 1)]);
     }
 }

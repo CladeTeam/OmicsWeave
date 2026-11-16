@@ -49,15 +49,34 @@ pub struct GzText {
 impl GzText {
     /// Creates `path` (kind `kind`) among the delivery's outputs.
     pub fn create(d: &mut Delivery<'_>, path: &Path, kind: &'static str) -> Result<GzText> {
+        Self::create_mode(d, path, kind, true)
+    }
+
+    /// Writes text without retaining a directory of all physical BGZF blocks.
+    /// Use [`GzText::close`] when no tabix/GZI index is needed.
+    pub fn create_unindexed(
+        d: &mut Delivery<'_>,
+        path: &Path,
+        kind: &'static str,
+    ) -> Result<GzText> {
+        Self::create_mode(d, path, kind, false)
+    }
+
+    fn create_mode(
+        d: &mut Delivery<'_>,
+        path: &Path,
+        kind: &'static str,
+        indexed: bool,
+    ) -> Result<GzText> {
         let file = d.outputs.create(path, kind)?;
         let limit = 4 * d.pool.threads();
-        Ok(GzText {
-            w: Writer::new(
-                BufWriter::with_capacity(1 << 20, file),
-                TEXT_LEVEL,
-                Box::new(d.pool.ordered(limit)),
-            )?,
-        })
+        let out = BufWriter::with_capacity(1 << 20, file);
+        let w = if indexed {
+            Writer::new(out, TEXT_LEVEL, Box::new(d.pool.ordered(limit)))?
+        } else {
+            Writer::new_streaming(out, TEXT_LEVEL, Box::new(d.pool.ordered(limit)))?
+        };
+        Ok(GzText { w })
     }
 
     #[inline]
@@ -74,6 +93,8 @@ impl GzText {
         self.w.flush_block()
     }
 
+    /// Returns the block directory created by [`GzText::create`].
+    /// Unindexed text must be completed with [`GzText::close`] instead.
     pub fn finish(self) -> Result<Finished<BufWriter<File>>> {
         let done = self.w.finish()?;
         Ok(done)
@@ -81,15 +102,15 @@ impl GzText {
 
     /// Finishes and flushes the file.
     pub fn close(self) -> Result<()> {
-        let done = self.finish()?;
-        done.out.into_inner().map_err(|e| e.into_error())?;
+        let out = self.w.finish_streaming()?;
+        out.into_inner().map_err(|e| e.into_error())?;
         Ok(())
     }
 }
 
 /// `text` as a BGZF file at `path`.
 pub fn write_gz(d: &mut Delivery<'_>, path: &Path, kind: &'static str, text: &[u8]) -> Result<()> {
-    let mut g = GzText::create(d, path, kind)?;
+    let mut g = GzText::create_unindexed(d, path, kind)?;
     g.write(text)?;
     g.close()
 }
@@ -108,4 +129,83 @@ pub(crate) fn push_u64(out: &mut Vec<u8>, mut v: u64) {
         }
     }
     out.extend_from_slice(&buf[i..]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omicsweave_convert::stage::Outputs;
+    use omicsweave_core::exec::Pool;
+    use std::io::Read;
+
+    #[test]
+    fn unindexed_text_preserves_members_plaintext_and_logical_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Pool::new(2);
+        for len in [0usize, 400_003] {
+            let text: Vec<u8> = (0..len).map(|i| ((i * 37 + i / 31) % 251) as u8).collect();
+            let mut results = Vec::new();
+            let mut positions = Vec::new();
+            for indexed in [true, false] {
+                let path = dir.path().join(format!("text-{len}-{indexed}.gz"));
+                let mut outputs = Outputs::new();
+                let mut delivery = Delivery {
+                    outputs: &mut outputs,
+                    dir: dir.path(),
+                    pool: &pool,
+                    matrix: crate::task::MatrixFormat::Mtx,
+                    tmp: dir.path(),
+                    buffer: 4 << 20,
+                };
+                let mut g = if indexed {
+                    GzText::create(&mut delivery, &path, "text")
+                } else {
+                    GzText::create_unindexed(&mut delivery, &path, "text")
+                }
+                .unwrap();
+                let mut tells = vec![(g.tell(), 0u64)];
+                let mut written = 0;
+                for (i, chunk) in text.chunks(5000).enumerate() {
+                    g.write(chunk).unwrap();
+                    written += chunk.len();
+                    if i % 3 == 0 {
+                        g.flush_block().unwrap();
+                    }
+                    if i % 17 == 0 {
+                        g.w.sync().unwrap();
+                    }
+                    tells.push((g.tell(), written as u64));
+                }
+                if indexed {
+                    let done = g.finish().unwrap();
+                    assert_eq!(done.blocks.text_len, len as u64);
+                    for &(logical, text_at) in &tells {
+                        let physical = done.blocks.resolve(logical);
+                        let start = done
+                            .blocks
+                            .starts
+                            .iter()
+                            .find(|&&(c, _)| c == physical >> 16)
+                            .map_or(done.blocks.text_len, |&(_, t)| t);
+                        assert_eq!(start + (physical & 0xffff), text_at);
+                    }
+                    done.out.into_inner().unwrap();
+                } else {
+                    g.close().unwrap();
+                }
+                outputs.commit().unwrap();
+                let data = std::fs::read(path).unwrap();
+                assert!(data.ends_with(&omicsweave_bgzf::EOF_BLOCK));
+                let mut plain = Vec::new();
+                flate2::read::MultiGzDecoder::new(&data[..])
+                    .read_to_end(&mut plain)
+                    .unwrap();
+                assert_eq!(plain, text);
+                results.push(data);
+                positions.push(tells);
+            }
+            assert_eq!(results[0], results[1]);
+            assert_eq!(positions[0], positions[1]);
+        }
+    }
 }

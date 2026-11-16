@@ -43,7 +43,7 @@ impl Input {
             detail: format!("{}: {e}", path.display()),
         })?;
         let len = file.metadata()?.len();
-        let mut scan = Scanner::new(
+        let mut scan = Scanner::new_streaming(
             BufReader::with_capacity(1 << 16, file),
             Box::new(Inline::new()),
         );
@@ -133,7 +133,7 @@ impl BatchReader<BufReader<File>> {
         target: usize,
     ) -> Result<BatchReader<BufReader<File>>> {
         let file = File::open(&input.path)?;
-        let mut scan = Scanner::new(BufReader::with_capacity(1 << 20, file), exec);
+        let mut scan = Scanner::new_streaming(BufReader::with_capacity(1 << 20, file), exec);
         scan.header().map_err(|e| with_input(e, &input.path))?;
         Ok(BatchReader {
             scan,

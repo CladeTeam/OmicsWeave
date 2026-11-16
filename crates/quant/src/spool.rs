@@ -7,7 +7,9 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use omicsweave_convert::stage::TempDir;
+use omicsweave_convert::stage::{Sorter, Spill};
 use omicsweave_core::Result;
+use omicsweave_core::exec::Pool;
 
 /// A record of a fixed number of bytes.
 pub trait Fixed: Sized + Send + 'static {
@@ -58,15 +60,32 @@ impl<T: Fixed> Spool<T> {
             let path = dir.path().join("spool");
             let f = File::create(&path)?;
             self.dir = Some(dir);
-            self.file = Some((path, BufWriter::with_capacity(1 << 20, f)));
+            let buffer = self.limit.saturating_mul(T::SIZE).clamp(1, 1 << 20);
+            self.file = Some((path, BufWriter::with_capacity(buffer, f)));
         }
         let (_, w) = self.file.as_mut().expect("created above");
+        let bytes = self.mem.len().saturating_mul(T::SIZE) as u64;
         let mut buf = vec![0u8; T::SIZE];
         for r in self.mem.drain(..) {
             r.put(&mut buf);
             w.write_all(&buf)?;
         }
-        self.spilled += (self.limit * T::SIZE) as u64;
+        self.spilled += bytes;
+        Ok(())
+    }
+
+    /// Releases buffered records before another stage takes over their budget.
+    pub(crate) fn stream_to_disk(&mut self) -> Result<()> {
+        if !self.mem.is_empty() {
+            self.spill()?;
+        }
+        self.mem = Vec::new();
+        self.limit = 1024;
+        if let Some((path, writer)) = self.file.take() {
+            let file = writer.into_inner().map_err(|e| e.into_error())?;
+            let buffer = self.limit.saturating_mul(T::SIZE).clamp(1, 64 << 10);
+            self.file = Some((path, BufWriter::with_capacity(buffer, file)));
+        }
         Ok(())
     }
 
@@ -78,9 +97,13 @@ impl<T: Fixed> Spool<T> {
         self.len == 0
     }
 
-    /// Bytes written to the spill file so far.
+    /// Bytes written to spill storage so far, including deferred sorting.
     pub fn spilled(&self) -> u64 {
         self.spilled
+    }
+
+    pub(crate) fn account_spilled(&mut self, bytes: u64) {
+        self.spilled = self.spilled.saturating_add(bytes);
     }
 
     /// The records, to be read once in order.
@@ -88,7 +111,8 @@ impl<T: Fixed> Spool<T> {
         let file = match self.file.take() {
             Some((path, w)) => {
                 w.into_inner().map_err(|e| e.into_error())?;
-                Some(BufReader::with_capacity(1 << 20, File::open(path)?))
+                let buffer = self.limit.saturating_mul(T::SIZE).clamp(4096, 1 << 20);
+                Some(BufReader::with_capacity(buffer, File::open(path)?))
             }
             None => None,
         };
@@ -100,6 +124,43 @@ impl<T: Fixed> Spool<T> {
             _dir: self.dir.take(),
         })
     }
+}
+
+/// Sorts deferred records while borrowing the worker pool only for this call.
+pub(crate) fn sort_spooled<T: Fixed + Spill>(
+    spool: Spool<T>,
+    pool: &Pool,
+    limit: u64,
+    parent: &Path,
+    mut emit: impl FnMut(&[T]) -> Result<()>,
+) -> Result<u64> {
+    let raw_bytes = spool.spilled();
+    let mut sorter = Sorter::new(pool, limit, parent);
+    let batch = (limit / size_of::<T>().max(1) as u64 / 4).clamp(1, 65_536) as usize;
+    let mut input = Vec::with_capacity(batch);
+    spool.finish()?.drain(|record| {
+        input.push(record);
+        if input.len() == batch {
+            sorter.extend(std::mem::take(&mut input))?;
+            input = Vec::with_capacity(batch);
+        }
+        Ok(())
+    })?;
+    sorter.extend(input)?;
+    let bytes = raw_bytes.saturating_add(sorter.spilled());
+    let mut merged = sorter.finish()?;
+    let mut output = Vec::with_capacity(4096);
+    while let Some(record) = merged.next_record()? {
+        output.push(record);
+        if output.len() == 4096 {
+            emit(&output)?;
+            output.clear();
+        }
+    }
+    if !output.is_empty() {
+        emit(&output)?;
+    }
+    Ok(bytes)
 }
 
 /// The records of a finished [`Spool`].
@@ -204,5 +265,32 @@ mod tests {
             assert_eq!(got, (0..10_000).collect::<Vec<_>>());
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn streaming_handoff_preserves_partial_records_and_actual_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = Spool::<V>::new(1 << 20, dir.path());
+        for i in 0..17 {
+            spool.push(V(i)).unwrap();
+        }
+        assert_eq!(spool.spilled(), 0);
+        spool.stream_to_disk().unwrap();
+        assert_eq!(spool.spilled(), 17 * 8);
+        assert_eq!(spool.mem.capacity(), 0);
+        assert!(spool.file.as_ref().unwrap().1.capacity() <= 64 << 10);
+        for i in 17..5000 {
+            spool.push(V(i)).unwrap();
+        }
+        let mut got = Vec::new();
+        spool
+            .finish()
+            .unwrap()
+            .drain(|v| {
+                got.push(v.0);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(got, (0..5000).collect::<Vec<_>>());
     }
 }

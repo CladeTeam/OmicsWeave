@@ -50,9 +50,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use omicsweave_bam::flag;
-use omicsweave_convert::stage::Sorter;
+use omicsweave_convert::stage::{Sorter, Spill, read_or_end};
 use omicsweave_core::{Error, Result};
 use smallvec::SmallVec;
+use std::io::Read;
 
 use super::counts::{
     Entry, FeatureSource, Fold, GlobalRows, LocalRows, Reduce, RowKey, Rows, collapse,
@@ -271,6 +272,39 @@ impl Cyt {
     }
 }
 
+impl Spill for Cyt {
+    type Key = (u64, u8);
+    fn key(&self) -> Self::Key {
+        self.order()
+    }
+    fn mem_size(&self) -> usize {
+        0
+    }
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.key.to_le_bytes());
+        out.push(self.code);
+        out.extend_from_slice(&self.meth.to_le_bytes());
+        out.extend_from_slice(&self.unmeth.to_le_bytes());
+    }
+    fn decode(input: &mut impl Read) -> Result<Option<Self>> {
+        let mut bytes = [0u8; 17];
+        if !read_or_end(input, &mut bytes)? {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            key: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            code: bytes[8],
+            meth: u32::from_le_bytes(bytes[9..13].try_into().unwrap()),
+            unmeth: u32::from_le_bytes(bytes[13..].try_into().unwrap()),
+        }))
+    }
+    const ABSORBS: bool = true;
+    fn absorb(&mut self, next: Self) {
+        self.meth += next.meth;
+        self.unmeth += next.unmeth;
+    }
+}
+
 fn collapse_cyt(v: &mut Vec<Cyt>) {
     v.sort_unstable_by_key(Cyt::order);
     let mut w = 0;
@@ -348,6 +382,8 @@ pub struct MethylTotal<'p> {
     held: Vec<Cyt>,
     scratch: Vec<Cyt>,
     spool: Spool<Cytosine>,
+    sorted: Option<Sorter<'p, Cyt>>,
+    sorted_spilled: u64,
     sorters: Vec<Sorter<'p, Entry>>,
     rows: Vec<GlobalRows>,
     mates: Mates<Half>,
@@ -454,6 +490,14 @@ impl MethylStage {
         };
         let qual = r.rec.qual();
         let mask = r.masked()?;
+        if r.segments().iter().any(|&(rs, qs, len)| {
+            rs.checked_add(len).is_none()
+                || qs
+                    .checked_add(len)
+                    .is_none_or(|end| end as usize > xm.len() || end as usize > qual.len())
+        }) {
+            return Ok(Outcome::Malformed);
+        }
         for &(rs, qs, len) in r.segments() {
             for i in 0..len {
                 let q = (qs + i) as usize;
@@ -485,22 +529,22 @@ impl MethylStage {
         let Some(bases) = r.aligned()? else {
             return Ok(Outcome::NoSource);
         };
-        let genome = r.reference_bases()?.is_some();
+        let genome = r.has_reference_context()?;
         let top = top_strand(r);
         let (target, converted) = if top { (b'C', b'T') } else { (b'G', b'A') };
         // Reference bases around a position: the genome's, else those the
         // MD tag gives under neighbouring aligned bases.
         let near = |i: usize, delta: i64| -> Result<u8> {
             let p = bases[i].ref_pos as i64 + delta;
-            if p < 0 {
+            let Ok(p) = u32::try_from(p) else {
                 return Ok(b'N');
-            }
+            };
             if genome {
-                return Ok(r.reference_base(p as u32)?.unwrap_or(b'N'));
+                return Ok(r.reference_context_base(p)?.unwrap_or(b'N'));
             }
             let j = i as i64 + delta;
             Ok(match bases.get(j.max(0) as usize) {
-                Some(b) if j >= 0 && b.ref_pos as i64 == p => b.reference,
+                Some(b) if j >= 0 && b.ref_pos == p => b.reference,
                 _ => b'N',
             })
         };
@@ -592,15 +636,38 @@ impl MethylStage {
                 codes.len()
             };
             let m_index = codes.iter().position(|&c| c == b'm');
-            let skips: Vec<usize> = match fields
+            if !(base == b'C' && strand == b'+' && found.is_none() && m_index.is_some()) {
+                let count = fields.try_fold(0usize, |n, f| {
+                    std::str::from_utf8(f).ok()?.parse::<usize>().ok()?;
+                    n.checked_add(1)
+                });
+                let Some(next_ml) = count
+                    .and_then(|n| n.checked_mul(n_codes))
+                    .and_then(|n| ml_at.checked_add(n))
+                else {
+                    return Ok(Outcome::Malformed);
+                };
+                if next_ml > ml.len() {
+                    return Ok(Outcome::Malformed);
+                }
+                ml_at = next_ml;
+                continue;
+            }
+            let skips: SmallVec<[usize; 8]> = match fields
                 .map(|f| std::str::from_utf8(f).ok()?.parse::<usize>().ok())
-                .collect::<Option<Vec<usize>>>()
+                .collect::<Option<SmallVec<[usize; 8]>>>()
             {
                 Some(v) => v,
                 None => return Ok(Outcome::Malformed),
             };
-            let take = skips.len() * n_codes;
-            if ml_at + take > ml.len() {
+            let Some(next_ml) = skips
+                .len()
+                .checked_mul(n_codes)
+                .and_then(|n| ml_at.checked_add(n))
+            else {
+                return Ok(Outcome::Malformed);
+            };
+            if next_ml > ml.len() {
                 return Ok(Outcome::Malformed);
             }
             if base == b'C'
@@ -636,7 +703,7 @@ impl MethylStage {
                 }
                 found = Some((probs, explicit));
             }
-            ml_at += take;
+            ml_at = next_ml;
         }
         let Some((probs, explicit)) = found else {
             return Ok(Outcome::Called);
@@ -644,7 +711,7 @@ impl MethylStage {
         let p = self.spec.min_probability;
         let qual = r.rec.qual();
         let mask = r.masked()?;
-        let genome = r.reference_bases()?.is_some();
+        let genome = r.has_reference_context()?;
         let mut c_index = 0usize;
         for k in 0..l_seq {
             if original(k) != b'C' {
@@ -676,10 +743,9 @@ impl MethylStage {
             let ctx = if genome {
                 let at = |d: i64| -> Result<u8> {
                     let x = pos as i64 + d;
-                    Ok(if x < 0 {
-                        b'N'
-                    } else {
-                        r.reference_base(x as u32)?.unwrap_or(b'N')
+                    Ok(match u32::try_from(x) {
+                        Ok(p) => r.reference_context_base(p)?.unwrap_or(b'N'),
+                        Err(_) => b'N',
                     })
                 };
                 if reverse {
@@ -833,10 +899,27 @@ fn unwait(waiting: &mut BTreeMap<u64, u32>, key: Option<u64>) {
     }
 }
 
-impl MethylTotal<'_> {
+impl<'p> MethylTotal<'p> {
     /// Merges `next` (sorted, collapsed) into the held cytosines and spools
     /// those before `limit`.
-    fn advance(&mut self, next: &[Cyt], limit: u64) -> Result<()> {
+    fn advance(&mut self, next: &[Cyt], limit: u64, rc: &RunCtx<'p>) -> Result<()> {
+        let share = rc.buffer / (1 + 4 * self.sorters.len() as u64);
+        let pending = self.held.len() - self.held.partition_point(|c| c.key < limit) + next.len()
+            - next.partition_point(|c| c.key < limit);
+        // Long alignments and distant mates can hold future calls over many
+        // batches. Switch before repeatedly merging that growing suffix.
+        if self.sorted.is_none()
+            && pending.saturating_mul(size_of::<Cyt>()) as u64 > (share / 4).max(64 << 10)
+        {
+            self.spool.stream_to_disk()?;
+            let mut sorter = Sorter::new(rc.pool, (share / 2).max(1), &rc.tmp);
+            sorter.extend(std::mem::take(&mut self.held))?;
+            self.scratch = Vec::new();
+            self.sorted = Some(sorter);
+        }
+        if let Some(sorter) = &mut self.sorted {
+            return sorter.extend(next.to_vec());
+        }
         let held = std::mem::take(&mut self.held);
         let mut all = std::mem::take(&mut self.scratch);
         all.clear();
@@ -874,6 +957,41 @@ impl MethylTotal<'_> {
         rest.extend_from_slice(&all[cut..]);
         self.held = rest;
         self.scratch = all;
+        Ok(())
+    }
+
+    fn finish_sorted(&mut self) -> Result<()> {
+        if let Some(sorter) = self.sorted.take() {
+            self.sorted_spilled += sorter.spilled();
+            let mut records = sorter.finish()?;
+            let mut pending: Option<Cyt> = None;
+            while let Some(c) = records.next_record()? {
+                if let Some(last) = &mut pending
+                    && last.order() == c.order()
+                {
+                    last.absorb(c);
+                    continue;
+                }
+                if let Some(last) = pending.replace(c) {
+                    self.spool.push(Cytosine {
+                        tid: (last.key >> 32) as u32,
+                        pos: last.key as u32,
+                        code: last.code,
+                        meth: last.meth,
+                        unmeth: last.unmeth,
+                    })?;
+                }
+            }
+            if let Some(last) = pending {
+                self.spool.push(Cytosine {
+                    tid: (last.key >> 32) as u32,
+                    pos: last.key as u32,
+                    code: last.code,
+                    meth: last.meth,
+                    unmeth: last.unmeth,
+                })?;
+            }
+        }
         Ok(())
     }
 }
@@ -1022,6 +1140,8 @@ impl Accumulator for MethylStage {
             held: Vec::new(),
             scratch: Vec::new(),
             spool: Spool::new(share, &rc.tmp),
+            sorted: None,
+            sorted_spilled: 0,
             sorters: (0..m)
                 .map(|_| Sorter::new(rc.pool, share * 4, &rc.tmp))
                 .collect(),
@@ -1124,7 +1244,7 @@ impl Accumulator for MethylStage {
         if let Some((&k, _)) = t.waiting.iter().next() {
             limit = limit.min(k);
         }
-        t.advance(&cyt, limit)?;
+        t.advance(&cyt, limit, rc)?;
         for (m, mut e) in entries.into_iter().enumerate() {
             e.append(&mut out[m]);
             t.sorters[m].extend(e)?;
@@ -1137,7 +1257,7 @@ impl Accumulator for MethylStage {
         &'p self,
         t: &mut MethylTotal<'p>,
         _input: u32,
-        _rc: &RunCtx<'p>,
+        rc: &RunCtx<'p>,
     ) -> Result<()> {
         let mut extra = Vec::new();
         let mut out = std::mem::take(&mut t.out);
@@ -1146,7 +1266,8 @@ impl Accumulator for MethylStage {
             .drain(|h| self.emit_half(h, &mut extra, &mut out, status));
         t.waiting.clear();
         collapse_cyt(&mut extra);
-        t.advance(&extra, u64::MAX)?;
+        t.advance(&extra, u64::MAX, rc)?;
+        t.finish_sorted()?;
         for (m, o) in out.iter_mut().enumerate() {
             t.sorters[m].extend(std::mem::take(o))?;
         }
@@ -1154,8 +1275,9 @@ impl Accumulator for MethylStage {
         Ok(())
     }
 
-    fn finish<'p>(&'p self, t: MethylTotal<'p>, rc: &RunCtx<'p>) -> Result<MethylProduct> {
-        let mut spilled = t.spool.spilled();
+    fn finish<'p>(&'p self, mut t: MethylTotal<'p>, rc: &RunCtx<'p>) -> Result<MethylProduct> {
+        t.finish_sorted()?;
+        let mut spilled = t.spool.spilled() + t.sorted_spilled;
         let mut matrices = Vec::new();
         for ((st, sorter), rows) in self.matrices.iter().zip(t.sorters).zip(t.rows) {
             spilled += sorter.spilled();
@@ -1263,6 +1385,307 @@ impl Accumulator for MethylStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_spliced_calls_reuse_actual_fasta_windows() {
+        use crate::assign::{BatchSpaces, Spaces};
+        use crate::reference::{BatchCtx, RefWindow, Reference};
+        use crate::source::Input;
+        use std::cell::RefCell;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reference.fa");
+        let len = 1_500_000u32;
+        let mut fasta = b">chr1\n".to_vec();
+        fasta.extend((0..len).map(|p| b"ACGT"[(p % 4) as usize]));
+        fasta.push(b'\n');
+        std::fs::write(&path, fasta).unwrap();
+        std::fs::write(
+            omicsweave_fasta::fai_path(&path),
+            format!("chr1\t{len}\t6\t{len}\t{}\n", len + 1),
+        )
+        .unwrap();
+        let inputs = [Input {
+            path: dir.path().join("in.bam"),
+            refs: vec![("chr1".into(), len)],
+            read_groups: vec![],
+            len: 0,
+        }];
+        let reference = Reference::open(&path, &inputs, None).unwrap();
+        let spaces = Spaces::default();
+        let ctx = BatchCtx {
+            spaces: BatchSpaces::new(&spaces, 0),
+            reference: Some(RefCell::new(RefWindow::new(&reference, 0))),
+            variants: None,
+        };
+        let stage = MethylStage {
+            spec: Methylation::default(),
+            matrices: vec![],
+            table_bytes: 0,
+        };
+        let mut raw = vec![0u8; 32];
+        raw[8] = 2;
+        raw[9] = 60;
+        raw[12..14].copy_from_slice(&3u16.to_le_bytes());
+        raw[16..20].copy_from_slice(&6i32.to_le_bytes());
+        raw[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        raw[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+        raw.extend_from_slice(b"r\0");
+        for (n, op) in [(3u32, 0u32), (1_000_000, 3), (3, 0)] {
+            raw.extend_from_slice(&((n << 4) | op).to_le_bytes());
+        }
+        let sequence = raw.len();
+        raw.extend_from_slice(&[0; 3]);
+        raw.extend_from_slice(&[30; 6]);
+        let mut calls = Vec::new();
+        for offset in 0..1000u32 {
+            let pos = 100 + offset;
+            raw[4..8].copy_from_slice(&(pos as i32).to_le_bytes());
+            for i in 0..3 {
+                raw[sequence + i] = ([1u8, 2, 4, 8][(pos as usize + 2 * i) % 4] << 4)
+                    | [1u8, 2, 4, 8][(pos as usize + 2 * i + 1) % 4];
+            }
+            let rec = omicsweave_bam::Record::parse(&raw, 1).unwrap();
+            let view = ReadView::new(0, offset as u64, rec, &ctx);
+            calls.clear();
+            assert!(matches!(
+                stage.reference(&view, &mut calls).unwrap(),
+                Outcome::Called
+            ));
+            let expected: Vec<_> = (0..6u32)
+                .filter_map(|q| {
+                    let p = pos + q + if q >= 3 { 1_000_000 } else { 0 };
+                    (p % 4 == 1).then_some((p, 0, true, q))
+                })
+                .collect();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|(c, q)| (c.pos, c.code, c.meth, *q))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let fetched = ctx.reference.as_ref().unwrap().borrow().fetched_bytes();
+        assert_eq!(fetched, 1_048_576);
+    }
+
+    #[test]
+    fn distant_calls_spill_without_remerging_the_whole_held_suffix() {
+        use omicsweave_core::exec::Pool;
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Pool::new(2);
+        let stage = MethylStage {
+            spec: Methylation::default(),
+            matrices: vec![],
+            table_bytes: 0,
+        };
+        let small = RunCtx {
+            pool: &pool,
+            buffer: 1 << 20,
+            tmp: dir.path().to_owned(),
+            inputs: &[],
+        };
+        let large = RunCtx {
+            pool: &pool,
+            buffer: 128 << 20,
+            tmp: dir.path().to_owned(),
+            inputs: &[],
+        };
+        let mut a = stage.total(&small).unwrap();
+        let mut b = stage.total(&large).unwrap();
+        let mut want: BTreeMap<(u64, u8), (u32, u32)> = BTreeMap::new();
+        for batch in 0..16u32 {
+            let mut values: Vec<Cyt> = (0..2000u32)
+                .map(|i| {
+                    let pos = 100_000 + (i * 391 + batch * 127) % 20_000;
+                    Cyt {
+                        key: pos as u64,
+                        code: if pos % 2 == 0 { 0 } else { 4 },
+                        meth: i % 3,
+                        unmeth: i % 2,
+                    }
+                })
+                .collect();
+            values.push(Cyt {
+                key: 10,
+                code: 0,
+                meth: 1,
+                unmeth: 0,
+            });
+            values.push(Cyt {
+                key: 11,
+                code: 4,
+                meth: 0,
+                unmeth: 1,
+            });
+            // A completed prefix is emitted only in the first batch.
+            if batch != 0 {
+                values.retain(|c| c.key >= 1000);
+            }
+            for c in &values {
+                let e = want.entry(c.order()).or_default();
+                e.0 += c.meth;
+                e.1 += c.unmeth;
+            }
+            collapse_cyt(&mut values);
+            a.advance(&values, 1000, &small).unwrap();
+            b.advance(&values, 1000, &large).unwrap();
+        }
+        assert!(a.sorted.is_some());
+        assert_eq!(a.held.capacity(), 0);
+        assert_eq!(a.scratch.capacity(), 0);
+        assert!(b.sorted.is_none());
+        stage.end_input(&mut a, 0, &small).unwrap();
+        stage.end_input(&mut b, 0, &large).unwrap();
+        assert!(a.sorted.is_none());
+        assert!(a.sorted_spilled > 0);
+        let expected: Vec<_> = want
+            .into_iter()
+            .map(|((key, code), (meth, unmeth))| (key, code, meth, unmeth))
+            .collect();
+        let mut outputs = Vec::new();
+        for spool in [a.spool, b.spool] {
+            let mut got = Vec::new();
+            spool
+                .finish()
+                .unwrap()
+                .drain(|c| {
+                    got.push((
+                        ((c.tid as u64) << 32) | c.pos as u64,
+                        c.code,
+                        c.meth,
+                        c.unmeth,
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(got, expected);
+            outputs.push(got);
+        }
+        use omicsweave_convert::stage::Outputs;
+        use omicsweave_core::{FileSource, Locus, Region, TrackRead};
+        for merge in [false, true] {
+            let mut tracks = Vec::new();
+            let mut tables = Vec::new();
+            for (mode, values) in outputs.iter().enumerate() {
+                let path = dir.path().join(format!("{merge}-{mode}"));
+                std::fs::create_dir_all(&path).unwrap();
+                let mut files = Outputs::new();
+                let mut delivery = Delivery {
+                    outputs: &mut files,
+                    dir: &path,
+                    pool: &pool,
+                    matrix: crate::task::MatrixFormat::Mtx,
+                    tmp: dir.path(),
+                    buffer: 4 << 20,
+                };
+                let cells = values
+                    .iter()
+                    .map(|&(key, code, meth, unmeth)| Cytosine {
+                        tid: (key >> 32) as u32,
+                        pos: key as u32,
+                        code,
+                        meth,
+                        unmeth,
+                    })
+                    .collect();
+                crate::sink::methylation::write(
+                    Spooled::from_vec(cells),
+                    &[("chr1".into(), 130_000)],
+                    merge,
+                    Some("calls.tsv.gz"),
+                    Some(("beta.bw", "coverage.bw")),
+                    &mut delivery,
+                )
+                .unwrap();
+                files.commit().unwrap();
+                tables.push(std::fs::read(path.join("calls.tsv.gz")).unwrap());
+                let mut layers = Vec::new();
+                for name in ["beta.bw", "coverage.bw"] {
+                    let mut reader =
+                        omicsweave_bbi::BbiReader::open(FileSource::open(path.join(name)).unwrap())
+                            .unwrap();
+                    let mut values = vec![0.0; 130_000];
+                    reader
+                        .values(&Locus::from(Region::new("chr1", 0, 130_000)), &mut values)
+                        .unwrap();
+                    layers.push(values.into_iter().map(f32::to_bits).collect::<Vec<_>>());
+                }
+                tracks.push(layers);
+            }
+            assert_eq!(tables[0], tables[1]);
+            assert_eq!(tracks[0], tracks[1]);
+        }
+    }
+
+    #[test]
+    fn reference_calls_fetch_only_aligned_context_across_long_introns() {
+        use crate::assign::{Query, SpaceId};
+        use crate::prelude::{Context, Hits};
+        use std::cell::RefCell;
+        struct Genome(RefCell<Vec<(u32, u32)>>);
+        impl Context for Genome {
+            fn assign(&self, _: SpaceId, _: &ReadView<'_>, _: Query, _: Option<bool>) -> Hits {
+                Hits::new()
+            }
+            fn assign_at(&self, _: SpaceId, _: &ReadView<'_>, _: u32, _: u32) -> Hits {
+                Hits::new()
+            }
+            fn reference(
+                &self,
+                _: u32,
+                start: u32,
+                end: u32,
+                with: &mut dyn FnMut(&[u8]),
+            ) -> Result<bool> {
+                self.0.borrow_mut().push((start, end));
+                let bytes: Vec<_> = (start..end).map(|p| b"ACGT"[(p % 4) as usize]).collect();
+                with(&bytes);
+                Ok(true)
+            }
+            fn variants(&self, _: u32, _: u32, _: u32, _: &mut Vec<u32>) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut raw = vec![0u8; 32];
+        raw[4..8].copy_from_slice(&100i32.to_le_bytes());
+        raw[8] = 2;
+        raw[9] = 60;
+        raw[12..14].copy_from_slice(&3u16.to_le_bytes());
+        raw[16..20].copy_from_slice(&6i32.to_le_bytes());
+        raw[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        raw[24..28].copy_from_slice(&(-1i32).to_le_bytes());
+        raw.extend_from_slice(b"r\0");
+        for (len, op) in [(3u32, 0u32), (1_000_000, 3), (3, 0)] {
+            raw.extend_from_slice(&((len << 4) | op).to_le_bytes());
+        }
+        raw.extend_from_slice(&[0x12, 0x48, 0x12]);
+        raw.extend_from_slice(&[30; 6]);
+        let rec = omicsweave_bam::Record::parse(&raw, 1).unwrap();
+        let genome = Genome(RefCell::new(Vec::new()));
+        let view = ReadView::new(0, 0, rec, &genome);
+        let stage = MethylStage {
+            spec: Methylation::default(),
+            matrices: vec![],
+            table_bytes: 0,
+        };
+        let mut calls = Vec::new();
+        assert!(matches!(
+            stage.reference(&view, &mut calls).unwrap(),
+            Outcome::Called
+        ));
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(c, q)| (c.pos, c.code, c.meth, *q))
+                .collect::<Vec<_>>(),
+            [(101, 0, true, 1), (1_000_105, 0, true, 5)]
+        );
+        let ranges = genome.0.borrow();
+        assert_eq!(ranges.iter().map(|(s, e)| e - s).sum::<u32>(), 20);
+        assert!(ranges.iter().all(|(s, e)| e - s <= 7));
+    }
 
     #[test]
     fn contexts_follow_the_next_bases() {

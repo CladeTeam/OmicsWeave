@@ -202,6 +202,9 @@ pub struct ContactTotal<'p> {
 
 /// The reference length of a CIGAR string (`M`, `D`, `N`, `=`, `X`).
 fn cigar_ref_len(text: &[u8]) -> Option<u32> {
+    if text.is_empty() {
+        return None;
+    }
     let mut n = 0u32;
     let mut len = 0u32;
     let mut digits = false;
@@ -223,6 +226,10 @@ fn cigar_ref_len(text: &[u8]) -> Option<u32> {
         digits = false;
     }
     (!digits).then_some(len)
+}
+
+fn mate_end(pos: u32, cigar: &[u8]) -> Option<u32> {
+    pos.checked_add(cigar_ref_len(cigar)?.max(1))
 }
 
 /// Per-barcode statistics, in [`CELL_METRICS`] order.
@@ -308,8 +315,11 @@ impl Accumulator for ContactStage {
         };
         let mate_reverse = f & flag::MATE_REVERSE != 0;
         let mate_five = if mate_reverse {
-            match r.tag_bytes(*b"MC").and_then(cigar_ref_len) {
-                Some(l) => rec.mate_pos as u32 + l.max(1),
+            match r
+                .tag_bytes(*b"MC")
+                .and_then(|c| mate_end(rec.mate_pos as u32, c))
+            {
+                Some(p) => p,
                 None => {
                     b.status.no_mate_cigar += 1;
                     return Ok(());
@@ -452,7 +462,7 @@ impl Accumulator for ContactStage {
                 let path = d.path(&rel)?;
                 files.push(Json::from(rel));
                 Some((
-                    crate::sink::pairs::PairsWriter::create(
+                    crate::sink::pairs::PairsWriter::create_unindexed(
                         d,
                         &path,
                         &chroms,
@@ -512,7 +522,7 @@ impl Accumulator for ContactStage {
             }
         }
         if let Some((w, _)) = pairs {
-            w.finish()?;
+            w.close()?;
         }
         let mut pixels = Json::Null;
         if let Some(h) = hic {
@@ -600,5 +610,10 @@ mod tests {
         assert_eq!(cigar_ref_len(b"M"), None);
         assert_eq!(cigar_ref_len(b"40"), None);
         assert_eq!(cigar_ref_len(b"*"), None);
+        assert_eq!(cigar_ref_len(b""), None);
+        assert_eq!(mate_end(100, b"10S30M2I5D20M"), Some(155));
+        assert_eq!(mate_end(u32::MAX - 50, b"50M"), Some(u32::MAX));
+        assert_eq!(mate_end(u32::MAX - 49, b"50M"), None);
+        assert_eq!(mate_end(1, b"4294967295M"), None);
     }
 }

@@ -229,7 +229,7 @@ pub fn write_with(
                 ));
                 let f = File::create(&path)?;
                 mtx.push(MtxLayer {
-                    body: Writer::new(
+                    body: Writer::new_streaming(
                         BufWriter::with_capacity(1 << 20, f),
                         TEXT_LEVEL,
                         Box::new(d.pool.ordered(4 * d.pool.threads())),
@@ -337,7 +337,7 @@ pub fn write_with(
 
 /// `features.tsv.gz`, a feature per line, streamed in chunks.
 fn features_file(f: &dyn FeatureList, path: &Path, d: &mut Delivery<'_>) -> Result<()> {
-    let mut g = GzText::create(d, path, "features")?;
+    let mut g = GzText::create_unindexed(d, path, "features")?;
     let mut text = Vec::with_capacity(1 << 16);
     for i in 0..f.len() {
         f.line(i, &mut text);
@@ -366,8 +366,9 @@ fn mtx_file(
         nnz,
         ..
     } = layer;
-    let done = body.finish()?;
-    done.out.into_inner().map_err(|e| e.into_error())?;
+    body.finish_streaming()?
+        .into_inner()
+        .map_err(|e| e.into_error())?;
     let header =
         format!("%%MatrixMarket matrix coordinate integer general\n%\n{n_cols} {n_rows} {nnz}\n");
     let mut head = Vec::new();
@@ -392,7 +393,7 @@ fn mtx_file(
 /// Dense `feature × row` CSV.
 fn dense_csv(t: &[u32], m: &CountMatrix, path: &Path, d: &mut Delivery<'_>) -> Result<()> {
     let n_rows = m.rows.len();
-    let mut g = GzText::create(d, path, "csv")?;
+    let mut g = GzText::create_unindexed(d, path, "csv")?;
     let mut line = b"feature".to_vec();
     for r in &m.rows.names {
         line.push(b',');
@@ -448,4 +449,75 @@ fn counts_tsv(t: &[u32], m: &CountMatrix, path: &Path, d: &mut Delivery<'_>) -> 
     }
     out.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omicsweave_convert::stage::Outputs;
+    use omicsweave_core::exec::Pool;
+
+    #[test]
+    fn mtx_header_and_body_are_identical_without_a_body_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Pool::new(2);
+        let mut expected =
+            String::from("%%MatrixMarket matrix coordinate integer general\n%\n10000 1 10000\n");
+        let mut bytes = Vec::new();
+        for indexed in [true, false] {
+            let tmp = dir.path().join(format!("body-{indexed}"));
+            let file = File::create(&tmp).unwrap();
+            let queue = Box::new(pool.ordered(4));
+            let mut body = if indexed {
+                Writer::new(BufWriter::new(file), TEXT_LEVEL, queue)
+            } else {
+                Writer::new_streaming(BufWriter::new(file), TEXT_LEVEL, queue)
+            }
+            .unwrap();
+            for i in 1..=10000 {
+                let line = format!("{i} 1 {i}\n");
+                body.write(line.as_bytes()).unwrap();
+                if indexed {
+                    expected.push_str(&line);
+                }
+                if i % 17 == 0 {
+                    body.flush_block().unwrap();
+                }
+            }
+            let path = dir.path().join(format!("matrix-{indexed}.mtx.gz"));
+            let mut outputs = Outputs::new();
+            let mut delivery = Delivery {
+                outputs: &mut outputs,
+                dir: dir.path(),
+                pool: &pool,
+                matrix: MatrixFormat::Mtx,
+                tmp: dir.path(),
+                buffer: 4 << 20,
+            };
+            mtx_file(
+                MtxLayer {
+                    body,
+                    path: tmp.clone(),
+                    nnz: 10000,
+                    line: vec![],
+                },
+                &path,
+                1,
+                10000,
+                &mut delivery,
+            )
+            .unwrap();
+            assert!(!tmp.exists());
+            outputs.commit().unwrap();
+            let data = std::fs::read(path).unwrap();
+            assert!(data.ends_with(&omicsweave_bgzf::EOF_BLOCK));
+            let mut plain = String::new();
+            flate2::read::MultiGzDecoder::new(&data[..])
+                .read_to_string(&mut plain)
+                .unwrap();
+            assert_eq!(plain, expected);
+            bytes.push(data);
+        }
+        assert_eq!(bytes[0], bytes[1]);
+    }
 }

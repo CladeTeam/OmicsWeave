@@ -76,8 +76,10 @@ pub enum RowKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dedup {
     None,
-    /// One count per distinct UMI (exact `UB` value) per row and feature;
-    /// reads without the UMI tag are not counted.
+    /// One count per UMI key per row and feature. Uppercase ACGT values
+    /// of at most 31 bases are lossless; other values use the 63-bit
+    /// fingerprint of [`umi_key`], without collision resolution.
+    /// Reads without the UMI tag are not counted.
     Umi,
     /// One count per distinct fragment position (reference, start, end) per
     /// row and feature: duplicate fragments of a barcode count once.

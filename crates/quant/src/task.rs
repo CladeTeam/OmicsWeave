@@ -417,21 +417,8 @@ impl Resolver<'_> {
     }
 
     fn junctions(&mut self, j: &Junctions) -> Result<JunctionStage> {
+        self.same_references(&format!("{}: junctions", j.name))?;
         let first: Vec<&str> = self.inputs[0].refs.iter().map(|r| r.0.as_str()).collect();
-        if self.inputs.iter().any(|i| {
-            i.refs
-                .iter()
-                .map(|r| r.0.as_str())
-                .ne(first.iter().copied())
-        }) {
-            return Err(Error::invalid(
-                "quant",
-                format!(
-                    "{}: junctions of several BAMs need the same references in the same order",
-                    j.name
-                ),
-            ));
-        }
         let (rows, table_bytes, reduce) = match &j.matrix {
             Some(m) => {
                 if m.dedup == Dedup::Position {
@@ -467,16 +454,13 @@ impl Resolver<'_> {
     /// Every input's references, which must be those of the first in the
     /// same order.
     fn same_references(&self, what: &str) -> Result<()> {
-        let first: Vec<&str> = self.inputs[0].refs.iter().map(|r| r.0.as_str()).collect();
-        if self.inputs.iter().any(|i| {
-            i.refs
-                .iter()
-                .map(|r| r.0.as_str())
-                .ne(first.iter().copied())
-        }) {
+        let first = &self.inputs[0].refs;
+        if self.inputs.iter().any(|i| &i.refs != first) {
             return Err(Error::invalid(
                 "quant",
-                format!("{what} of several BAMs need the same references in the same order"),
+                format!(
+                    "{what} of several BAMs need the same references in the same order (including lengths)"
+                ),
             ));
         }
         Ok(())
@@ -608,7 +592,7 @@ impl Resolver<'_> {
         } else {
             None
         };
-        let (rows, _) = self.rows(&RowKey::Tag(a.barcode_tag), a.whitelist.as_deref())?;
+        let (rows, table_bytes) = self.rows(&RowKey::Tag(a.barcode_tag), a.whitelist.as_deref())?;
         let mut counts = Vec::new();
         for c in a.matrices(has_ann) {
             counts.push(self.counts(&c)?);
@@ -619,6 +603,7 @@ impl Resolver<'_> {
                 rows,
                 peaks,
                 tss,
+                table_bytes,
             },
             counts,
         ))
@@ -1030,4 +1015,81 @@ pub fn run(plan: &Plan, progress: OnProgress<'_>) -> Result<Report> {
 /// [`plan`] then [`run`].
 pub fn quantify(task: Task, budget: Budget, progress: OnProgress<'_>) -> Result<Report> {
     run(&plan(task, budget)?, progress)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accum::Accumulator;
+
+    #[test]
+    fn fragment_only_whitelist_is_included_in_fixed_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let whitelist = dir.path().join("barcodes");
+        let mut names = String::new();
+        for i in 0..10_000 {
+            names.push_str(&format!("B{i:08}\n"));
+        }
+        std::fs::write(&whitelist, names).unwrap();
+        let task = Task::new(vec![], "unused");
+        let mut resolver = Resolver {
+            task: &task,
+            inputs: &[],
+            spaces: Spaces::default(),
+            lengths: None,
+            reference: None,
+        };
+        let spec = Atac {
+            whitelist: Some(whitelist),
+            tiles: None,
+            gene_activity: None,
+            ..Atac::default()
+        };
+        let (stage, counts) = resolver.atac(&spec).unwrap();
+        assert!(counts.is_empty());
+        let memory = stage.estimate(&PlanInfo {
+            threads: 1,
+            inputs: vec![],
+            batch_bytes: 4096,
+            batches: 1,
+        });
+        assert!(memory.fixed > 1_000_000, "fixed={}", memory.fixed);
+        assert!(memory.fixed >= 10_000 * size_of::<[u64; 6]>() as u64);
+    }
+
+    #[test]
+    fn combined_coordinate_outputs_check_names_lengths_and_order() {
+        let task = Task::new(vec![], "unused");
+        let dictionary = vec![("chr1".to_string(), 100), ("chr2".to_string(), 200)];
+        for (other, valid) in [
+            (dictionary.clone(), true),
+            (vec![("chr1".into(), 101), ("chr2".into(), 200)], false),
+            (vec![("chr2".into(), 200), ("chr1".into(), 100)], false),
+            (vec![("chr1".into(), 100)], false),
+        ] {
+            let inputs = [
+                Input {
+                    path: PathBuf::from("one"),
+                    refs: dictionary.clone(),
+                    read_groups: vec![],
+                    len: 0,
+                },
+                Input {
+                    path: PathBuf::from("two"),
+                    refs: other,
+                    read_groups: vec![],
+                    len: 0,
+                },
+            ];
+            let mut resolver = Resolver {
+                task: &task,
+                inputs: &inputs,
+                spaces: Spaces::default(),
+                lengths: None,
+                reference: None,
+            };
+            assert_eq!(resolver.same_references("contacts").is_ok(), valid);
+            assert_eq!(resolver.junctions(&Junctions::default()).is_ok(), valid);
+        }
+    }
 }

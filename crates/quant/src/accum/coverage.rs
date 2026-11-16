@@ -6,13 +6,15 @@
 //! into runs of constant depth, so memory follows the depth at the
 //! frontier, not the genome; finished runs go to a [`Spool`].
 
+use omicsweave_convert::stage::{Spill, read_or_end};
 use omicsweave_core::{Error, Result};
+use std::io::Read;
 
 use super::{Accumulator, BatchInfo, Delivery, MemoryNeed, Needs, PlanInfo, RunCtx};
 use crate::model::{Run, Track};
 use crate::prelude::{Filter, ReadView, Rejected, Strandedness};
 use crate::sink::json::Json;
-use crate::spool::Spool;
+use crate::spool::{Fixed, Spool, sort_spooled};
 
 /// What each counted read adds to the track.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -133,6 +135,37 @@ pub struct CoverageTotal {
     counted: u64,
     tally: Tally,
     scratch: Vec<u64>,
+    deferred: [Option<Spool<Event>>; 2],
+}
+
+#[derive(Clone, Copy)]
+struct Event(u64);
+
+impl Fixed for Event {
+    const SIZE: usize = 8;
+    fn put(&self, out: &mut [u8]) {
+        out.copy_from_slice(&self.0.to_le_bytes());
+    }
+    fn get(bytes: &[u8]) -> Self {
+        Self(u64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+}
+
+impl Spill for Event {
+    type Key = u64;
+    fn key(&self) -> u64 {
+        self.0
+    }
+    fn mem_size(&self) -> usize {
+        0
+    }
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0.to_le_bytes());
+    }
+    fn decode(input: &mut impl Read) -> Result<Option<Self>> {
+        let mut b = [0u8; 8];
+        Ok(read_or_end(input, &mut b)?.then(|| Self::get(&b)))
+    }
 }
 
 #[inline]
@@ -176,7 +209,27 @@ fn emit(open: &mut Option<Run>, spool: &mut Spool<Run>, run: Run) -> Result<()> 
 impl CoverageTotal {
     /// Sweeps the events of strand `s` before `limit` (a `tid << 32 | pos`
     /// key) out of `pending` and `next` into runs.
-    fn sweep(&mut self, s: usize, next: &[u64], limit: u64) -> Result<()> {
+    fn sweep(&mut self, s: usize, next: &[u64], limit: u64, rc: &RunCtx<'_>) -> Result<()> {
+        let retained = self.pending[s].len() - self.pending[s].partition_point(|&e| e >> 1 < limit)
+            + next.len()
+            - next.partition_point(|&e| e >> 1 < limit);
+        if self.deferred[s].is_none()
+            && retained.saturating_mul(8) as u64 > (rc.buffer / 8).max(64 << 10)
+        {
+            self.spools[s].stream_to_disk()?;
+            let mut deferred = Spool::new((rc.buffer / 16).max(8 << 10), &rc.tmp);
+            for e in std::mem::take(&mut self.pending[s]) {
+                deferred.push(Event(e))?;
+            }
+            self.scratch = Vec::new();
+            self.deferred[s] = Some(deferred);
+        }
+        if let Some(deferred) = &mut self.deferred[s] {
+            for &e in next {
+                deferred.push(Event(e))?;
+            }
+            return Ok(());
+        }
         let pending = std::mem::take(&mut self.pending[s]);
         let merged = &mut self.scratch;
         merged.clear();
@@ -326,6 +379,7 @@ impl Accumulator for Coverage {
             counted: 0,
             tally: Tally::default(),
             scratch: Vec::new(),
+            deferred: [None, None],
         })
     }
 
@@ -334,7 +388,7 @@ impl Accumulator for Coverage {
         t: &mut CoverageTotal,
         b: CoverageBatch,
         frontier: u64,
-        _rc: &RunCtx<'p>,
+        rc: &RunCtx<'p>,
     ) -> Result<()> {
         t.counted += b.counted;
         t.tally.add(&b.tally);
@@ -342,15 +396,30 @@ impl Accumulator for Coverage {
         let limit = frontier.saturating_sub(1);
         for s in 0..2 {
             if !b.events[s].is_empty() || !t.pending[s].is_empty() {
-                t.sweep(s, &b.events[s], limit)?;
+                t.sweep(s, &b.events[s], limit, rc)?;
             }
         }
         Ok(())
     }
 
-    fn end_input<'p>(&'p self, t: &mut CoverageTotal, _input: u32, _rc: &RunCtx<'p>) -> Result<()> {
+    fn end_input<'p>(&'p self, t: &mut CoverageTotal, _input: u32, rc: &RunCtx<'p>) -> Result<()> {
         for s in 0..2 {
-            t.sweep(s, &[], u64::MAX)?;
+            if let Some(deferred) = t.deferred[s].take() {
+                let mut events = Vec::with_capacity(4096);
+                let spilled = sort_spooled(
+                    deferred,
+                    rc.pool,
+                    (rc.buffer / 4).max(1),
+                    &rc.tmp,
+                    |batch| {
+                        events.clear();
+                        events.extend(batch.iter().map(|e| e.0));
+                        t.sweep(s, &events, u64::MAX, rc)
+                    },
+                )?;
+                t.spools[s].account_spilled(spilled);
+            }
+            t.sweep(s, &[], u64::MAX, rc)?;
             t.last[s] = None;
         }
         Ok(())
@@ -448,4 +517,98 @@ pub struct CoverageTotalStats {
     pub counted: u64,
     pub tally: Tally,
     pub scale: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::Input;
+    use omicsweave_core::exec::Pool;
+
+    #[test]
+    fn future_events_spill_and_resume_the_existing_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Pool::new(2);
+        let inputs = [Input {
+            path: dir.path().join("in.bam"),
+            refs: vec![("chr1".into(), 130_000)],
+            read_groups: vec![],
+            len: 0,
+        }];
+        let small = RunCtx {
+            pool: &pool,
+            buffer: 1 << 20,
+            tmp: dir.path().to_owned(),
+            inputs: &inputs,
+        };
+        let large = RunCtx {
+            pool: &pool,
+            buffer: 128 << 20,
+            tmp: dir.path().to_owned(),
+            inputs: &inputs,
+        };
+        for scale in [Scale::None, Scale::Cpm, Scale::Factor(0.5)] {
+            let stage = Coverage {
+                scale,
+                strands: StrandSplit::Split(Strandedness::Forward),
+                ..Coverage::default()
+            };
+            let mut a = stage.total(&small).unwrap();
+            let mut b = stage.total(&large).unwrap();
+            let mut expected = [vec![0u32; 130_000], vec![0u32; 130_000]];
+            for batch in 0..16u32 {
+                for (s, expected_strand) in expected.iter_mut().enumerate() {
+                    let mut events = Vec::new();
+                    for i in 0..2000u32 {
+                        let start = 100_000 + (i * 17 + batch * 37 + s as u32) % 20_000;
+                        let end = start + 1 + i % 4;
+                        add(&mut events, 0, start, end);
+                        for depth in &mut expected_strand[start as usize..end as usize] {
+                            *depth += 1;
+                        }
+                    }
+                    if batch == 0 {
+                        add(&mut events, 0, 10, 12);
+                        add(&mut events, 0, 12, 15);
+                        for depth in &mut expected_strand[10..15] {
+                            *depth += 1;
+                        }
+                    }
+                    events.sort_unstable();
+                    a.sweep(s, &events, 1000, &small).unwrap();
+                    b.sweep(s, &events, 1000, &large).unwrap();
+                }
+            }
+            assert!(a.deferred.iter().all(Option::is_some));
+            assert!(a.pending.iter().all(|p| p.capacity() == 0));
+            assert!(b.deferred.iter().all(Option::is_none));
+            a.counted = 64_004;
+            b.counted = 64_004;
+            stage.end_input(&mut a, 0, &small).unwrap();
+            stage.end_input(&mut b, 0, &large).unwrap();
+            let (a, sa) = stage.finish(a, &small).unwrap();
+            let (b, sb) = stage.finish(b, &large).unwrap();
+            assert_eq!(sa.scale.to_bits(), sb.scale.to_bits());
+            let expected_scale = match scale {
+                Scale::None => 1.0,
+                Scale::Cpm => 1e6 / 64_004.0,
+                Scale::Factor(f) => f,
+            };
+            assert_eq!(sa.scale.to_bits(), expected_scale.to_bits());
+            for tracks in [a, b] {
+                for (s, track) in tracks.into_iter().enumerate() {
+                    assert_eq!(track.scale.to_bits(), sa.scale.to_bits());
+                    let mut got = vec![0u32; 130_000];
+                    track
+                        .runs
+                        .drain(|r| {
+                            got[r.start as usize..r.end as usize].fill(r.value);
+                            Ok(())
+                        })
+                        .unwrap();
+                    assert_eq!(got, expected[s]);
+                }
+            }
+        }
+    }
 }

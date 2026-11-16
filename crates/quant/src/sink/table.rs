@@ -111,7 +111,7 @@ pub fn write_mbias(m: &Mbias, path: &Path, d: &mut Delivery<'_>) -> Result<()> {
 /// (BGZF): a site per line in panel order, 1-based; the fraction is
 /// `alt / (ref + alt)`, empty without either.
 pub fn write_variants(t: &VariantTable, path: &Path, d: &mut Delivery<'_>) -> Result<()> {
-    let mut g = super::GzText::create(d, path, "variants")?;
+    let mut g = super::GzText::create_unindexed(d, path, "variants")?;
     g.write(b"chrom\tpos\tref\talt\tref_count\talt_count\tother_count\talt_fraction\n")?;
     let mut line = Vec::with_capacity(1 << 16);
     for (s, c) in t.sites.iter().zip(&t.counts) {

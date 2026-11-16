@@ -219,6 +219,11 @@ pub(crate) struct RefWindow<'a> {
 }
 
 impl<'a> RefWindow<'a> {
+    #[cfg(test)]
+    pub(crate) fn fetched_bytes(&self) -> u64 {
+        self.fetched
+    }
+
     pub fn new(reference: &'a Reference, input: usize) -> RefWindow<'a> {
         RefWindow {
             reference,

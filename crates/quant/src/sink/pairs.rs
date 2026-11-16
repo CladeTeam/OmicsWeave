@@ -31,7 +31,33 @@ impl<'c> PairsWriter<'c> {
         genome: &str,
         barcode: bool,
     ) -> Result<PairsWriter<'c>> {
-        let mut g = GzText::create(d, path, "pairs")?;
+        Self::create_mode(d, path, chroms, genome, barcode, true)
+    }
+
+    /// Creates pairs text without retaining a directory for an unused index.
+    pub fn create_unindexed(
+        d: &mut Delivery<'_>,
+        path: &Path,
+        chroms: &'c [(String, u32)],
+        genome: &str,
+        barcode: bool,
+    ) -> Result<PairsWriter<'c>> {
+        Self::create_mode(d, path, chroms, genome, barcode, false)
+    }
+
+    fn create_mode(
+        d: &mut Delivery<'_>,
+        path: &Path,
+        chroms: &'c [(String, u32)],
+        genome: &str,
+        barcode: bool,
+        indexed: bool,
+    ) -> Result<PairsWriter<'c>> {
+        let mut g = if indexed {
+            GzText::create(d, path, "pairs")?
+        } else {
+            GzText::create_unindexed(d, path, "pairs")?
+        };
         let mut head = String::from(
             "## pairs format v1.0\n#sorted: chr1-chr2-pos1-pos2\n#shape: upper triangle\n",
         );
@@ -82,5 +108,83 @@ impl<'c> PairsWriter<'c> {
 
     pub fn finish(self) -> Result<Finished<BufWriter<File>>> {
         self.g.finish()
+    }
+
+    /// Finishes and flushes pairs text when no block directory is consumed.
+    pub fn close(self) -> Result<()> {
+        self.g.close()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omicsweave_convert::stage::Outputs;
+    use omicsweave_core::exec::Pool;
+    use std::io::Read;
+
+    #[test]
+    fn unindexed_pairs_preserve_the_complete_bgzf_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Pool::new(2);
+        let chroms = vec![
+            ("chr1".to_string(), 1_000_000),
+            ("chr2".to_string(), 1_000_000),
+        ];
+        let mut results = Vec::new();
+        for indexed in [true, false] {
+            let path = dir.path().join(format!("pairs-{indexed}.gz"));
+            let mut outputs = Outputs::new();
+            let mut delivery = Delivery {
+                outputs: &mut outputs,
+                dir: dir.path(),
+                pool: &pool,
+                matrix: crate::task::MatrixFormat::Mtx,
+                tmp: dir.path(),
+                buffer: 4 << 20,
+            };
+            let mut w = if indexed {
+                PairsWriter::create(&mut delivery, &path, &chroms, "test", true)
+            } else {
+                PairsWriter::create_unindexed(&mut delivery, &path, &chroms, "test", true)
+            }
+            .unwrap();
+            for i in 0..2000u32 {
+                let c = Contact {
+                    c1: 0,
+                    p1: i + 1,
+                    c2: 1,
+                    p2: i + 2,
+                    s1: i % 2 != 0,
+                    s2: i % 3 != 0,
+                    mapq1: 60,
+                    mapq2: 50,
+                    row: 0,
+                    input: 0,
+                    ordinal: i as u64,
+                    name: if i % 7 == 0 {
+                        vec![]
+                    } else {
+                        format!("read{i}").into_bytes()
+                    },
+                };
+                w.push(&c, Some(b"cellA")).unwrap();
+            }
+            if indexed {
+                w.finish().unwrap().out.into_inner().unwrap();
+            } else {
+                w.close().unwrap();
+            }
+            outputs.commit().unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            let mut plain = String::new();
+            flate2::read::MultiGzDecoder::new(&bytes[..])
+                .read_to_string(&mut plain)
+                .unwrap();
+            assert_eq!(plain.lines().filter(|l| !l.starts_with('#')).count(), 2000);
+            assert!(plain.contains(".\tchr1\t1\tchr2\t2\t+\t+\tUU\t60\t50\tcellA\n"));
+            results.push(bytes);
+        }
+        assert_eq!(results[0], results[1]);
     }
 }

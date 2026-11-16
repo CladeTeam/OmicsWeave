@@ -495,3 +495,47 @@ fn allele_outputs_do_not_depend_on_threads_or_spilling() {
     .unwrap_err();
     assert!(err.to_string().contains("S9"), "{err}");
 }
+
+#[test]
+fn placed_unmapped_spans_and_absent_sequences_do_not_add_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let sam = dir.path().join("reads.sam");
+    std::fs::write(
+        &sam,
+        "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:1000\n\
+u\t4\tchr1\t101\t60\t4M\t*\t0\t0\tACAA\t*\n\
+m\t0\tchr1\t201\t60\t4M\t*\t0\t0\t*\t*\n\
+n\t0\tchr1\t301\t60\t4M\t*\t0\t0\tACAA\t*\n",
+    )
+    .unwrap();
+    let bam = dir.path().join("reads.bam");
+    common::bam_of(&sam, &bam);
+    let mut vcf = String::from(
+        "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=1000>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
+    );
+    for p in [100, 101, 200, 201, 300, 301] {
+        let (r, a) = if p % 100 == 0 { ('A', 'C') } else { ('C', 'A') };
+        vcf.push_str(&format!("chr1\t{}\t.\t{r}\t{a}\t.\t.\t.\n", p + 1));
+    }
+    let panel = bcf_of_vcf(dir.path(), "sites", &vcf);
+    let mut spec = Alleles::bulk(panel);
+    spec.filter.exclude = 0;
+    let out = dir.path().join("out");
+    let mut task = Task::new(vec![bam], &out);
+    task.matrix = MatrixFormat::Mtx;
+    task.products = vec![Product::Alleles(spec)];
+    quantify(task, Budget::new(1, 128 << 20), None).unwrap();
+    let layer = read_10x_layer(&out.join("alleles"), "ref");
+    let features: Vec<_> = layer
+        .into_iter()
+        .map(|((_, feature), n)| (feature, n))
+        .collect();
+    assert_eq!(
+        features,
+        [
+            ("chr1:101:A>C".into(), 1),
+            ("chr1:301:A>C".into(), 1),
+            ("chr1:302:C>A".into(), 1)
+        ]
+    );
+}

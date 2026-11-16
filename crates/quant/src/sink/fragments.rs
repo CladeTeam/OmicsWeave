@@ -148,11 +148,11 @@ fn tabix(bai: &[u8], names: &[&str], n_refs: usize) -> Result<Vec<u8>> {
     }
     body.extend_from_slice(&bai[8..refs_end]);
     body.extend_from_slice(&bai[bai.len() - 8..]);
-    let mut w = Writer::new(
+    let mut w = Writer::new_streaming(
         Vec::new(),
         omicsweave_bgzf::DEFAULT_LEVEL,
         Box::new(Inline::new()),
     )?;
     w.write(&body)?;
-    Ok(w.finish()?.out)
+    w.finish_streaming()
 }

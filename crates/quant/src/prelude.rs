@@ -29,6 +29,12 @@ pub type Segments = SmallVec<[(u32, u32, u32); 4]>;
 /// context of its first and last bases is known.
 pub const REFERENCE_PAD: u32 = 2;
 
+/// Reference sequence only around aligned segments, with nearby flanks merged.
+struct ReferenceContext {
+    ranges: SmallVec<[(u32, u32, usize); 4]>,
+    bases: Vec<u8>,
+}
+
 /// Which records an accumulator counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Filter {
@@ -170,7 +176,7 @@ pub fn find_aux(aux: &[u8], tag: [u8; 2]) -> Option<Aux<'_>> {
                 let sub = *aux.get(v)?;
                 let n = u32::from_le_bytes(aux.get(v + 1..v + 5)?.try_into().ok()?) as usize;
                 let w = aux_width(sub)?;
-                let end = v + 5 + n.checked_mul(w)?;
+                let end = v.checked_add(5)?.checked_add(n.checked_mul(w)?)?;
                 (Aux::Array(sub, aux.get(v + 5..end)?), end)
             }
             _ => {
@@ -269,6 +275,7 @@ pub struct ReadView<'a> {
     nh: OnceCell<u32>,
     segments: OnceCell<Segments>,
     reference: OnceCell<Option<(u32, Vec<u8>)>>,
+    reference_context: OnceCell<Option<ReferenceContext>>,
     mask: OnceCell<Vec<u32>>,
     aligned: OnceCell<Option<Vec<AlignedBase>>>,
     /// (space, query, strand) → hits, for this record.
@@ -292,6 +299,7 @@ impl<'a> ReadView<'a> {
             nh: OnceCell::new(),
             segments: OnceCell::new(),
             reference: OnceCell::new(),
+            reference_context: OnceCell::new(),
             mask: OnceCell::new(),
             aligned: OnceCell::new(),
             hits: RefCell::new(SmallVec::new()),
@@ -553,7 +561,7 @@ impl<'a> ReadView<'a> {
         let s = self.segments();
         let i = s.partition_point(|x| x.0 <= p).checked_sub(1)?;
         let (r, q, len) = s[i];
-        (p - r < len).then(|| q + (p - r))
+        (p - r < len).then(|| q.checked_add(p - r)).flatten()
     }
 
     /// The reference position query base `q` is aligned to, if it lies in
@@ -562,7 +570,7 @@ impl<'a> ReadView<'a> {
         let s = self.segments();
         let i = s.partition_point(|x| x.1 <= q).checked_sub(1)?;
         let (r, qs, len) = s[i];
-        (q - qs < len).then(|| r + (q - qs))
+        (q - qs < len).then(|| r.checked_add(q - qs)).flatten()
     }
 
     /// The task's reference bases under the read, [`REFERENCE_PAD`] bases
@@ -589,6 +597,76 @@ impl<'a> ReadView<'a> {
         Ok(self.reference_bases()?.map(|(s, b)| {
             p.checked_sub(s)
                 .and_then(|i| b.get(i as usize).copied())
+                .unwrap_or(b'N')
+        }))
+    }
+
+    fn reference_context(&self) -> Result<Option<&ReferenceContext>> {
+        if let Some(v) = self.reference_context.get() {
+            return Ok(v.as_ref());
+        }
+        let mut ranges: SmallVec<[(u32, u32, usize); 4]> = SmallVec::new();
+        for &(start, _, len) in self.segments() {
+            let lo = start.saturating_sub(REFERENCE_PAD);
+            let hi = start.saturating_add(len).saturating_add(REFERENCE_PAD);
+            if let Some(last) = ranges.last_mut()
+                && lo <= last.1
+            {
+                last.1 = last.1.max(hi);
+            } else {
+                ranges.push((lo, hi, 0));
+            }
+        }
+        let mut bases = Vec::new();
+        let mut have = true;
+        if ranges.is_empty() {
+            have = self
+                .ctx
+                .reference(self.tid(), self.pos(), self.pos(), &mut |_| {})?;
+        }
+        for (lo, hi, offset) in &mut ranges {
+            *offset = bases.len();
+            if !self
+                .ctx
+                .reference(self.tid(), *lo, *hi, &mut |b| bases.extend_from_slice(b))?
+            {
+                have = false;
+                break;
+            }
+        }
+        let value = have.then_some(ReferenceContext { ranges, bases });
+        Ok(self.reference_context.get_or_init(|| value).as_ref())
+    }
+
+    /// Whether the reference can supply aligned bases and their short context.
+    /// This does not fetch introns or long deletions between aligned segments.
+    pub(crate) fn has_reference_context(&self) -> Result<bool> {
+        match self.reference.get() {
+            Some(v) => Ok(v.is_some()),
+            None => Ok(self.reference_context()?.is_some()),
+        }
+    }
+
+    /// A base from an explicit full reference or aligned-segment context.
+    /// Positions outside the available ranges read N.
+    pub(crate) fn reference_context_base(&self, p: u32) -> Result<Option<u8>> {
+        if let Some(v) = self.reference.get() {
+            return Ok(v.as_ref().map(|(s, b)| {
+                p.checked_sub(*s)
+                    .and_then(|i| b.get(i as usize).copied())
+                    .unwrap_or(b'N')
+            }));
+        }
+        Ok(self.reference_context()?.map(|context| {
+            let i = context.ranges.partition_point(|r| r.0 <= p);
+            i.checked_sub(1)
+                .and_then(|i| {
+                    let &(lo, hi, offset) = &context.ranges[i];
+                    (p < hi)
+                        .then(|| offset.checked_add((p - lo) as usize))
+                        .flatten()
+                })
+                .and_then(|i| context.bases.get(i).copied())
                 .unwrap_or(b'N')
         }))
     }
@@ -1208,12 +1286,33 @@ mod tests {
                 assert_eq!(b.qual, 10 + b.qpos as u8);
                 assert_eq!(b.masked, [103, 1_000_112].contains(&b.ref_pos));
             }
+            ctx.ranges.borrow_mut().clear();
+            assert!(view.has_reference_context().unwrap());
+            assert_eq!(
+                ctx.ranges.borrow().iter().map(|(s, e)| e - s).sum::<u32>(),
+                24
+            );
+            assert_eq!(view.reference_context().unwrap().unwrap().ranges.len(), 2);
+            for b in bases {
+                for p in b.ref_pos.saturating_sub(2)..=b.ref_pos.saturating_add(2) {
+                    assert_eq!(
+                        view.reference_context_base(p).unwrap(),
+                        Some(b"ACGT"[(p % 4) as usize])
+                    );
+                }
+            }
+            assert_eq!(view.reference_context_base(500_000).unwrap(), Some(b'N'));
             let explicit = ReadView::new(0, 0, record, &ctx);
             let (start, reference) = explicit.reference_bases().unwrap().unwrap();
             assert_eq!(start, 98);
             assert_eq!(reference.len(), 1_000_020);
             let calls = ctx.ranges.borrow().len();
             assert_eq!(explicit.aligned().unwrap().unwrap(), bases);
+            assert!(explicit.has_reference_context().unwrap());
+            assert_eq!(
+                explicit.reference_context_base(500_000).unwrap(),
+                Some(b'A')
+            );
             assert_eq!(ctx.ranges.borrow().len(), calls);
         }
     }
