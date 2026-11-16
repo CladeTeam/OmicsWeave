@@ -314,6 +314,34 @@ fn unwritten_chunks_use_library_fill_values() {
 }
 
 #[test]
+fn large_unwritten_pixel_extent_uses_fill_without_a_logical_chunk_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sparse-extent.cool");
+    write_cool(&path, &MapSpec::new(&[("chr1", 10)], 1));
+    const N: usize = 1 << 26;
+    {
+        let file = hdf5_metno::File::open_rw(&path).unwrap();
+        for name in ["pixels/bin1_id", "pixels/bin2_id", "pixels/count"] {
+            file.unlink(name).unwrap();
+            file.new_dataset::<i32>()
+                .shape(N..)
+                .chunk(16)
+                .fill_value(0)
+                .create(name)
+                .unwrap();
+        }
+    }
+    assert!(std::fs::metadata(&path).unwrap().len() < 1 << 20);
+    let cool = Cool::open(&path, "/").unwrap();
+    assert_eq!(cool.n_pixels(), N as u64);
+    assert_eq!(cool.read_paths(), [ReadPath::Library; 3]);
+    let fast = read(&cool, N as u64 - 2..N as u64);
+    assert_eq!(fast.bin1, [0, 0]);
+    assert_eq!(fast.bin2, [0, 0]);
+    assert_eq!(fast.count, [0.0, 0.0]);
+}
+
+#[test]
 fn largest_span_target_covers_all_pixels() {
     let dir = tempfile::tempdir().unwrap();
     let s = spec(500, 94);
@@ -675,6 +703,106 @@ fn chromosome_offsets_are_checked_before_bin_table_access() {
         ),
         "{err}"
     );
+}
+
+#[test]
+fn bin_validation_crosses_batches_and_empty_chromosomes() {
+    for chrom_enum in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batched.cool");
+        let mut s = MapSpec::new(
+            &[
+                ("empty-first", 0),
+                ("first", 65_535),
+                ("empty-middle", 0),
+                ("second", 65_539),
+                ("empty-last", 0),
+            ],
+            1,
+        );
+        s.chrom_enum = chrom_enum;
+        write_cool(&path, &s);
+        let cool = Cool::open(&path, "/").unwrap();
+        assert_eq!(cool.n_bins(), 131_074);
+        assert_eq!(cool.locate(65_534), (1, 65_534));
+        assert_eq!(cool.locate(65_535), (3, 0));
+        assert_eq!(cool.locate(131_073), (3, 65_538));
+        drop(cool);
+
+        // Exercise both the first row of a new batch and the final short
+        // batch; a valid prefix must not hide invalid later metadata.
+        for row in [65_536usize, 131_073] {
+            for (name, expected) in [("start", row - 65_535), ("end", row - 65_534)] {
+                {
+                    let file = hdf5_metno::File::open_rw(&path).unwrap();
+                    file.dataset(&format!("bins/{name}"))
+                        .unwrap()
+                        .write_slice(&[-1i32], row..row + 1)
+                        .unwrap();
+                }
+                assert!(matches!(
+                    Cool::open(&path, "/"),
+                    Err(Error::Invalid {
+                        what: "cool bins",
+                        ..
+                    })
+                ));
+                let file = hdf5_metno::File::open_rw(&path).unwrap();
+                file.dataset(&format!("bins/{name}"))
+                    .unwrap()
+                    .write_slice(&[expected as i32], row..row + 1)
+                    .unwrap();
+            }
+        }
+        assert!(Cool::open(&path, "/").is_ok());
+    }
+}
+
+#[test]
+fn float_bin_ids_are_rejected_even_with_custom_hdf5_layout() {
+    use hdf5_metno as hdf5;
+    use hdf5_metno_sys as sys;
+
+    for custom_bias in [false, true] {
+        for name in ["pixels/bin1_id", "pixels/bin2_id"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("float-ids.cool");
+            let mut s = MapSpec::new(&[("chr1", 10)], 1);
+            s.pixels = vec![(0, 1, 2.0)];
+            write_cool(&path, &s);
+            {
+                let file = hdf5::File::open_rw(&path).unwrap();
+                file.unlink(name).unwrap();
+                let dtype = {
+                    let _lock = sys::LOCK.lock();
+                    // SAFETY: an open file initialized HDF5; the global
+                    // lock protects the predefined type and its new copy.
+                    let id = unsafe { sys::h5t::H5Tcopy(*sys::h5t::H5T_IEEE_F32LE) };
+                    assert!(id >= 0);
+                    // SAFETY: transfer the newly owned valid type once to
+                    // the RAII wrapper while holding the HDF5 lock.
+                    let dtype: hdf5::Datatype = unsafe { hdf5::from_id(id) }.unwrap();
+                    if custom_bias {
+                        // SAFETY: this transient copy is exclusively owned
+                        // and not yet attached to a dataset; lock is held.
+                        assert!(unsafe { sys::h5t::H5Tset_ebias(dtype.id(), 126) } >= 0);
+                    }
+                    dtype
+                };
+                file.new_dataset_builder()
+                    .empty_as(&dtype)
+                    .shape(1)
+                    .create(name)
+                    .unwrap()
+                    .write_raw(&[0.75f32])
+                    .unwrap();
+            }
+            assert!(matches!(
+                Cool::open(&path, "/"),
+                Err(Error::Invalid { what, .. }) if what == name
+            ));
+        }
+    }
 }
 
 fn storage_strategy() -> impl Strategy<Value = Storage> {

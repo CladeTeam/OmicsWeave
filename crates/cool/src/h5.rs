@@ -10,6 +10,7 @@ use hdf5_metno_sys as sys;
 use hdf5::Location;
 use hdf5::types::{FloatSize, IntSize, TypeDescriptor, VarLenAscii, VarLenUnicode};
 use omicsweave_core::{Error, Result};
+use std::ops::Range;
 
 /// Wraps a libhdf5 failure with what was being read.
 pub(crate) fn err(what: &'static str) -> impl FnOnce(hdf5::Error) -> Error {
@@ -204,6 +205,14 @@ pub(crate) fn read_strings(ds: &hdf5::Dataset, what: &'static str) -> Result<Vec
 /// A whole 1-D integer (or integer-based enum) dataset, as stored values.
 pub(crate) fn read_ints(ds: &hdf5::Dataset, what: &'static str) -> Result<Vec<i64>> {
     len_1d(ds, what)?;
+    check_integer(ds, what)?;
+    ds.read_raw::<i64>().map_err(err(what))
+}
+
+/// Checks the stored type independently of whether the byte decoder can
+/// represent its layout. Library conversion must not turn float IDs into
+/// apparently valid integers.
+pub(crate) fn check_integer(ds: &hdf5::Dataset, what: &'static str) -> Result<()> {
     let desc = ds
         .dtype()
         .and_then(|t| t.to_descriptor())
@@ -217,7 +226,71 @@ pub(crate) fn read_ints(ds: &hdf5::Dataset, what: &'static str) -> Result<Vec<i6
             format!("expected integers, found {desc:?}"),
         ));
     }
-    ds.read_raw::<i64>().map_err(err(what))
+    Ok(())
+}
+
+/// Forward-only integer metadata reads. Each column follows its own
+/// chunk grid, so different chunk lengths never cause repeated decoding
+/// or an LCM-sized buffer. Contiguous columns use a fixed-size window;
+/// virtual columns retain a whole-column fallback because their source
+/// chunk grids are not described by the virtual dataset's own layout.
+pub(crate) struct IntCursor {
+    ds: hdf5::Dataset,
+    what: &'static str,
+    len: usize,
+    step: usize,
+    rows: Range<usize>,
+    values: Vec<i64>,
+}
+
+impl IntCursor {
+    pub(crate) fn new(ds: hdf5::Dataset, what: &'static str) -> Result<Self> {
+        let len = usize::try_from(len_1d(&ds, what)?)
+            .map_err(|_| Error::invalid(what, "column length exceeds address space"))?;
+        check_integer(&ds, what)?;
+        const WINDOW: usize = 1 << 16;
+        let step = match ds.layout() {
+            hdf5::dataset::Layout::Virtual => len.max(1),
+            _ => match ds.chunk().and_then(|shape| shape.first().copied()) {
+                Some(0) => return Err(Error::invalid(what, "zero chunk size")),
+                Some(chunk) => (WINDOW / chunk).max(1) * chunk,
+                None => WINDOW,
+            },
+        };
+        Ok(Self {
+            ds,
+            what,
+            len,
+            step,
+            rows: 0..0,
+            values: Vec::new(),
+        })
+    }
+
+    pub(crate) fn get(&mut self, row: usize) -> Result<i64> {
+        if row == self.rows.end {
+            let end = row.saturating_add(self.step).min(self.len);
+            // Release the preceding window before allocating its successor.
+            self.values = Vec::new();
+            let array = self
+                .ds
+                .read_slice_1d::<i64, _>(row..end)
+                .map_err(err(self.what))?;
+            let (values, offset) = array.into_raw_vec_and_offset();
+            if offset != Some(0) || values.len() != end - row {
+                return Err(Error::invalid(
+                    self.what,
+                    "unexpected integer window layout",
+                ));
+            }
+            self.values = values;
+            self.rows = row..end;
+        }
+        self.values
+            .get(row.wrapping_sub(self.rows.start))
+            .copied()
+            .ok_or_else(|| Error::invalid(self.what, "row outside forward metadata window"))
+    }
 }
 
 /// The enum members of a dataset's type, `(name, value)`, or `None` when
@@ -389,5 +462,60 @@ mod tests {
             Some("first")
         );
         assert!(attr_string(&file, "empty").is_err());
+    }
+
+    #[test]
+    fn integer_windows_cover_each_chunk_once_including_large_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5::File::create(dir.path().join("windows.h5")).unwrap();
+        let values: Vec<i32> = (0..400_003).collect();
+        for chunk in [None, Some(1_111), Some(150_000)] {
+            let name = format!("column-{chunk:?}");
+            let builder = file.new_dataset::<i32>().shape(values.len());
+            let ds = match chunk {
+                None => builder.create(name.as_str()).unwrap(),
+                Some(n) => builder.chunk(n).deflate(1).create(name.as_str()).unwrap(),
+            };
+            ds.write_raw(&values).unwrap();
+            let mut cursor = IntCursor::new(ds, "test").unwrap();
+            let mut windows = Vec::new();
+            for (row, &value) in values.iter().enumerate() {
+                if row == cursor.rows.end {
+                    assert_eq!(cursor.get(row).unwrap(), i64::from(value));
+                    windows.push(cursor.rows.clone());
+                } else {
+                    assert_eq!(cursor.get(row).unwrap(), i64::from(value));
+                }
+            }
+            assert_eq!(windows[0].start, 0);
+            assert_eq!(windows.last().unwrap().end, values.len());
+            assert!(windows.windows(2).all(|w| w[0].end == w[1].start));
+            if let Some(chunk) = chunk {
+                assert!(windows.iter().all(|w| w.start % chunk == 0));
+                assert!(
+                    windows[..windows.len() - 1]
+                        .iter()
+                        .all(|w| w.end % chunk == 0)
+                );
+            }
+        }
+        let virtual_ds = file
+            .new_dataset::<i32>()
+            .shape(values.len())
+            .virtual_map(
+                ".",
+                "/column-Some(150000)",
+                values.len(),
+                ..,
+                values.len(),
+                ..,
+            )
+            .create("virtual")
+            .unwrap();
+        let mut cursor = IntCursor::new(virtual_ds, "test").unwrap();
+        for (row, &value) in values.iter().enumerate() {
+            assert_eq!(cursor.get(row).unwrap(), i64::from(value));
+            assert_eq!(cursor.rows, 0..values.len());
+        }
     }
 }

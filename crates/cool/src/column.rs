@@ -252,10 +252,10 @@ impl Column {
     ) -> Result<Column> {
         let ds = h5::dataset(group, path)?;
         let len = h5::len_1d(&ds, path)?;
-        let elem = h5::elem(&ds, path)?;
-        if integer && elem.is_some_and(|e| e.kind == ElemKind::Float) {
-            return Err(Error::invalid(path, "bin ids are not integers"));
+        if integer {
+            h5::check_integer(&ds, path)?;
         }
+        let elem = h5::elem(&ds, path)?;
         let store = match elem {
             Some(e) if len > 0 => store(&ds, path, len, e, file_len)?,
             _ => Store::Library,
@@ -473,6 +473,12 @@ fn store(
             };
             let n = usize::try_from(len.div_ceil(chunk_len))
                 .map_err(|_| Error::invalid(what, "chunk index size overflow"))?;
+            // An absent chunk requires library fill-value handling for
+            // this column. Detect that before allocating a directory for
+            // a potentially enormous, mostly unwritten logical extent.
+            if ds.num_chunks().is_some_and(|allocated| allocated < n) {
+                return Ok(Store::Library);
+            }
             // HDF5 reserves HADDR_UNDEF for an absent address; it cannot
             // name any allocated chunk. Keep holes in the final index so
             // constructing it needs only one allocation.

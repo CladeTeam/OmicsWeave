@@ -435,17 +435,24 @@ fn read_chroms(grp: &hdf5::Group) -> Result<Vec<CoolChrom>> {
 /// and the bin count.
 fn read_bins(grp: &hdf5::Group, chroms: &[CoolChrom], bin_size: u32) -> Result<(Vec<u64>, u64)> {
     let chrom_ds = h5::dataset(grp, "bins/chrom")?;
-    let chrom_col = h5::read_ints(&chrom_ds, "bins/chrom")?;
-    let start = h5::read_ints(&h5::dataset(grp, "bins/start")?, "bins/start")?;
-    let end = h5::read_ints(&h5::dataset(grp, "bins/end")?, "bins/end")?;
-    let n_bins = chrom_col.len();
-    if start.len() != n_bins || end.len() != n_bins {
+    let start_ds = h5::dataset(grp, "bins/start")?;
+    let end_ds = h5::dataset(grp, "bins/end")?;
+    let n_bins = h5::len_1d(&chrom_ds, "bins/chrom")?;
+    let n_start = h5::len_1d(&start_ds, "bins/start")?;
+    let n_end = h5::len_1d(&end_ds, "bins/end")?;
+    for (ds, name) in [
+        (&chrom_ds, "bins/chrom"),
+        (&start_ds, "bins/start"),
+        (&end_ds, "bins/end"),
+    ] {
+        h5::check_integer(ds, name)?;
+    }
+    if n_start != n_bins || n_end != n_bins {
         return Err(Error::invalid(
             "cool bins",
             format!(
                 "column lengths differ: chrom {n_bins}, start {}, end {}",
-                start.len(),
-                end.len()
+                n_start, n_end
             ),
         ));
     }
@@ -485,7 +492,7 @@ fn read_bins(grp: &hdf5::Group, chroms: &[CoolChrom], bin_size: u32) -> Result<(
         .map(|&o| u64::try_from(o))
         .collect::<std::result::Result<_, _>>()
         .map_err(|_| Error::invalid("indexes/chrom_offset", "negative offset"))?;
-    if offsets[0] != 0 || offsets[chroms.len()] != n_bins as u64 {
+    if offsets[0] != 0 || offsets[chroms.len()] != n_bins {
         return Err(Error::invalid(
             "indexes/chrom_offset",
             format!(
@@ -519,26 +526,44 @@ fn read_bins(grp: &hdf5::Group, chroms: &[CoolChrom], bin_size: u32) -> Result<(
                 ),
             ));
         }
-        for i in lo..hi {
-            let local = i - lo;
-            let s = local * size;
-            let e = (s + size).min(len);
-            let row = i as usize;
-            let stored = chrom_col[row];
-            let chrom_index = match &by_value {
-                Some(map) => map.get(&stored).copied(),
-                None => usize::try_from(stored).ok(),
-            };
-            if chrom_index != Some(c) || start[row] != s as i64 || end[row] != e as i64 {
-                return Err(Error::invalid(
-                    "cool bins",
-                    format!(
-                        "bin {i} is (chrom {stored}, {}, {}), expected ({}, {s}, {e}) \
-                         for fixed {size} bp bins",
-                        start[row], end[row], chrom.name
-                    ),
-                ));
-            }
+    }
+
+    // Independent chunk-aligned windows keep metadata memory bounded by
+    // the stored chunks without repeatedly decoding large chunks.
+    let n_bins = usize::try_from(n_bins)
+        .map_err(|_| Error::invalid("cool bins", "bin table length exceeds address space"))?;
+    let mut chrom_col = h5::IntCursor::new(chrom_ds, "bins/chrom")?;
+    let mut start_col = h5::IntCursor::new(start_ds, "bins/start")?;
+    let mut end_col = h5::IntCursor::new(end_ds, "bins/end")?;
+    let mut c = 0;
+    for row in 0..n_bins {
+        let i = row as u64;
+        // The checked sentinel is n_bins > i, including when empty
+        // chromosomes share an offset, so this stops before the sentinel.
+        while offsets[c + 1] <= i {
+            c += 1;
+        }
+        let chrom = &chroms[c];
+        let len = u64::from(chrom.length);
+        let local = i - offsets[c];
+        let s = local * size;
+        let e = (s + size).min(len);
+        let stored = chrom_col.get(row)?;
+        let start = start_col.get(row)?;
+        let end = end_col.get(row)?;
+        let chrom_index = match &by_value {
+            Some(map) => map.get(&stored).copied(),
+            None => usize::try_from(stored).ok(),
+        };
+        if chrom_index != Some(c) || start != s as i64 || end != e as i64 {
+            return Err(Error::invalid(
+                "cool bins",
+                format!(
+                    "bin {i} is (chrom {stored}, {start}, {end}), expected ({}, {s}, {e}) \
+                     for fixed {size} bp bins",
+                    chrom.name
+                ),
+            ));
         }
     }
     Ok((offsets, n_bins as u64))
