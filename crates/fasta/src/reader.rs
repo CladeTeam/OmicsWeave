@@ -124,18 +124,15 @@ impl<S: ReadAt> SequenceRead for FastaReader<S> {
 
 impl<S: ReadAt> FastaReader<S> {
     /// The forward concatenation of a multi-span locus. In bgzip files,
-    /// consecutive spans that share a BGZF block are decoded together, so
-    /// every block is inflated once; cached and plain files read span by
-    /// span, which repeats no decoding.
+    /// consecutive spans that share BGZF blocks are decoded in bounded
+    /// runs. A run boundary may revisit one block, keeping a sparse locus
+    /// from materializing a chromosome-sized hull in working memory.
     fn read_spans(&mut self, locus: &Locus<'_>, out: &mut [u8]) -> Result<()> {
-        let pieces: Vec<(u32, Region<'_>)> = locus.pieces().collect();
-        let Some(gzi) = self
-            .gzi
-            .as_ref()
-            .filter(|_| self.cache.is_none())
-            .map(Arc::clone)
-        else {
-            for (at, region) in pieces {
+        if let Some(cache) = self.cache.as_ref().map(Arc::clone) {
+            return self.sequence_cached_locus(locus, out, &cache);
+        }
+        let Some(gzi) = self.gzi.as_ref().map(Arc::clone) else {
+            for (at, region) in locus.pieces() {
                 let at = at as usize;
                 self.read_region(region, &mut out[at..at + region.len() as usize])?;
             }
@@ -143,30 +140,69 @@ impl<S: ReadAt> FastaReader<S> {
         };
         let fai = Arc::clone(&self.fai);
         let entry = entry(&fai, locus.chrom)?;
-        let blocks = pieces
-            .iter()
-            .map(|(_, r)| Ok(gzi.indices(entry.text_range(r.start, r.end)?)))
-            .collect::<Result<Vec<_>>>()?;
+        let spans = locus.spans();
         let mut i = 0;
-        while i < pieces.len() {
+        let mut output_at = 0usize;
+        let mut pending = None;
+        while i < spans.len() {
+            if spans[i].is_empty() {
+                i += 1;
+                continue;
+            }
+            let first = spans[i];
+            let blocks = match pending.take() {
+                Some(blocks) => blocks,
+                None => gzi.indices(entry.text_range(first.start, first.end)?),
+            };
+            let mut block_end = blocks.end;
+            let mut hull_end = first.end;
+            let mut count = 1;
             let mut j = i + 1;
-            while j < pieces.len() && blocks[j].start < blocks[j - 1].end {
+            while j < spans.len() {
+                let span = spans[j];
+                if span.is_empty() {
+                    j += 1;
+                    continue;
+                }
+                let blocks = gzi.indices(entry.text_range(span.start, span.end)?);
+                if blocks.start >= block_end || (span.end - first.start) as u64 > READ_BATCH_LEN {
+                    pending = Some(blocks);
+                    break;
+                }
+                hull_end = span.end;
+                block_end = blocks.end;
+                count += 1;
                 j += 1;
             }
-            let (at, first) = pieces[i];
-            let at = at as usize;
-            if j == i + 1 {
-                self.read_region(first, &mut out[at..at + first.len() as usize])?;
+            if count == 1 {
+                let len = first.len() as usize;
+                self.read_region(
+                    Region::new(locus.chrom, first.start, first.end),
+                    &mut out[output_at..output_at + len],
+                )?;
+                output_at += len;
             } else {
-                let hull = Region::new(locus.chrom, first.start, pieces[j - 1].1.end);
+                let hull = Region::new(locus.chrom, first.start, hull_end);
                 let mut bases = std::mem::take(&mut self.hull);
-                let result = grow(&mut bases, hull.len() as usize)
-                    .and_then(|()| self.read_region(hull, &mut bases[..hull.len() as usize]));
+                let len = hull.len() as usize;
+                let result = (|| {
+                    if len > bases.len() {
+                        bases
+                            .try_reserve_exact(len - bases.len())
+                            .map_err(|e| Error::invalid("sequence buffer", e.to_string()))?;
+                        bases.resize(len, 0);
+                    }
+                    self.read_region(hull, &mut bases[..len])
+                })();
                 if result.is_ok() {
-                    for &(at, region) in &pieces[i..j] {
-                        let lo = (region.start - hull.start) as usize;
-                        let len = region.len() as usize;
-                        out[at as usize..at as usize + len].copy_from_slice(&bases[lo..lo + len]);
+                    for span in &spans[i..j] {
+                        if span.is_empty() {
+                            continue;
+                        }
+                        let lo = (span.start - hull.start) as usize;
+                        let len = span.len() as usize;
+                        out[output_at..output_at + len].copy_from_slice(&bases[lo..lo + len]);
+                        output_at += len;
                     }
                 }
                 self.hull = bases;
@@ -577,6 +613,8 @@ impl<S: ReadAt> SequenceRead for TwoBitReader<S> {
         check_output("sequence", out.len(), locus.len() as usize)?;
         if locus.spans().len() == 1 {
             self.read_region(locus.hull(), out)?;
+        } else if let Some(cache) = self.cache.as_ref().map(Arc::clone) {
+            self.sequence_cached_locus(locus, out, &cache)?;
         } else {
             for (at, region) in locus.pieces() {
                 let at = at as usize;

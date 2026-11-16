@@ -3,7 +3,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use omicsweave_core::cache::{BlockCache, BlockKey, SourceToken};
+use omicsweave_core::cache::{BlockCache, BlockKey, CacheLease, SourceToken};
 use omicsweave_core::{FileSource, Locus, ReadAt, Region, check_output};
 
 use crate::bgzf::{Inflater, MAX_BLOCK_LEN};
@@ -56,7 +56,6 @@ impl<S: ReadAt> FastaReader<S> {
         for (_, region) in locus.pieces() {
             self.describe_region(region, out)?;
         }
-        out.dedup();
         Ok(())
     }
 
@@ -69,7 +68,10 @@ impl<S: ReadAt> FastaReader<S> {
         if !region.is_empty() {
             let range = entry.text_range(region.start, region.end)?;
             for block in gzi.blocks(range, self.source.len()) {
-                out.push(bgzf_key(self.namespace, &block));
+                let key = bgzf_key(self.namespace, &block);
+                if out.last() != Some(&key) {
+                    out.push(key);
+                }
             }
         }
         Ok(())
@@ -81,7 +83,30 @@ impl<S: ReadAt> FastaReader<S> {
         out: &mut [u8],
         cache: &BlockCache,
     ) -> Result<()> {
-        self.cached_blocks(region, Some(out), cache)
+        self.cached_blocks(region, Some(out), cache, &mut None, &mut None)
+    }
+
+    pub(crate) fn sequence_cached_locus(
+        &mut self,
+        locus: &Locus<'_>,
+        out: &mut [u8],
+        cache: &BlockCache,
+    ) -> Result<()> {
+        // Ordered, disjoint spans can share only their boundary block. Its
+        // lease belongs to this operation, including when admission fails;
+        // no decoded result remains in the reader after the operation.
+        let (mut last, mut raw_run) = (None, None);
+        for (at, region) in locus.pieces() {
+            let at = at as usize;
+            self.cached_blocks(
+                region,
+                Some(&mut out[at..at + region.len() as usize]),
+                cache,
+                &mut last,
+                &mut raw_run,
+            )?;
+        }
+        Ok(())
     }
 
     /// Loads the locus' decoded BGZF blocks into the attached external
@@ -94,8 +119,9 @@ impl<S: ReadAt> FastaReader<S> {
             .map(Arc::clone)
             .ok_or_else(|| Error::invalid("FASTA cache", "no external cache is attached"))?;
         locus.check()?;
+        let (mut last, mut raw_run) = (None, None);
         for (_, region) in locus.pieces() {
-            self.cached_blocks(region, None, &cache)?;
+            self.cached_blocks(region, None, &cache, &mut last, &mut raw_run)?;
         }
         Ok(())
     }
@@ -105,6 +131,8 @@ impl<S: ReadAt> FastaReader<S> {
         region: Region<'_>,
         mut out: Option<&mut [u8]>,
         cache: &BlockCache,
+        last: &mut Option<CacheLease<BgzfText>>,
+        raw_run: &mut Option<Range<u64>>,
     ) -> Result<()> {
         let entry = entry(&self.fai, region.chrom)?;
         region.check_within(entry.len)?;
@@ -127,7 +155,6 @@ impl<S: ReadAt> FastaReader<S> {
         };
         let indices = gzi.indices(range.clone());
         let file_len = self.source.len();
-        let mut raw_run: Option<Range<u64>> = None;
         let mut decoder = out
             .as_ref()
             .map(|_| TextDecoder::new(entry, region.start, region.end))
@@ -142,51 +169,59 @@ impl<S: ReadAt> FastaReader<S> {
                 ));
             }
             let key = bgzf_key(self.namespace, &block);
-            let data = cache.get_or_load(key, || {
-                let count = read_len(&block.compressed, file_len)?;
-                if !raw_run.as_ref().is_some_and(|run| {
-                    run.start <= block.compressed.start && block.compressed.end <= run.end
-                }) {
-                    // A miss reads one bounded adjacent run, so following
-                    // misses reuse compressed bytes instead of issuing one
-                    // positional read per block. Hits perform no reads.
-                    let start = block.compressed.start;
-                    let mut end = block.compressed.end;
-                    for j in i + 1..indices.end {
-                        let next = read.block(j, file_len);
-                        if next.compressed.start != end
-                            || next.compressed.end < next.compressed.start
-                            || next.compressed.end.saturating_sub(start) > 1 << 20
-                        {
-                            break;
+            if last.as_ref().is_none_or(|data| data.key != key) {
+                // Release the preceding lease before admission of a new
+                // block, so a bounded cache is not pinned by this operation.
+                *last = None;
+                *last = Some(cache.get_or_load(key, || {
+                    let count = read_len(&block.compressed, file_len)?;
+                    if !raw_run.as_ref().is_some_and(|run| {
+                        run.start <= block.compressed.start && block.compressed.end <= run.end
+                    }) {
+                        // A miss reads one bounded adjacent run, so following
+                        // misses reuse compressed bytes instead of issuing one
+                        // positional read per block. Hits perform no reads.
+                        let start = block.compressed.start;
+                        let mut end = block.compressed.end;
+                        for j in i + 1..indices.end {
+                            let next = read.block(j, file_len);
+                            if next.compressed.start != end
+                                || next.compressed.end < next.compressed.start
+                                || next.compressed.end.saturating_sub(start) > 1 << 20
+                            {
+                                break;
+                            }
+                            end = next.compressed.end;
                         }
-                        end = next.compressed.end;
+                        let run = start..end;
+                        let len = read_len(&run, file_len)?;
+                        grow(read.raw, len)?;
+                        read.source.read_exact_at(&mut read.raw[..len], start)?;
+                        *raw_run = Some(run);
                     }
-                    let run = start..end;
-                    let len = read_len(&run, file_len)?;
-                    grow(read.raw, len)?;
-                    read.source.read_exact_at(&mut read.raw[..len], start)?;
-                    raw_run = Some(run);
-                }
-                let run = raw_run.as_ref().expect("miss populated compressed run");
-                let at = (block.compressed.start - run.start) as usize;
-                grow(read.text, MAX_BLOCK_LEN)?;
-                let (used, mut n) = read
-                    .inflater
-                    .inflate_block(&read.raw[at..at + count], &mut read.text[..MAX_BLOCK_LEN])?;
-                if n == 0 && block.text_len != Some(0) {
-                    n = read.after_empty_members(block.compressed.start + used as u64, file_len)?;
-                }
-                if block.text_len.is_some_and(|expected| expected != n as u64) {
-                    return Err(Error::invalid(
-                        "gzi",
-                        "indexed block lengths differ from BGZF data",
-                    ));
-                }
-                let bytes = read.text[..n].to_vec();
-                let charge = bytes.capacity();
-                Ok((BgzfText { key, bytes }, charge))
-            })?;
+                    let run = raw_run.as_ref().expect("miss populated compressed run");
+                    let at = (block.compressed.start - run.start) as usize;
+                    grow(read.text, MAX_BLOCK_LEN)?;
+                    let (used, mut n) = read.inflater.inflate_block(
+                        &read.raw[at..at + count],
+                        &mut read.text[..MAX_BLOCK_LEN],
+                    )?;
+                    if n == 0 && block.text_len != Some(0) {
+                        n = read
+                            .after_empty_members(block.compressed.start + used as u64, file_len)?;
+                    }
+                    if block.text_len.is_some_and(|expected| expected != n as u64) {
+                        return Err(Error::invalid(
+                            "gzi",
+                            "indexed block lengths differ from BGZF data",
+                        ));
+                    }
+                    let bytes = read.text[..n].to_vec();
+                    let charge = bytes.capacity();
+                    Ok((BgzfText { key, bytes }, charge))
+                })?);
+            }
+            let data = last.as_ref().expect("the current block has been loaded");
             if data.key != key || block.text_len.is_some_and(|n| n != data.bytes.len() as u64) {
                 return Err(Error::invalid(
                     "FASTA cache",
@@ -224,7 +259,6 @@ impl<S: ReadAt> TwoBitReader<S> {
         for span in locus.spans() {
             self.describe_region(Region::new(locus.chrom, span.start, span.end), out)?;
         }
-        out.dedup();
         Ok(())
     }
 
@@ -236,7 +270,10 @@ impl<S: ReadAt> TwoBitReader<S> {
         region.check_within(self.records[record].len())?;
         if !region.is_empty() {
             for tile in region.start / self.tile_bases..=(region.end - 1) / self.tile_bases {
-                out.push(twobit_key(self.namespace, record, tile, self.tile_bases));
+                let key = twobit_key(self.namespace, record, tile, self.tile_bases);
+                if out.last() != Some(&key) {
+                    out.push(key);
+                }
             }
         }
         Ok(())
@@ -248,7 +285,26 @@ impl<S: ReadAt> TwoBitReader<S> {
         out: &mut [u8],
         cache: &BlockCache,
     ) -> Result<()> {
-        self.cached_tiles(region, Some(out), cache)
+        self.cached_tiles(region, Some(out), cache, &mut None)
+    }
+
+    pub(crate) fn sequence_cached_locus(
+        &mut self,
+        locus: &Locus<'_>,
+        out: &mut [u8],
+        cache: &BlockCache,
+    ) -> Result<()> {
+        let mut last = None;
+        for (at, region) in locus.pieces() {
+            let at = at as usize;
+            self.cached_tiles(
+                region,
+                Some(&mut out[at..at + region.len() as usize]),
+                cache,
+                &mut last,
+            )?;
+        }
+        Ok(())
     }
 
     /// Loads fixed decoded tiles into the attached external cache without
@@ -261,8 +317,9 @@ impl<S: ReadAt> TwoBitReader<S> {
             .map(Arc::clone)
             .ok_or_else(|| Error::invalid("2bit cache", "no external cache is attached"))?;
         locus.check()?;
+        let mut last = None;
         for (_, region) in locus.pieces() {
-            self.cached_tiles(region, None, &cache)?;
+            self.cached_tiles(region, None, &cache, &mut last)?;
         }
         Ok(())
     }
@@ -272,6 +329,7 @@ impl<S: ReadAt> TwoBitReader<S> {
         region: Region<'_>,
         mut out: Option<&mut [u8]>,
         cache: &BlockCache,
+        last: &mut Option<CacheLease<TwoBitTile>>,
     ) -> Result<()> {
         let record_index = self
             .directory
@@ -308,19 +366,23 @@ impl<S: ReadAt> TwoBitReader<S> {
             let start = tile * self.tile_bases;
             let end = record.len().min(start.saturating_add(self.tile_bases));
             let key = twobit_key(self.namespace, record_index, tile, self.tile_bases);
-            let data = cache.get_or_load(key, || {
-                let range = record.packed_range(start, end)?;
-                let n = read_len(&range, self.source.len())?;
-                grow(&mut self.packed, n)?;
-                if n != 0 {
-                    self.source
-                        .read_exact_at(&mut self.packed[..n], range.start)?;
-                }
-                let mut bytes = vec![0; (end - start) as usize];
-                record.decode(start, &self.packed[..n], &mut bytes, false)?;
-                let charge = bytes.capacity();
-                Ok((TwoBitTile { key, bytes }, charge))
-            })?;
+            if last.as_ref().is_none_or(|data| data.key != key) {
+                *last = None;
+                *last = Some(cache.get_or_load(key, || {
+                    let range = record.packed_range(start, end)?;
+                    let n = read_len(&range, self.source.len())?;
+                    grow(&mut self.packed, n)?;
+                    if n != 0 {
+                        self.source
+                            .read_exact_at(&mut self.packed[..n], range.start)?;
+                    }
+                    let mut bytes = vec![0; (end - start) as usize];
+                    record.decode(start, &self.packed[..n], &mut bytes, false)?;
+                    let charge = bytes.capacity();
+                    Ok((TwoBitTile { key, bytes }, charge))
+                })?);
+            }
+            let data = last.as_ref().expect("the current tile has been loaded");
             if data.key != key || data.bytes.len() != (end - start) as usize {
                 return Err(Error::invalid(
                     "2bit cache",
