@@ -24,7 +24,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from . import _native
+from . import _budget, _native
 from .formats import PathLike
 from .types import Region, RegionLike, Spliced, StringVector
 from .types._genome import as_region
@@ -41,11 +41,13 @@ __all__ = [
     "IntervalSet",
     "Junctions",
     "Level",
+    "OtherTable",
     "Part",
     "Problem",
     "Selection",
     "Transcript",
     "TranscriptTable",
+    "read_aliases",
 ]
 
 Level = Literal["gene", "transcript", "exon"]
@@ -183,6 +185,38 @@ class FeatureTable:
 
     def __len__(self) -> int:
         return len(self.start)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class OtherTable:
+    """Records that are neither genes, transcripts nor their features (GFF3
+    ``region``, ``repeat_region``, ...), in file order. ``type``, ``source``,
+    ``score`` and ``id`` (``ID``, or ``gene_id`` in GTF) are as written;
+    ``phase`` is 0-2, or 255 for ``.``."""
+
+    chroms: tuple[str, ...]
+    seqid: np.ndarray
+    start: np.ndarray
+    end: np.ndarray
+    strand: np.ndarray
+    phase: np.ndarray
+    type: StringVector
+    source: StringVector
+    score: StringVector
+    id: StringVector
+
+    def __len__(self) -> int:
+        return len(self.start)
+
+
+def read_aliases(path: PathLike) -> dict[str, str]:
+    """Chromosome aliases from a file of two names per line (``from to``, as
+    a UCSC ``chromAlias`` table reduced to two columns); ``#`` lines and
+    blank lines are skipped."""
+    return dict(_native.read_aliases(os.fspath(path)))
+
+
+Mode = Literal["overlaps", "within", "containing"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,10 +368,12 @@ class IntervalSet:
         names = self._columns["name"]
         return None if names is None else _strings(names)
 
-    def overlaps(self, region: RegionLike) -> np.ndarray:
-        """Rows overlapping ``region``, in start order."""
+    def overlaps(self, region: RegionLike, mode: Mode = "overlaps") -> np.ndarray:
+        """Rows overlapping ``region`` (``mode="overlaps"``), lying within it
+        (``"within"``) or covering all of it (``"containing"``), in start
+        order."""
         r = as_region(region)
-        return self._native.overlaps(r.chrom, r.start, r.end)
+        return self._native.overlaps(r.chrom, r.start, r.end, mode)
 
     def overlaps_batch(self, regions: Iterable[RegionLike]) -> tuple[np.ndarray, np.ndarray]:
         """Rows overlapping each region: ``(offsets, rows)``, region ``i``'s
@@ -417,21 +453,26 @@ class Annotation:
     def read(
         cls,
         path: PathLike,
+        *,
         attributes: Literal["all"] | Sequence[str] | None = "all",
         aliases: Mapping[str, str] | None = None,
         strict: bool = False,
-        threads: int = 0,
+        threads: int | None = None,
         dialect: Literal["gtf", "gff3"] | None = None,
+        batch_bytes: int | None = None,
     ) -> Annotation:
         """Reads a GTF or GFF3 file (plain, gzip or BGZF, told by content).
 
         ``attributes`` keeps every attribute (``"all"``: lossless, needed to
         write the original GTF back), only the keys listed, or none
         (``None``); ids, names, biotypes and tags are read regardless.
-        ``aliases`` renames chromosomes (``{"1": "chr1"}``). Problems
-        (orphans, duplicate ids, strand conflicts, ...) are collected in
-        :attr:`report`, or raised as
-        :class:`~omicsweave.errors.FormatError` when ``strict``.
+        ``aliases`` renames chromosomes (``{"1": "chr1"}``;
+        :func:`read_aliases` reads them from a file). Problems (orphans,
+        duplicate ids, strand conflicts, ...) are collected in
+        :attr:`report`, or raised as :class:`~omicsweave.errors.FormatError`
+        when ``strict``. ``threads`` parse in parallel (default: the
+        available cores, at most 8), ``batch_bytes`` of text each (default
+        4 MiB).
         """
         if attributes == "all":
             mode, keys = "all", None
@@ -443,7 +484,16 @@ class Annotation:
             mode, keys = "only", [str(k) for k in attributes]
         pairs = None if aliases is None else [(str(a), str(b)) for a, b in aliases.items()]
         fspath = os.fspath(path)
-        native = _native.Annotation(fspath, mode, keys, pairs, strict, threads, dialect)
+        native = _native.Annotation(
+            fspath,
+            mode,
+            keys,
+            pairs,
+            strict,
+            threads=_budget.threads(threads),
+            dialect=dialect,
+            batch_bytes=batch_bytes,
+        )
         kwargs = dict(
             attributes=attributes
             if isinstance(attributes, str) or attributes is None
@@ -452,6 +502,7 @@ class Annotation:
             strict=strict,
             threads=threads,
             dialect=dialect,
+            batch_bytes=batch_bytes,
         )
         return cls(native, fspath, kwargs)
 
@@ -551,6 +602,22 @@ class Annotation:
         """The exon rows of :attr:`features`; exon-level queries return rows
         of this table."""
         return self._features(True)
+
+    @cached_property
+    def others(self) -> OtherTable:
+        c = self._native.others()
+        return OtherTable(
+            self.chroms,
+            c["seqid"],
+            c["start"],
+            c["end"],
+            c["strand"],
+            c["phase"],
+            _strings(c["type"]),
+            _strings(c["source"]),
+            _strings(c["score"]),
+            _strings(c["id"]),
+        )
 
     @cached_property
     def report(self) -> AnnotationReport:
