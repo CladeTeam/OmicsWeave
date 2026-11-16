@@ -150,6 +150,13 @@ fn compare_with_libbigwig(seed: u64, source: BinSource) -> Result<(), TestCaseEr
     Ok(())
 }
 
+#[test]
+fn mixed_section_statistics_match_libbigwig() {
+    for source in [BinSource::Exact, BinSource::Zoom] {
+        compare_with_libbigwig(5_161_540_668_705_399_665, source).unwrap();
+    }
+}
+
 /// Statistics of positions `[lo, hi)` of per-base values (NaN = no data).
 fn brute(values: &[f32], stat: Stat) -> f64 {
     let data: Vec<f64> = values

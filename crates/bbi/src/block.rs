@@ -1053,6 +1053,30 @@ pub struct ZoomBlock<'a> {
     order: Order,
 }
 
+/// Validated zoom bytes and their ordering certificate, owned by an external cache.
+pub(crate) struct OwnedZoomBlock {
+    bytes: Vec<u8>,
+    order: Order,
+}
+
+impl OwnedZoomBlock {
+    pub(crate) fn new(bytes: Vec<u8>) -> Result<Self> {
+        let order = ZoomBlock::parse(&bytes)?.prepare().order;
+        Ok(Self { bytes, order })
+    }
+
+    pub(crate) fn view(&self) -> ZoomBlock<'_> {
+        ZoomBlock {
+            buf: &self.bytes,
+            order: self.order,
+        }
+    }
+
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.bytes.capacity()
+    }
+}
+
 impl<'a> ZoomBlock<'a> {
     pub fn parse(buf: &'a [u8]) -> Result<ZoomBlock<'a>> {
         if !buf.len().is_multiple_of(ZOOM_RECORD_LEN) {
@@ -1161,5 +1185,92 @@ impl<'a> ZoomBlock<'a> {
             // SAFETY: The range bounds i to the complete record count.
             unsafe { block.record_unchecked(i) }
         })
+    }
+}
+
+#[cfg(test)]
+mod zoom_order_tests {
+    use super::*;
+
+    fn bytes(records: &[Summary]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(records.len() * ZOOM_RECORD_LEN);
+        for &record in records {
+            for word in bits(record) {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    fn bits(z: Summary) -> [u32; 8] {
+        [
+            z.chrom,
+            z.start,
+            z.end,
+            z.valid,
+            z.min.to_bits(),
+            z.max.to_bits(),
+            z.sum.to_bits(),
+            z.sum_squares.to_bits(),
+        ]
+    }
+
+    #[test]
+    fn cached_zoom_order_matches_raw_for_sorted_nested_and_unsorted_records() {
+        let mut records: Vec<_> = (0..512)
+            .map(|i| Summary {
+                chrom: 0,
+                start: i * 10,
+                end: i * 10 + 8,
+                valid: 8,
+                min: -0.0,
+                max: i as f32,
+                sum: f32::from_bits(0x7fc0_0123),
+                sum_squares: 0.0,
+            })
+            .collect();
+        for pattern in 0..3 {
+            if pattern == 1 {
+                records[0].end = 6000;
+            }
+            if pattern == 2 {
+                records.swap(2, 510);
+            }
+            let data = bytes(&records);
+            let raw = ZoomBlock::parse(&data).unwrap();
+            let owned = OwnedZoomBlock::new(data.clone()).unwrap();
+            let prepared = owned.view();
+            for (start, end) in [
+                (0, 0),
+                (0, 1),
+                (1, 7),
+                (2510, 2518),
+                (0, 6000),
+                (6000, 7000),
+            ] {
+                for chrom in [0, 1] {
+                    let want: Vec<_> = raw.overlapping(chrom, start, end).map(bits).collect();
+                    let got: Vec<_> = prepared.overlapping(chrom, start, end).map(bits).collect();
+                    assert_eq!(got, want);
+                }
+            }
+            if pattern == 0 {
+                let probes = std::cell::Cell::new(0);
+                let range = prepared
+                    .order
+                    .candidates(prepared.len(), (0, 2510), (0, 2518), |i| {
+                        probes.set(probes.get() + 1);
+                        prepared.bounds(i)
+                    });
+                assert_eq!(range.len(), 1);
+                assert!(probes.get() <= 20);
+                assert_eq!(
+                    raw.order
+                        .candidates(raw.len(), (0, 2510), (0, 2518), |i| raw.bounds(i))
+                        .len(),
+                    512
+                );
+            }
+        }
     }
 }

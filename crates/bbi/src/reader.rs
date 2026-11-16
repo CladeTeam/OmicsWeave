@@ -1,6 +1,7 @@
 //! [`BbiReader`]: the standard access to a bigWig or bigBed file, composing
 //! the crate's steps over a caller-provided byte source.
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use omicsweave_core::{
     IntervalsOut, Locus, ReadAt, Region, Span, TrackEntry, TrackRead, ZoomPiece, check_output,
 };
 
-use crate::block::{BedBlock, OwnedBedBlock, OwnedWigBlock, WigBlock, ZoomBlock};
+use crate::block::{BedBlock, OwnedBedBlock, OwnedWigBlock, OwnedZoomBlock, WigBlock, ZoomBlock};
 use crate::chroms::{ChromId, Chroms};
 use crate::error::{Error, Result};
 use crate::header::{HEADER_LEN, Header, Kind, TotalSummary, ZoomLevel};
@@ -38,6 +39,21 @@ fn grow(buf: &mut Vec<u8>, need: usize) -> Result<()> {
     Ok(())
 }
 
+fn selected_pieces<'p, 'l>(
+    pieces: &'p [(u32, Region<'l>)],
+    offsets: &[usize],
+    ids: &'p [usize],
+    block: usize,
+) -> impl Iterator<Item = (u32, Region<'l>)> + use<'p, 'l> {
+    let linked = !offsets.is_empty();
+    let range = if linked {
+        offsets[block]..offsets[block + 1]
+    } else {
+        0..pieces.len()
+    };
+    range.map(move |i| pieces[if linked { ids[i] } else { i }])
+}
+
 /// A bigWig ([`TrackRead`]) or bigBed ([`IntervalRead`]) file. Opening reads
 /// the header, chromosome tree and base index once and keeps them; each
 /// query reads and decodes only the data blocks it overlaps, once.
@@ -57,6 +73,10 @@ pub struct BbiReader<S> {
     index_nodes: Arc<Vec<NodeInfo>>,
     inflater: Option<Inflater>,
     blocks: Vec<BlockRef>,
+    /// Flat block-to-locus-piece links, avoiding unrelated span probes.
+    block_hits: Vec<(BlockRef, usize)>,
+    block_piece_offsets: Vec<usize>,
+    block_piece_ids: Vec<usize>,
     raw: Vec<u8>,
     raw_run: Option<ReadRun>,
     inflated: Vec<u8>,
@@ -93,7 +113,7 @@ enum CachedData {
     Wig(OwnedWigBlock),
     Bed(OwnedBedBlock),
     /// Decompressed zoom records.
-    Zoom(Vec<u8>),
+    Zoom(OwnedZoomBlock),
 }
 
 struct CachedBlock {
@@ -157,6 +177,9 @@ impl<S: ReadAt> BbiReader<S> {
             index_nodes: Arc::new(index_nodes),
             inflater: None,
             blocks: Vec::new(),
+            block_hits: Vec::new(),
+            block_piece_offsets: Vec::new(),
+            block_piece_ids: Vec::new(),
             raw: Vec::new(),
             raw_run: None,
             track_entries: Vec::new(),
@@ -299,13 +322,12 @@ impl<S: ReadAt> BbiReader<S> {
     ) -> Result<CacheLease<CachedBlock>> {
         let key = self.block_key_at(self.blocks[i], 1 + level as u64);
         let block = cache.get_or_load(key, || {
-            let bytes = self.load(i)?.to_vec();
-            ZoomBlock::parse(&bytes)?;
-            let heap = bytes.capacity();
+            let block = OwnedZoomBlock::new(self.load(i)?.to_vec())?;
+            let heap = block.heap_bytes();
             Ok((
                 CachedBlock {
                     key,
-                    data: CachedData::Zoom(bytes),
+                    data: CachedData::Zoom(block),
                 },
                 heap,
             ))
@@ -384,6 +406,8 @@ impl<S: ReadAt> BbiReader<S> {
     /// Collects the blocks overlapping `[start, end)` into `self.blocks`.
     fn find_blocks(&mut self, chrom: ChromId, start: u32, end: u32) -> Result<()> {
         self.blocks.clear();
+        self.block_piece_offsets.clear();
+        self.block_piece_ids.clear();
         self.raw_run = None;
         self.arena_run = None;
         // SAFETY: open prepared these nodes for this exact index and base.
@@ -411,6 +435,9 @@ impl<S: ReadAt> BbiReader<S> {
             return self.find_blocks(chrom, spans[0].start, spans[0].end);
         }
         self.blocks.clear();
+        self.block_hits.clear();
+        self.block_piece_offsets.clear();
+        self.block_piece_ids.clear();
         self.raw_run = None;
         self.arena_run = None;
         let tree = match level {
@@ -428,16 +455,43 @@ impl<S: ReadAt> BbiReader<S> {
                 Some(tree) => Index::new(&tree.bytes, tree.base)?.with_prepared_nodes(&tree.nodes),
             }
         };
-        for span in spans.iter().filter(|s| !s.is_empty()) {
-            for block in index.query(chrom, span.start, span.end) {
+        if spans.len() == 1 {
+            for block in index.query(chrom, spans[0].start, spans[0].end) {
                 self.blocks.push(block?);
             }
+            return Ok(());
         }
-        if spans.len() > 1 {
-            self.blocks.sort_unstable_by_key(|b| b.offset);
-            self.blocks.dedup();
+        for (piece, span) in spans.iter().filter(|s| !s.is_empty()).enumerate() {
+            for block in index.query(chrom, span.start, span.end) {
+                self.block_hits.push((block?, piece));
+            }
         }
+        self.block_hits
+            .sort_unstable_by_key(|(b, p)| (b.offset, b.size, *p));
+        self.block_hits.dedup();
+        for &(block, piece) in &self.block_hits {
+            if self.blocks.last() != Some(&block) {
+                self.block_piece_offsets.push(self.block_piece_ids.len());
+                self.blocks.push(block);
+            }
+            self.block_piece_ids.push(piece);
+        }
+        self.block_piece_offsets.push(self.block_piece_ids.len());
         Ok(())
+    }
+
+    /// Borrows the piece links separately from the I/O buffers, restoring
+    /// their allocation after success or a recoverable I/O/decode error.
+    fn with_piece_links<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &[usize], &[usize]) -> Result<T>,
+    ) -> Result<T> {
+        let offsets = std::mem::take(&mut self.block_piece_offsets);
+        let ids = std::mem::take(&mut self.block_piece_ids);
+        let result = f(self, &offsets, &ids);
+        self.block_piece_offsets = offsets;
+        self.block_piece_ids = ids;
+        result
     }
 
     /// The R-tree of zoom level `level`, read on first use.
@@ -736,31 +790,44 @@ impl<S: ReadAt> BbiReader<S> {
         acc: &mut BinAccumulator,
     ) -> Result<()> {
         self.find_locus_blocks(None, chrom, locus.spans())?;
-        let pieces: Vec<(u32, Region<'_>)> = locus.pieces().collect();
-        let feed = |block: &WigBlock<'_>, acc: &mut BinAccumulator| {
-            for &(at, r) in &pieces {
-                for (s, e, value) in block.overlapping(chrom, r.start, r.end) {
-                    let (s, e) = (s.max(r.start), e.min(r.end));
-                    if s < e {
-                        acc.add(at + (s - r.start), at + (e - r.start), value);
+        let one = [(0, locus.hull())];
+        let pieces: Cow<'_, [(u32, Region<'_>)]> = if locus.spans().len() == 1 {
+            Cow::Borrowed(&one)
+        } else {
+            Cow::Owned(locus.pieces().collect())
+        };
+        self.with_piece_links(|reader, offsets, ids| {
+            let feed = |i, block: &WigBlock<'_>, acc: &mut BinAccumulator| {
+                for (at, r) in selected_pieces(&pieces, offsets, ids, i) {
+                    for (s, e, value) in block.overlapping(chrom, r.start, r.end) {
+                        let (s, e) = (s.max(r.start), e.min(r.end));
+                        if s < e {
+                            acc.add(at + (s - r.start), at + (e - r.start), value);
+                        }
                     }
                 }
+            };
+            if let Some(cache) = reader.cache_for_query() {
+                for i in 0..reader.blocks.len() {
+                    let data = reader.load_cached(i, &cache)?;
+                    let CachedData::Wig(block) = &data.data else {
+                        return Err(Error::invalid("BBI cache", "expected a bigWig block"));
+                    };
+                    feed(i, &block.view(), acc);
+                }
+                return Ok(());
             }
-        };
-        if let Some(cache) = self.cache_for_query() {
-            for i in 0..self.blocks.len() {
-                let data = self.load_cached(i, &cache)?;
-                let CachedData::Wig(block) = &data.data else {
-                    return Err(Error::invalid("BBI cache", "expected a bigWig block"));
+            for i in 0..reader.blocks.len() {
+                let block = WigBlock::parse(reader.load(i)?)?;
+                let block = if pieces.len() > 1 {
+                    block.prepare()
+                } else {
+                    block
                 };
-                feed(&block.view(), acc);
+                feed(i, &block, acc);
             }
-            return Ok(());
-        }
-        for i in 0..self.blocks.len() {
-            feed(&WigBlock::parse(self.load(i)?)?, acc);
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Feeds the records of zoom level `level` overlapping `locus` to
@@ -773,40 +840,53 @@ impl<S: ReadAt> BbiReader<S> {
         acc: &mut BinAccumulator,
     ) -> Result<()> {
         self.find_locus_blocks(Some(level), chrom, locus.spans())?;
-        let pieces: Vec<(u32, Region<'_>)> = locus.pieces().collect();
-        let feed = |block: &ZoomBlock<'_>, acc: &mut BinAccumulator| {
-            for &(at, r) in &pieces {
-                for z in block.overlapping(chrom, r.start, r.end) {
-                    let (s, e) = (z.start.max(r.start), z.end.min(r.end));
-                    if s < e {
-                        acc.add_zoom(ZoomPiece {
-                            start: at + (s - r.start),
-                            end: at + (e - r.start),
-                            record_len: z.end - z.start,
-                            bases: z.valid,
-                            min: z.min,
-                            max: z.max,
-                            sum: z.sum,
-                            squares: z.sum_squares,
-                        });
+        let one = [(0, locus.hull())];
+        let pieces: Cow<'_, [(u32, Region<'_>)]> = if locus.spans().len() == 1 {
+            Cow::Borrowed(&one)
+        } else {
+            Cow::Owned(locus.pieces().collect())
+        };
+        self.with_piece_links(|reader, offsets, ids| {
+            let feed = |i, block: &ZoomBlock<'_>, acc: &mut BinAccumulator| {
+                for (at, r) in selected_pieces(&pieces, offsets, ids, i) {
+                    for z in block.overlapping(chrom, r.start, r.end) {
+                        let (s, e) = (z.start.max(r.start), z.end.min(r.end));
+                        if s < e {
+                            acc.add_zoom(ZoomPiece {
+                                start: at + (s - r.start),
+                                end: at + (e - r.start),
+                                record_len: z.end - z.start,
+                                bases: z.valid,
+                                min: z.min,
+                                max: z.max,
+                                sum: z.sum,
+                                squares: z.sum_squares,
+                            });
+                        }
                     }
                 }
+            };
+            if let Some(cache) = reader.cache_for_query() {
+                for i in 0..reader.blocks.len() {
+                    let data = reader.load_cached_zoom(i, level, &cache)?;
+                    let CachedData::Zoom(block) = &data.data else {
+                        return Err(Error::invalid("BBI cache", "expected a zoom block"));
+                    };
+                    feed(i, &block.view(), acc);
+                }
+                return Ok(());
             }
-        };
-        if let Some(cache) = self.cache_for_query() {
-            for i in 0..self.blocks.len() {
-                let data = self.load_cached_zoom(i, level, &cache)?;
-                let CachedData::Zoom(bytes) = &data.data else {
-                    return Err(Error::invalid("BBI cache", "expected a zoom block"));
+            for i in 0..reader.blocks.len() {
+                let block = ZoomBlock::parse(reader.load(i)?)?;
+                let block = if pieces.len() > 1 {
+                    block.prepare()
+                } else {
+                    block
                 };
-                feed(&ZoomBlock::parse(bytes)?, acc);
+                feed(i, &block, acc);
             }
-            return Ok(());
-        }
-        for i in 0..self.blocks.len() {
-            feed(&ZoomBlock::parse(self.load(i)?)?, acc);
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -830,10 +910,15 @@ impl<S: ReadAt> TrackRead for BbiReader<S> {
         }
         self.find_locus_blocks(None, chrom, locus.spans())?;
         let mut scratch = std::mem::take(&mut self.fill_scratch);
-        let pieces: Vec<(u32, Region<'_>)> = locus.pieces().collect();
-        let result = (|| {
-            let mut fill = |block: &WigBlock<'_>, scratch: &mut Vec<usize>| -> Result<()> {
-                for &(at, r) in &pieces {
+        let one = [(0, locus.hull())];
+        let pieces: Cow<'_, [(u32, Region<'_>)]> = if locus.spans().len() == 1 {
+            Cow::Borrowed(&one)
+        } else {
+            Cow::Owned(locus.pieces().collect())
+        };
+        let result = self.with_piece_links(|reader, offsets, ids| {
+            let mut fill = |i, block: &WigBlock<'_>, scratch: &mut Vec<usize>| -> Result<()> {
+                for (at, r) in selected_pieces(&pieces, offsets, ids, i) {
                     let at = at as usize;
                     block.fill_reusing(
                         chrom,
@@ -844,21 +929,27 @@ impl<S: ReadAt> TrackRead for BbiReader<S> {
                 }
                 Ok(())
             };
-            if let Some(cache) = self.cache_for_query() {
-                for i in 0..self.blocks.len() {
-                    let data = self.load_cached(i, &cache)?;
+            if let Some(cache) = reader.cache_for_query() {
+                for i in 0..reader.blocks.len() {
+                    let data = reader.load_cached(i, &cache)?;
                     let CachedData::Wig(block) = &data.data else {
                         return Err(Error::invalid("BBI cache", "expected a bigWig block"));
                     };
-                    fill(&block.view(), &mut scratch)?;
+                    fill(i, &block.view(), &mut scratch)?;
                 }
                 return Ok(());
             }
-            for i in 0..self.blocks.len() {
-                fill(&WigBlock::parse(self.load(i)?)?, &mut scratch)?;
+            for i in 0..reader.blocks.len() {
+                let block = WigBlock::parse(reader.load(i)?)?;
+                let block = if pieces.len() > 1 {
+                    block.prepare()
+                } else {
+                    block
+                };
+                fill(i, &block, &mut scratch)?;
             }
             Ok(())
-        })();
+        });
         self.fill_scratch = scratch;
         result?;
         orient_values(locus.strand, out);
@@ -997,6 +1088,9 @@ impl BbiReader<omicsweave_core::FileSource> {
             index_nodes: Arc::clone(&self.index_nodes),
             inflater: None,
             blocks: Vec::new(),
+            block_hits: Vec::new(),
+            block_piece_offsets: Vec::new(),
+            block_piece_ids: Vec::new(),
             raw: Vec::new(),
             raw_run: None,
             inflated: Vec::new(),
@@ -1016,5 +1110,113 @@ impl BbiReader<omicsweave_core::FileSource> {
             bins: BinAccumulator::new(),
             zoom_indexes: self.zoom_indexes.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::{BigWigWriter, Chrom, WriteOptions};
+    use omicsweave_core::{Stat, Strand};
+
+    struct FaultSource {
+        bytes: Vec<u8>,
+        fail: AtomicBool,
+    }
+
+    impl ReadAt for FaultSource {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_exact_at(&self, out: &mut [u8], offset: u64) -> omicsweave_core::Result<()> {
+            if self.fail.swap(false, Ordering::Relaxed) {
+                return Err(Error::invalid("BBI source", "injected I/O failure"));
+            }
+            self.bytes.read_exact_at(out, offset)
+        }
+    }
+
+    #[test]
+    fn sparse_spliced_blocks_match_values_and_bins_across_cache_budgets() {
+        let mut writer = BigWigWriter::create(
+            Cursor::new(Vec::new()),
+            vec![Chrom {
+                name: "c".into(),
+                len: 20_000,
+            }],
+            WriteOptions {
+                items_per_slot: Some(1),
+                zoom_levels: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..128 {
+            writer.add(0, i * 100, i * 100 + 1, i as f32).unwrap();
+        }
+        let bytes = writer.finish().unwrap().0.into_inner();
+        let mut spans = vec![Span::new(0, 0)];
+        for i in 0..128 {
+            spans.push(Span::new(i * 100, i * 100 + 1));
+            spans.push(Span::new(i * 100 + 2, i * 100 + 2));
+        }
+        for budget in [None, Some(0), Some(1), Some(1 << 20)] {
+            let source = FaultSource {
+                bytes: bytes.clone(),
+                fail: AtomicBool::new(false),
+            };
+            let mut reader = BbiReader::open(source).unwrap();
+            reader
+                .set_cache(budget.map(|n| Arc::new(BlockCache::new(n, 4096))))
+                .unwrap();
+            for strand in [Strand::Forward, Strand::Reverse] {
+                let locus = Locus::new("c", &spans, strand).unwrap();
+                let mut output = vec![-999.; 130];
+                if let Some(cache) = &reader.cache {
+                    cache.clear();
+                }
+                reader.source.fail.store(true, Ordering::Relaxed);
+                assert!(reader.values(&locus, &mut output[1..129]).is_err());
+                reader.values(&locus, &mut output[1..129]).unwrap();
+                let mut want: Vec<f32> = (0..128).map(|i| i as f32).collect();
+                if strand == Strand::Reverse {
+                    want.reverse();
+                }
+                assert_eq!(output[0], -999.);
+                assert_eq!(output[129], -999.);
+                assert_eq!(&output[1..129], want);
+                assert_eq!(reader.blocks.len(), 128);
+                assert_eq!(reader.block_piece_ids.len(), 128);
+                let mut bins = vec![0.; 128];
+                reader
+                    .bins(&locus, &BinSpec::new(1, &[Stat::Mean]), &mut bins)
+                    .unwrap();
+                assert_eq!(bins, want);
+            }
+            let locus = Locus::from(Region::new("c", 0, 12_800));
+            let spec = BinSpec {
+                source: BinSource::Zoom,
+                ..BinSpec::new(1000, &Stat::ALL)
+            };
+            let mut expected = vec![0.; spec.output_len(locus.len())];
+            BbiReader::open(bytes.clone())
+                .unwrap()
+                .bins(&locus, &spec, &mut expected)
+                .unwrap();
+            for _ in 0..2 {
+                let mut actual = vec![0.; expected.len()];
+                reader.bins(&locus, &spec, &mut actual).unwrap();
+                assert!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+            }
+        }
     }
 }
